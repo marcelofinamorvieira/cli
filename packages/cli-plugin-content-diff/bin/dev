@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+
+const oclif = require('@oclif/core');
+const path = require('path');
+
+const root = path.join(__dirname, '..');
+const project = path.join(root, 'tsconfig.json');
+
+process.env.NODE_ENV = 'development';
+require('ts-node').register({ project });
+
+oclif.settings.debug = true;
+
+// A generated oclif.manifest.json (`npm run manifest`, also run by
+// `prepare`) points every command at its compiled lib/ file, and oclif loads
+// that file even in development. Ignoring the manifest keeps bin/dev on the
+// TypeScript sources of this checkout.
+async function run() {
+  const plugin = new oclif.Plugin({ root, isRoot: true, ignoreManifest: true });
+  await plugin.load();
+  return oclif.run(process.argv.slice(2), {
+    root,
+    plugins: new Map([[plugin.name, plugin]]),
+  });
+}
+
+run()
+  .then(() => oclif.flush())
+  .catch(oclif.Errors.handle);

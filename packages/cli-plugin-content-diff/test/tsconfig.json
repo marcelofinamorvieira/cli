@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig",
+  "compilerOptions": {
+    "declaration": false,
+    "noEmit": true,
+    "rootDir": "..",
+    "types": ["node", "mocha"]
+  },
+  "include": ["../src/**/*.ts", "./**/*.ts"],
+  "exclude": ["../lib", "../node_modules"]
+}

@@ -1,0 +1,65 @@
+{
+  "name": "@datocms/cli-plugin-content-diff",
+  "version": "4.2.1",
+  "description": "Plugin for DatoCMS CLI to generate reviewable content migrations between environments",
+  "keywords": ["datocms", "cli", "content", "migration", "diff"],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "author": "DatoCMS <support@datocms.com>",
+  "homepage": "https://github.com/datocms/cli#readme",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": ["/lib", "/npm-shrinkwrap.json", "/oclif.manifest.json"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/datocms/cli.git",
+    "directory": "packages/cli-plugin-content-diff"
+  },
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('lib', { recursive: true, force: true })\" && node scripts/runtime-shared.mjs --check && tsc -b",
+    "package:check": "node scripts/package-check.mjs",
+    "postpack": "rm -f oclif.manifest.json",
+    "prepack": "npm run build && oclif manifest && oclif readme",
+    "runtime:generate": "node scripts/runtime-shared.mjs --write",
+    "test": "node -e \"require('node:fs').rmSync('oclif.manifest.json', { force: true })\" && mocha --timeout 200000 --require ts-node/register --forbid-only \"test/**/*.test.ts\"",
+    "test:e2e:cross-project": "mocha --timeout 1800000 --require ts-node/register --forbid-only \"test/cross-project-e2e/**/*.e2e.ts\"",
+    "test:e2e:real-cma": "mocha --timeout 1800000 --require ts-node/register --require test/e2e/real-cma-harness.ts --forbid-only \"test/e2e/**/*.e2e.ts\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p test/tsconfig.json --noEmit"
+  },
+  "bugs": {
+    "url": "https://github.com/datocms/cli/issues"
+  },
+  "dependencies": {
+    "@datocms/cli-utils": "^4.2.0",
+    "@datocms/cma-schema-types-generator": "^6.1.0",
+    "@datocms/rest-client-utils": "^6.1.0",
+    "@oclif/core": "^4",
+    "lodash": "^4.17.21",
+    "mkdirp": "^1.0.4",
+    "prettier": "^3.4.2",
+    "tslib": "^2.8.1",
+    "tsx": "^4.19.2",
+    "typescript": "5.7.2"
+  },
+  "devDependencies": {
+    "@oclif/test": "^4",
+    "@types/lodash": "^4.17.20",
+    "@types/mkdirp": "^1.0.2",
+    "datocms": "^4.2.0",
+    "mocha": "^12.0.2",
+    "oclif": "^4"
+  },
+  "oclif": {
+    "commands": "./lib/commands",
+    "hooks": {
+      "init": "./lib/hooks/init/check-datocms-version"
+    },
+    "repositoryPrefix": "<%- repo %>/blob/@datocms/cli-plugin-content-diff@<%- version %>/packages/cli-plugin-content-diff/<%- commandPath %>"
+  }
+}
