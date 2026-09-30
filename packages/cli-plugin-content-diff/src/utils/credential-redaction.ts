@@ -1,5 +1,3 @@
-import { compareStrings } from '../content-diff/shared/ordering';
-
 export const REDACTED_CREDENTIAL = '[REDACTED]';
 
 type LogFunction = (message: string) => void;
@@ -42,7 +40,8 @@ export class CredentialRedactor {
       // is never left partially visible.
       this.orderedCredentials = [...this.credentials].sort(
         (left, right) =>
-          right.length - left.length || compareStrings(left, right),
+          right.length - left.length ||
+          (left < right ? -1 : left > right ? 1 : 0),
       );
     }
   }

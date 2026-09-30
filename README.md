@@ -15,7 +15,7 @@ DatoCMS CLI tool for managing DatoCMS projects, environments and schemas.
 - [@datocms/cli](https://github.com/datocms/cli/tree/main/packages/cli): Main CLI package
 - [@datocms/cli-plugin-wordpress](https://github.com/datocms/cli/tree/main/packages/cli-plugin-wordpress): CLI plugin to import WordPress websites into DatoCMS projects
 - [@datocms/cli-plugin-contentful](https://github.com/datocms/cli/tree/main/packages/cli-plugin-contentful): CLI plugin to import Contentful spaces into DatoCMS projects
-- [@datocms/cli-plugin-content-diff](https://github.com/datocms/cli/tree/main/packages/cli-plugin-content-diff): CLI plugin to move content between environments or projects as reviewable migrations
+- [@datocms/cli-plugin-content-diff](https://github.com/datocms/cli/tree/main/packages/cli-plugin-content-diff): CLI plugin to compare environments or projects and apply content bundles
 
 ## Development
 
