@@ -212,8 +212,11 @@ describe('content command integration', () => {
       'applyBundle',
       async (args: Parameters<typeof apply.applyBundle>[0]) => {
         assert.equal(args.bundlePath, './bundle');
+        const { signal, ...options } = args.options;
+        assert.ok(signal instanceof AbortSignal);
+        assert.equal(signal.aborted, false);
         assert.deepEqual(
-          { ...args.options, log: undefined },
+          { ...options, log: undefined },
           {
             inPlace: false,
             allowPrimary: false,

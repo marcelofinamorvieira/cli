@@ -4,6 +4,7 @@ import { lstat, open, rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { assertNotAborted } from './cancellation';
 import { ContentError } from './errors';
 import type { BinaryFile } from './types';
 
@@ -12,7 +13,9 @@ export async function stageBinary(
   bundlePath: string,
   stagingDirectory: string,
   binary: BinaryFile,
+  signal?: AbortSignal,
 ): Promise<string> {
+  assertNotAborted(signal);
   const parts = binary.file.split('/');
   if (
     isAbsolute(binary.file) ||
@@ -55,6 +58,7 @@ export async function stageBinary(
         },
       }),
       createWriteStream(destination, { flags: 'wx', mode: 0o600 }),
+      { signal },
     );
     if (
       bytes !== binary.bytes ||
@@ -69,6 +73,7 @@ export async function stageBinary(
     return destination;
   } catch (error) {
     await rm(destination, { force: true });
+    assertNotAborted(signal);
     throw error;
   } finally {
     await input.close();

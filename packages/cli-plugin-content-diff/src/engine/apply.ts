@@ -4,18 +4,24 @@ import { stageBinary } from './apply-binary';
 import { validateExecution } from './apply-validation';
 import { batches, boundedWork } from './apply-work';
 import { readBundle } from './bundle';
+import { assertNotAborted } from './cancellation';
 import { captureSnapshot, readRecordBatch } from './capture';
 import {
   canonicalCollection,
+  canonicalFields,
   canonicalUpload,
+  collectionHash,
   hashJson,
   inspectRecord,
   modelIndex,
+  object,
   recordGuard,
   recordHash,
   recordPayloadFields,
+  unsupportedRecordPayloadKey,
 } from './codec';
 import { ContentError } from './errors';
+import { collectionTransitionIssues, orderedCollectionWrites } from './planner';
 import {
   assertApplyAccess,
   assertSchemaEditAccess,
@@ -28,6 +34,7 @@ import type {
   BundleManifest,
   Client,
   CollectionPlan,
+  CollectionState,
   JsonObject,
   Kind,
   PlanEntry,
@@ -37,6 +44,7 @@ import type {
   Schedules,
   SchemaState,
   UploadPlan,
+  UploadState,
 } from './types';
 
 const emptySchedules: Schedules = { publication: null, unpublishing: null };
@@ -103,6 +111,31 @@ interface Context {
   bundlePath: string;
   concurrency: number;
   mutations: number;
+  writesPlanned: boolean;
+  signal?: AbortSignal;
+  log?: ApplyOptions['log'];
+}
+
+function scheduleNeedsValidity(context: Context, record: RecordState): boolean {
+  const model = modelIndex(context.schema).get(record.modelId)!;
+  return (
+    (model.saveInvalidDrafts ||
+      context.schema.semantics.improved_validation_at_publishing === true) &&
+    !(model.saveInvalidDrafts && record.schedules.publication?.selective)
+  );
+}
+
+function assertRecordWritable(context: Context, record: RecordState): void {
+  const key = unsupportedRecordPayloadKey(
+    record.current,
+    record.modelId,
+    context.schema,
+  );
+  if (key)
+    throw new ContentError(
+      'UNSUPPORTED_RECORD_PAYLOAD',
+      `Record ${record.id} payload metadata ${key} cannot round-trip through the SDK.`,
+    );
 }
 
 function managedRecord(context: Context, entry: RecordPlan): boolean {
@@ -118,8 +151,11 @@ function* records(
   order: 'createOrder' | 'updateOrder' | 'publishOrder' | 'deleteOrder',
   rank?: number,
 ): Generator<RecordPlan> {
+  // With an unanalyzed temporary database SQLite can prefer scanning the
+  // primary key for every rank, making a dependency chain quadratic. The
+  // preflight creates this exact expression index before any phase runs.
   const rows = context.store.database.prepare(
-    `SELECT data FROM plan WHERE kind='record' AND action IN (${actions
+    `SELECT data FROM plan INDEXED BY apply_record_${order} WHERE kind='record' AND action IN (${actions
       .map(() => '?')
       .join(',')})
      ${
@@ -156,6 +192,29 @@ function* scheduledRecords(
   }
 }
 
+function* orderedCollections(
+  context: Context,
+  deleting: boolean,
+): Generator<CollectionPlan> {
+  if (!deleting) {
+    // Preflight ranks the full intended tree, including preserved ancestors.
+    // Using only changed parents can attempt a move before a needed detach.
+    yield* orderedCollectionWrites(context.store);
+    return;
+  }
+  const actions = deleting ? "'delete'" : "'create','update'";
+  const parent = deleting ? 'baseline' : 'desired';
+  const rows = context.store.database.prepare(`WITH RECURSIVE ordered(id,depth) AS (
+    SELECT id,0 FROM plan WHERE kind='collection' AND action IN (${actions})
+    AND (json_extract(data,'$.${parent}.parentId') IS NULL OR json_extract(data,'$.${parent}.parentId') NOT IN (SELECT id FROM plan WHERE kind='collection' AND action IN (${actions})))
+    UNION ALL SELECT p.id,o.depth+1 FROM ordered o CROSS JOIN plan p INDEXED BY apply_plan_${parent}_parent ON json_extract(p.data,'$.${parent}.parentId')=+o.id WHERE p.kind='collection' AND p.action IN (${actions}))
+    SELECT p.data FROM plan p JOIN ordered o ON p.id=o.id WHERE p.kind='collection' ORDER BY o.depth ${
+      deleting ? 'DESC' : 'ASC'
+    },p.id`);
+  for (const row of rows.iterate())
+    yield JSON.parse(row.data as string) as CollectionPlan;
+}
+
 async function recordPhase(
   context: Context,
   actions: string[],
@@ -168,11 +227,12 @@ async function recordPhase(
   );
   const ranks = context.store.database.prepare(
     `SELECT DISTINCT COALESCE(json_extract(data,'$.execution.${order}'),0) AS rank
-     FROM plan WHERE kind='record' AND action IN (${actions
+     FROM plan INDEXED BY apply_record_${order} WHERE kind='record' AND action IN (${actions
        .map(() => '?')
        .join(',')}) ORDER BY rank`,
   );
   for (const row of ranks.iterate(...actions)) {
+    assertNotAborted(context.signal);
     await boundedWork(
       records(context, actions, order, Number(row.rank)),
       context.concurrency,
@@ -205,6 +265,7 @@ async function recordPhase(
         }
         return { writes, reads };
       },
+      context.signal,
     );
   }
 }
@@ -222,6 +283,7 @@ async function guardRecord(
   context: Context,
   id: string,
 ): Promise<RecordState | null> {
+  assertNotAborted(context.signal);
   // DatoCMS cannot persistently freeze a sandbox. Re-read both full versions
   // here: publication, destruction and schedule APIs have no version token.
   // A subsequent update also sends current_version for optimistic locking.
@@ -241,13 +303,22 @@ async function guardRecord(
 async function rememberRecord(
   context: Context,
   id: string,
+  expected: RecordState,
 ): Promise<RecordState> {
   const record = await focusedRecord(context, id);
   if (!record) conflict('record', id, 'missing after a write');
+  // A sandbox cannot be frozen between the write and this read. Only accept
+  // its predicted effects, otherwise a concurrent edit becomes the next
+  // trusted baseline and later phases can silently overwrite that edit.
+  if (
+    recordHash(record) !== recordHash(expected) ||
+    record.position !== expected.position
+  )
+    conflict('record', id, 'content or lifecycle changed during a write');
   context.store.putRecord('live', record);
   context.store.database
     .prepare(
-      'INSERT INTO apply_schedule_state(id,schedules_json) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET schedules_json=excluded.schedules_json',
+      'INSERT INTO apply_schedule_state(id,schedules_json) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET schedules_json=excluded.schedules_json,previous_schedules_json=NULL',
     )
     .run(id, JSON.stringify(record.schedules));
   return record;
@@ -264,10 +335,14 @@ async function dependencies(
     ? entry.safety.publishedReferences
     : entry.safety.currentReferences;
   function* dependencyIds() {
-    yield* ids;
+    // A record can publish a reference to itself in the same write. Its own
+    // guard already protects it; requiring an earlier published copy would
+    // reject that native lifecycle. Tree parents remain separate dependencies.
+    for (const id of ids) if (id !== entry.id) yield id;
     if (entry.safety.desiredParentId) yield entry.safety.desiredParentId;
   }
   for (const batch of batches(dependencyIds())) {
+    assertNotAborted(context.signal);
     const states = await readRecordBatch(context.client, batch, context.schema);
     for (const id of batch) {
       const state = states.find((record) => record.id === id);
@@ -285,6 +360,7 @@ async function dependencies(
     }
   }
   for (const id of entry.safety.uploadReferences) {
+    assertNotAborted(context.signal);
     const expected = context.store.getUpload('live', id);
     const upload = await findMaybe(() => context.client.uploads.find(id));
     if (
@@ -306,7 +382,11 @@ async function noReferrers(
     nested: false,
     version: publishedOnly ? 'published' : 'published-or-current',
   });
-  if (refs.length) conflict('record', entry.id, 'still has live referrers');
+  // CMA reports self references too, but destruction/unpublishing handles
+  // those atomically with their owner. Other record referrers remain fatal.
+  // This exception never applies to the separate upload identity namespace.
+  if (refs.some((record) => record.id !== entry.id))
+    conflict('record', entry.id, 'still has live referrers');
   const model = context.schema.models.find((m) => m.id === entry.modelId)!;
   if (model.tree && !publishedOnly) {
     const parent = await context.client.items.find(entry.id);
@@ -327,7 +407,7 @@ function* orderingRecords(
   modelId: string,
 ): Generator<RecordState> {
   const rows = context.store.database.prepare(
-    "SELECT r.state_json FROM apply_ordering o JOIN records r ON r.side='live' AND r.id=o.id WHERE o.model_id=? ORDER BY o.id",
+    "SELECT r.state_json FROM apply_ordering o CROSS JOIN records r ON r.side='live' AND r.id=o.id WHERE o.model_id=? ORDER BY o.id",
   );
   for (const row of rows.iterate(modelId))
     yield JSON.parse(row.state_json as string) as RecordState;
@@ -392,6 +472,7 @@ async function orderingBefore(
   // Pulling a bounded affected range avoids rereading the entire ordered model
   // for every ordinary field update or append to a large collection.
   for (const batch of batches(orderingRecords(context, entry.modelId))) {
+    assertNotAborted(context.signal);
     const states = await readRecordBatch(
       context.client,
       batch.map((record) => record.id),
@@ -502,12 +583,38 @@ async function updateRecord(
       `Record ${entry.id} has no optimistic locking version.`,
     );
   const meta = (body.meta ?? {}) as JsonObject;
+  const model = modelIndex(context.schema).get(entry.modelId)!;
+  const current = canonicalFields(
+    { ...live.current, ...body },
+    entry.modelId,
+    context.schema,
+  );
+  const intended: RecordState = {
+    ...live,
+    current,
+    published: model.draftMode ? live.published : current,
+    createdAt: 'created_at' in meta ? String(meta.created_at) : live.createdAt,
+    firstPublishedAt:
+      'first_published_at' in meta
+        ? (meta.first_published_at as string | null)
+        : live.firstPublishedAt,
+    stage: 'stage' in meta ? (meta.stage as string | null) : live.stage,
+    parentId:
+      'parent_id' in body ? (body.parent_id as string | null) : live.parentId,
+    position:
+      'position' in body ? (body.position as number | null) : live.position,
+  };
+  // Preservation records can also need a validity or ordering write. Check
+  // the actual resulting payload here, including repair paths, before an SDK
+  // adapter can drop opaque metadata or fail after the remote write commits.
+  assertRecordWritable(context, intended);
+  assertNotAborted(context.signal);
   await context.client.items.update(entry.id, {
     ...body,
     meta: { ...meta, current_version: live.currentVersion },
   } as Parameters<Client['items']['update']>[1]);
   context.mutations++;
-  const result = await rememberRecord(context, entry.id);
+  const result = await rememberRecord(context, entry.id, intended);
   if (ordering) await orderingAfter(context, entry);
   return result;
 }
@@ -527,7 +634,7 @@ function intendSchedule(
 ): void {
   context.store.database
     .prepare(
-      'UPDATE apply_schedule_state SET touched=1,schedules_json=? WHERE id=?',
+      'UPDATE apply_schedule_state SET touched=1,previous_schedules_json=schedules_json,schedules_json=? WHERE id=?',
     )
     .run(JSON.stringify(schedules), id);
 }
@@ -557,19 +664,23 @@ async function cancelSchedules(context: Context, id: string): Promise<void> {
   let live = await guardRecord(context, id);
   if (!live) return;
   if (live.schedules.publication) {
-    intendSchedule(context, id, { ...live.schedules, publication: null });
+    const schedules = { ...live.schedules, publication: null };
+    intendSchedule(context, id, schedules);
+    assertNotAborted(context.signal);
     await context.client.scheduledPublication.destroy(id);
     context.mutations++;
-    live = await rememberRecord(context, id);
+    live = await rememberRecord(context, id, { ...live, schedules });
     if (live.schedules.publication)
       conflict('record', id, 'publication schedule was not canceled');
   }
   if (live.schedules.unpublishing) {
     await guardRecord(context, id);
-    intendSchedule(context, id, { ...live.schedules, unpublishing: null });
+    const schedules = { ...live.schedules, unpublishing: null };
+    intendSchedule(context, id, schedules);
+    assertNotAborted(context.signal);
     await context.client.scheduledUnpublishing.destroy(id);
     context.mutations++;
-    live = await rememberRecord(context, id);
+    live = await rememberRecord(context, id, { ...live, schedules });
     if (live.schedules.unpublishing)
       conflict('record', id, 'unpublishing schedule was not canceled');
   }
@@ -592,14 +703,10 @@ async function restoreSchedules(
   if (schedules.publication) {
     let live = await guardRecord(context, id);
     if (!live) conflict('record', id, 'missing before scheduling publication');
-    const liveModelId = live.modelId;
-    const model = context.schema.models.find(
-      (candidate) => candidate.id === liveModelId,
-    )!;
-    const stampRequired =
-      (model.saveInvalidDrafts ||
-        context.schema.semantics.improved_validation_at_publishing === true) &&
-      !(model.saveInvalidDrafts && schedules.publication.selective);
+    const stampRequired = scheduleNeedsValidity(context, {
+      ...live,
+      schedules,
+    });
     if (stampRequired && !live.validity.current) {
       const entry = context.store.getPlan('record', id) as
         | RecordPlan
@@ -620,10 +727,12 @@ async function restoreSchedules(
       await guardRecord(context, id);
     }
     const current = context.store.getRecord('live', id)!;
-    intendSchedule(context, id, {
+    const intendedSchedules = {
       ...current.schedules,
       publication: schedules.publication,
-    });
+    };
+    intendSchedule(context, id, intendedSchedules);
+    assertNotAborted(context.signal);
     await context.client.scheduledPublication.create(id, {
       publication_scheduled_at: schedules.publication.at,
       selective_publication: schedules.publication.selective
@@ -634,22 +743,30 @@ async function restoreSchedules(
         : null,
     });
     context.mutations++;
-    await rememberRecord(context, id);
+    await rememberRecord(context, id, {
+      ...current,
+      schedules: intendedSchedules,
+    });
   }
   if (schedules.unpublishing) {
     futureSchedules(id, schedules);
     await guardRecord(context, id);
     const current = context.store.getRecord('live', id)!;
-    intendSchedule(context, id, {
+    const intendedSchedules = {
       ...current.schedules,
       unpublishing: schedules.unpublishing,
-    });
+    };
+    intendSchedule(context, id, intendedSchedules);
+    assertNotAborted(context.signal);
     await context.client.scheduledUnpublishing.create(id, {
       unpublishing_scheduled_at: schedules.unpublishing.at,
       content_in_locales: schedules.unpublishing.locales,
     });
     context.mutations++;
-    await rememberRecord(context, id);
+    await rememberRecord(context, id, {
+      ...current,
+      schedules: intendedSchedules,
+    });
   }
   if (!equal(context.store.getRecord('live', id)?.schedules, schedules)) {
     conflict(
@@ -669,22 +786,29 @@ async function createRecord(
     entry.execution?.creationFields ?? desired.published ?? desired.current;
   const seed = { ...desired, current: fields, published: null };
   const inspected = inspectRecord(seed, context.schema);
+  const references = inspected.references
+    .filter((reference) => reference.kind === 'current')
+    .map((reference) => reference.targetId);
+  const model = modelIndex(context.schema).get(entry.modelId)!;
   const seedPlan = {
     ...entry,
     safety: {
       ...entry.safety,
-      currentReferences: inspected.references
-        .filter((r) => r.kind === 'current')
-        .map((r) => r.targetId),
+      currentReferences: references,
+      publishedReferences: references,
     },
   };
-  await dependencies(context, seedPlan, false);
+  // Creating on a model without draft mode also publishes. Check only the
+  // actual seed dependencies, and require their publication before this write
+  // so CMA link strategies cannot publish another record incidentally.
+  await dependencies(context, seedPlan, !model.draftMode);
   const ordering = await orderingBefore(context, entry, {
     parentId: desired.parentId,
     position: desired.position,
   });
   await guardRecord(context, entry.id);
-  const model = context.schema.models.find((m) => m.id === entry.modelId)!;
+  assertRecordWritable(context, seed);
+  assertNotAborted(context.signal);
   await context.client.items.create({
     id: entry.id,
     item_type: { id: entry.modelId, type: 'item_type' },
@@ -697,7 +821,22 @@ async function createRecord(
     ...(model.tree || model.sortable ? { position: desired.position } : {}),
   } as Parameters<Client['items']['create']>[0]);
   context.mutations++;
-  const created = await rememberRecord(context, entry.id);
+  const workflow = context.schema.workflows.find(
+    (candidate) => candidate.id === model.workflowId,
+  );
+  const initialStage = Array.isArray(workflow?.stages)
+    ? workflow.stages.find((stage) => object(stage) && stage.initial === true)
+    : undefined;
+  const created = await rememberRecord(context, entry.id, {
+    ...desired,
+    current: fields,
+    published: model.draftMode ? null : fields,
+    stage:
+      object(initialStage) && typeof initialStage.id === 'string'
+        ? initialStage.id
+        : null,
+    schedules: emptySchedules,
+  });
   if (!equal(created.current, fields))
     conflict('record', entry.id, 'creation seed did not converge');
   if (ordering) await orderingAfter(context, entry);
@@ -728,11 +867,16 @@ async function publication(context: Context, entry: RecordPlan): Promise<void> {
   if (!desired.published) {
     await noReferrers(context, entry, true);
     await guardRecord(context, entry.id);
+    assertRecordWritable(context, live);
+    assertNotAborted(context.signal);
     await context.client.items.unpublish(entry.id, undefined, {
       recursive: false,
     });
     context.mutations++;
-    live = await rememberRecord(context, entry.id);
+    live = await rememberRecord(context, entry.id, {
+      ...live,
+      published: null,
+    });
     if (live.published)
       conflict('record', entry.id, 'unpublishing did not converge');
     return;
@@ -759,9 +903,14 @@ async function publication(context: Context, entry: RecordPlan): Promise<void> {
   }
   await dependencies(context, entry, true);
   await guardRecord(context, entry.id);
+  assertRecordWritable(context, live);
+  assertNotAborted(context.signal);
   await context.client.items.publish(entry.id, undefined, { recursive: false });
   context.mutations++;
-  live = await rememberRecord(context, entry.id);
+  live = await rememberRecord(context, entry.id, {
+    ...live,
+    published: desired.published,
+  });
   if (!equal(live.published, desired.published))
     conflict('record', entry.id, 'published payload did not converge');
 }
@@ -785,45 +934,191 @@ async function current(context: Context, entry: RecordPlan): Promise<void> {
   if (Object.keys(body).length) await updateRecord(context, entry, body);
 }
 
-async function collection(
+async function guardCollection(
   context: Context,
-  entry: CollectionPlan,
-): Promise<void> {
-  const found = await findMaybe(() =>
-    context.client.uploadCollections.find(entry.id),
+  id: string,
+): Promise<CollectionState | null> {
+  // Collection endpoints have no version token, and a sandbox cannot be
+  // frozen. Compare the complete captured state again before each write.
+  assertNotAborted(context.signal);
+  const resource = await findMaybe(() =>
+    context.client.uploadCollections.find(id),
   );
-  const expected = context.store.getCollection('live', entry.id);
-  const live = found ? canonicalCollection(found) : null;
-  if ((live?.hash ?? null) !== (expected?.hash ?? null))
-    conflict('collection', entry.id, 'changed before write');
-  const desired = entry.desired!;
+  const live = resource ? canonicalCollection(resource) : null;
   if (
-    desired.parentId &&
-    !(await findMaybe(() =>
-      context.client.uploadCollections.find(desired.parentId!),
-    ))
-  ) {
-    conflict('collection', entry.id, 'parent collection is missing');
+    (live?.hash ?? null) !==
+    (context.store.getCollection('live', id)?.hash ?? null)
+  )
+    conflict('collection', id, 'changed before write');
+  return live;
+}
+
+function* collectionSiblings(
+  context: Context,
+): Generator<{ state: CollectionState; position: number }> {
+  const rows = context.store.database.prepare(
+    "SELECT c.state_json,o.position FROM apply_collection_ordering o CROSS JOIN collections c ON c.side='live' AND c.id=o.id ORDER BY o.id",
+  );
+  for (const row of rows.iterate())
+    yield {
+      state: JSON.parse(row.state_json as string),
+      position: Number(row.position),
+    };
+}
+
+async function verifyCollectionSiblings(
+  context: Context,
+  after: boolean,
+): Promise<void> {
+  for (const batch of batches(collectionSiblings(context))) {
+    assertNotAborted(context.signal);
+    const ids = new Set(batch.map((row) => row.state.id));
+    // The public collection endpoint supports filter.ids. Its unfiltered list
+    // is unpaginated, so guard only the indexed native shift range in batches.
+    const actual = new Map<string, CollectionState>();
+    for (const raw of await context.client.uploadCollections.list({
+      filter: { ids: [...ids].join(',') },
+    })) {
+      const state = canonicalCollection(raw);
+      if (!ids.has(state.id) || actual.has(state.id))
+        throw new ContentError(
+          'INVALID_RESPONSE',
+          'Collection ID filter returned an unexpected or duplicate identity.',
+        );
+      actual.set(state.id, state);
+    }
+    for (const row of batch) {
+      if (!Number.isSafeInteger(row.position))
+        throw new ContentError(
+          'UNEXECUTABLE_COLLECTION_ORDERING',
+          `Collection ${row.state.id} would exceed the supported integer position range.`,
+        );
+      const expected = after
+        ? collectionHash({ ...row.state, position: row.position })
+        : row.state.hash;
+      const found = actual.get(row.state.id);
+      if (!found || found.hash !== expected)
+        conflict(
+          'collection',
+          row.state.id,
+          after
+            ? 'affected sibling changed during an ordering write'
+            : 'affected sibling changed before an ordering write',
+        );
+      if (after) context.store.putCollection('live', found);
+    }
   }
+}
+
+async function collectionOrderingBefore(
+  context: Context,
+  before: CollectionState,
+  desired: CollectionState,
+): Promise<void> {
+  // DatoCMS has no persistent sandbox freeze, and collection writes have no
+  // version token. Predict the native inclusive sibling shifts, guard that
+  // bounded range immediately before the write, then verify its exact result.
+  const db = context.store.database;
+  db.exec('DELETE FROM apply_collection_ordering');
+  const insert = (
+    parentId: string | null,
+    minimum: number,
+    maximum: number | null,
+    delta: number,
+  ) => {
+    db.prepare(
+      `INSERT INTO apply_collection_ordering SELECT id,position+? FROM collections INDEXED BY collections_siblings WHERE side='live' AND parent_id IS ? AND position>=? ${
+        maximum === null ? '' : 'AND position<=?'
+      } AND id!=?`,
+    ).run(
+      delta,
+      parentId,
+      minimum,
+      ...(maximum === null ? [] : [maximum]),
+      before.id,
+    );
+  };
+  if (before.parentId === desired.parentId)
+    insert(
+      before.parentId,
+      Math.min(before.position, desired.position),
+      Math.max(before.position, desired.position),
+      desired.position < before.position ? 1 : -1,
+    );
+  else {
+    insert(before.parentId, before.position, null, -1);
+    insert(desired.parentId, desired.position, null, 1);
+  }
+  await verifyCollectionSiblings(context, false);
+}
+
+async function writeCollection(
+  context: Context,
+  desired: CollectionState,
+): Promise<void> {
+  const before = await guardCollection(context, desired.id);
+  if (before?.hash === desired.hash) return;
+  if (desired.parentId && !(await guardCollection(context, desired.parentId)))
+    conflict('collection', desired.id, 'parent collection is missing');
+  // Creating at an explicit position does not renumber siblings. Updating at
+  // the same position can shift duplicate peers, so every actual update uses
+  // the native range prediction, including label-only writes.
+  if (before) await collectionOrderingBefore(context, before, desired);
+  await guardCollection(context, desired.id);
   const body = {
     label: desired.label,
+    position: desired.position,
     parent: desired.parentId
       ? { id: desired.parentId, type: 'upload_collection' as const }
       : null,
   };
-  if (entry.action === 'create')
-    await context.client.uploadCollections.create({ id: entry.id, ...body });
-  else await context.client.uploadCollections.update(entry.id, body);
+  assertNotAborted(context.signal);
+  if (before) await context.client.uploadCollections.update(desired.id, body);
+  else
+    await context.client.uploadCollections.create({ id: desired.id, ...body });
   context.mutations++;
   const verified = canonicalCollection(
-    await context.client.uploadCollections.find(entry.id),
+    await context.client.uploadCollections.find(desired.id),
   );
   if (verified.hash !== desired.hash)
-    conflict('collection', entry.id, 'collection did not converge');
+    conflict('collection', desired.id, 'collection did not converge');
   context.store.putCollection('live', verified);
+  if (before) await verifyCollectionSiblings(context, true);
+}
+
+async function collection(
+  context: Context,
+  entry: CollectionPlan,
+): Promise<void> {
+  await writeCollection(context, entry.desired!);
+}
+
+async function reconcileCollectionOrdering(context: Context): Promise<void> {
+  // Moving too-low indexes downward in descending desired order first leaves
+  // every index at or above its target. Moving upward in ascending target order
+  // then preserves already-fixed lower indexes, including sparse/negative gaps.
+  // The planner simulates this same sequence for native duplicate-position cases.
+  for (const descending of [true, false]) {
+    const rows = context.store.database.prepare(
+      `SELECT c.id,CASE WHEN p.action IN ('create','update') THEN json_extract(p.data,'$.desired.position') ELSE original.position END AS position FROM collections c LEFT JOIN plan p ON p.kind='collection' AND p.id=c.id LEFT JOIN apply_original_collections original ON original.id=c.id WHERE c.side='live' ORDER BY c.parent_id,position ${
+        descending ? 'DESC' : 'ASC'
+      },c.id`,
+    );
+    for (const row of rows.iterate()) {
+      assertNotAborted(context.signal);
+      const live = context.store.getCollection('live', String(row.id))!;
+      const position = Number(row.position);
+      if (descending ? live.position >= position : live.position <= position)
+        continue;
+      const desired = { ...live, position };
+      desired.hash = collectionHash(desired);
+      await writeCollection(context, desired);
+    }
+  }
 }
 
 async function upload(context: Context, entry: UploadPlan): Promise<void> {
+  assertNotAborted(context.signal);
   const found = await findMaybe(() => context.client.uploads.find(entry.id));
   const expected = context.store.getUpload('live', entry.id);
   let live = found ? canonicalUpload(found) : null;
@@ -850,7 +1145,9 @@ async function upload(context: Context, entry: UploadPlan): Promise<void> {
       context.bundlePath,
       context.store.directory,
       entry.binary,
+      context.signal,
     );
+    assertNotAborted(context.signal);
     const path = await CmaClient.uploadLocalFileAndReturnPath(
       context.client,
       staged,
@@ -865,26 +1162,80 @@ async function upload(context: Context, entry: UploadPlan): Promise<void> {
     ) {
       conflict('upload', entry.id, 'changed while its binary was staged');
     }
+    assertNotAborted(context.signal);
+    let written: UploadState;
     if (live) {
       // keep_url can overwrite a file shared by other environments. Always
       // replace with a new isolated URL, preserving only the upload identity.
-      await context.client.uploads.update(
-        entry.id,
-        { path },
-        { replace_strategy: 'create_new_url' },
+      written = canonicalUpload(
+        await context.client.uploads.update(
+          entry.id,
+          { path },
+          { replace_strategy: 'create_new_url' },
+        ),
       );
     } else {
-      await context.client.uploads.create({ id: entry.id, path });
+      written = canonicalUpload(
+        await context.client.uploads.create({ id: entry.id, path }),
+      );
     }
     context.mutations++;
-    live = canonicalUpload(await context.client.uploads.find(entry.id));
-    context.store.putUpload('live', live);
-    if (live.md5 !== desired.md5 || live.size !== desired.size)
+    if (
+      written.id !== entry.id ||
+      written.md5 !== desired.md5 ||
+      written.size !== desired.size
+    )
       conflict('upload', entry.id, 'uploaded binary checksum differs');
+    if (live) {
+      if (written.collectionId !== live.collectionId)
+        conflict(
+          'upload',
+          entry.id,
+          'collection changed during binary replacement',
+        );
+      for (const key of [
+        'tags',
+        'default_field_metadata',
+        'author',
+        'copyright',
+        'notes',
+      ]) {
+        const previous = live.attributes[key];
+        // Native binary processing fills blank author/copyright/notes from
+        // EXIF. It preserves existing nonblank values and all manual tags,
+        // field metadata and collection membership. File-derived name/format
+        // changes are intentionally checked later against desired metadata.
+        const exifDefault =
+          ['author', 'copyright', 'notes'].includes(key) &&
+          (previous === null ||
+            previous === undefined ||
+            (typeof previous === 'string' && !previous.trim()));
+        if (
+          !exifDefault &&
+          !equal(previous ?? null, written.attributes[key] ?? null)
+        )
+          conflict(
+            'upload',
+            entry.id,
+            `${key} changed during binary replacement`,
+          );
+      }
+    }
+    // There is no persistent sandbox freeze: another writer can edit after
+    // the SDK's mutation response. Trust only that controlled intermediate,
+    // then verify a fresh read before letting the metadata phase overwrite it.
+    const verifiedBinary = canonicalUpload(
+      await context.client.uploads.find(entry.id),
+    );
+    if (verifiedBinary.hash !== written.hash)
+      conflict('upload', entry.id, 'changed after the binary write response');
+    live = verifiedBinary;
+    context.store.putUpload('live', live);
   }
   const before = canonicalUpload(await context.client.uploads.find(entry.id));
   if (before.hash !== live.hash)
     conflict('upload', entry.id, 'changed before metadata write');
+  assertNotAborted(context.signal);
   await context.client.uploads.update(entry.id, {
     ...desired.attributes,
     upload_collection: desired.collectionId
@@ -902,6 +1253,14 @@ function preserveBaseline(context: Context): void {
   context.store.database.exec(
     'CREATE TABLE apply_ordering(model_id TEXT,id TEXT PRIMARY KEY,parent_id TEXT,position REAL)',
   );
+  // Drive sibling reads from the small affected range. Without this index and
+  // explicit outer join order, SQLite can scan every live record per move.
+  context.store.database.exec(
+    'CREATE INDEX apply_ordering_model ON apply_ordering(model_id,id)',
+  );
+  context.store.database.exec(
+    'CREATE TABLE apply_collection_ordering(id TEXT PRIMARY KEY,position INTEGER NOT NULL) WITHOUT ROWID',
+  );
   context.store.database.exec(
     "CREATE TABLE apply_schedule_state AS SELECT id,json_extract(state_json,'$.schedules') AS schedules_json FROM records WHERE side='live'",
   );
@@ -910,6 +1269,9 @@ function preserveBaseline(context: Context): void {
   );
   context.store.database.exec(
     'ALTER TABLE apply_schedule_state ADD COLUMN touched INTEGER NOT NULL DEFAULT 0',
+  );
+  context.store.database.exec(
+    'ALTER TABLE apply_schedule_state ADD COLUMN previous_schedules_json TEXT',
   );
   for (const table of ['records', 'uploads', 'collections']) {
     context.store.database.exec(
@@ -957,6 +1319,7 @@ async function reconcileOrdering(context: Context): Promise<void> {
          (SELECT o.position FROM apply_original_records o WHERE o.id=r.id)),r.id`,
   );
   for (const row of ordered.iterate()) {
+    assertNotAborted(context.signal);
     const live = JSON.parse(row.state_json as string) as RecordState;
     const plan = row.plan_data
       ? (JSON.parse(row.plan_data as string) as RecordPlan)
@@ -1032,6 +1395,7 @@ function validateBundlePreflight(context: Context): void {
   );
   const reachableModels = new Set<string>();
   for (const entry of context.store.iteratePlan()) {
+    assertNotAborted(context.signal);
     if (entry.kind === 'record')
       validateExecution({
         entry,
@@ -1129,9 +1493,26 @@ function validateBundlePreflight(context: Context): void {
       entry.kind === 'record' &&
       entry.action === 'noop' &&
       managedRecord(context, entry) &&
-      entry.guard
-    )
+      entry.guard &&
+      context.writesPlanned
+    ) {
       futureSchedules(entry.id, entry.guard.schedules);
+      const record = live as RecordState;
+      if (
+        record.schedules.publication &&
+        scheduleNeedsValidity(context, record) &&
+        !record.validity.current &&
+        unsupportedRecordPayloadKey(
+          record.current,
+          record.modelId,
+          context.schema,
+        )
+      )
+        throw new ContentError(
+          'UNEXECUTABLE_EXISTING_SCHEDULE',
+          `Record ${entry.id} needs an SDK-unsafe content refresh to recreate its publication schedule.`,
+        );
+    }
   }
   for (const change of context.manifest.temporarySchemaChanges) {
     if (!reachableModels.has(change.modelId)) {
@@ -1146,7 +1527,7 @@ function validateBundlePreflight(context: Context): void {
     SELECT id FROM plan WHERE kind='collection' AND action IN ('create','update')
     AND (json_extract(data,'$.desired.parentId') IS NULL OR json_extract(data,'$.desired.parentId') NOT IN
       (SELECT id FROM plan WHERE kind='collection' AND action IN ('create','update')))
-    UNION SELECT p.id FROM plan p JOIN ordered o ON json_extract(p.data,'$.desired.parentId')=o.id
+    UNION SELECT p.id FROM ordered o CROSS JOIN plan p INDEXED BY apply_plan_desired_parent ON json_extract(p.data,'$.desired.parentId')=+o.id
       WHERE p.kind='collection' AND p.action IN ('create','update'))
     SELECT (SELECT count(*) FROM plan WHERE kind='collection' AND action IN ('create','update')) AS total,
       (SELECT count(*) FROM ordered) AS ordered`)
@@ -1157,12 +1538,22 @@ function validateBundlePreflight(context: Context): void {
       'Asset collections cannot be created or moved in their planned parent order.',
     );
   }
+  // Imported execution plans receive the same native ordering/label proof as
+  // generated plans, using this run's fresh baseline and exact write order.
+  for (const issue of collectionTransitionIssues({
+    store: context.store,
+    baselineSide: 'live',
+    writes: orderedCollections(context, false),
+    deletes: orderedCollections(context, true),
+  }))
+    throw new ContentError(issue.code, issue.message, { ...issue });
 }
 
 async function captureLive(
   context: Context,
   environmentId: string,
 ): Promise<void> {
+  assertNotAborted(context.signal);
   context.store.clearSide('live');
   await captureSnapshot({
     client: context.client,
@@ -1176,6 +1567,8 @@ async function captureLive(
         .map((model) => model.id),
       uploads: 'all',
       concurrency: context.concurrency,
+      signal: context.signal,
+      progress: context.log,
     },
     verify: true,
   });
@@ -1218,6 +1611,7 @@ function expectedFinal(
 
 function verifyFinal(context: Context, schedules: boolean): void {
   for (const entry of context.store.iteratePlan()) {
+    assertNotAborted(context.signal);
     const state =
       entry.kind === 'record'
         ? context.store.getRecord('live', entry.id)
@@ -1279,6 +1673,7 @@ async function temporarySchema(
   restore: boolean,
 ): Promise<void> {
   for (const change of context.manifest.temporarySchemaChanges) {
+    assertNotAborted(context.signal);
     const wanted = restore ? change.original : change.temporary;
     const before = await context.client.fields.find(change.fieldId);
     const allowed = restore ? change.temporary : change.original;
@@ -1293,6 +1688,7 @@ async function temporarySchema(
         }.`,
       );
     }
+    assertNotAborted(context.signal);
     await context.client.fields.update(change.fieldId, {
       validators: wanted.validators,
       default_value: wanted.defaultValue,
@@ -1331,6 +1727,7 @@ export async function applyBundle(args: {
     if (repairs.length < 20) repairs.push(message);
   };
   try {
+    assertNotAborted(args.options.signal);
     if (
       args.options.concurrency !== undefined &&
       (!Number.isSafeInteger(args.options.concurrency) ||
@@ -1341,7 +1738,13 @@ export async function applyBundle(args: {
         'Apply concurrency must be a positive integer.',
       );
     }
-    const manifest = await readBundle({ directory: args.bundlePath, store });
+    args.options.log?.('Validating content bundle and asset checksums.');
+    const manifest = await readBundle({
+      directory: args.bundlePath,
+      store,
+      signal: args.options.signal,
+    });
+    assertNotAborted(args.options.signal);
     const destinationId =
       args.options.destinationEnvironmentId ??
       manifest.destination.environmentId;
@@ -1411,10 +1814,20 @@ export async function applyBundle(args: {
         Math.min(16, Math.floor(args.options.concurrency ?? 4)),
       ),
       mutations: 0,
+      writesPlanned:
+        manifest.temporarySchemaChanges.length > 0 ||
+        !!store.database
+          .prepare(
+            "SELECT 1 FROM plan WHERE action IN ('create','update','delete') LIMIT 1",
+          )
+          .get(),
+      signal: args.options.signal,
+      log: args.options.log,
     };
     // DatoCMS exposes no persistent sandbox freeze. Maintenance mode applies
     // only to primary and is not an immutable snapshot or a transaction. These
     // complete baseline and focused checks reduce races; apply is not atomic.
+    context.log?.(`Verifying destination baseline in "${destinationId}".`);
     await captureLive(context, destinationId);
     validateBundlePreflight(context);
     preserveBaseline(context);
@@ -1430,6 +1843,8 @@ export async function applyBundle(args: {
         );
       }
       forkRequested = true;
+      assertNotAborted(context.signal);
+      context.log?.(`Creating destination fork "${ownedFork}".`);
       const fork = await args.rootClient.environments.fork(destinationId, {
         id: ownedFork,
       });
@@ -1460,29 +1875,26 @@ export async function applyBundle(args: {
           'Fork project/schema differs from the bound destination.',
         );
       }
+      context.log?.(`Verifying fork baseline in "${environmentId}".`);
       await captureLive(context, environmentId);
       validateBundlePreflight(context);
       verifyForkBaseline(context);
     }
     args.options.log?.(`Applying to ${environmentId}`);
-    startedWrites = true;
-    for (const entry of scheduledRecords(context, false))
-      await cancelSchedules(context, entry.id);
+    startedWrites = context.writesPlanned;
+    if (context.writesPlanned)
+      for (const entry of scheduledRecords(context, false))
+        await cancelSchedules(context, entry.id);
     if (manifest.temporarySchemaChanges.length) {
       changedSchema = true;
       await temporarySchema(context, false);
     }
     // Collection parents first, from indexed recursive order rather than an
-    // array of all collection payloads.
-    const collections = store.database.prepare(
-      `WITH RECURSIVE ordered(id,depth) AS (
-       SELECT id,0 FROM plan WHERE kind='collection' AND action IN ('create','update')
-       AND (json_extract(data,'$.desired.parentId') IS NULL OR json_extract(data,'$.desired.parentId') NOT IN (SELECT id FROM plan WHERE kind='collection' AND action IN ('create','update')))
-       UNION ALL SELECT p.id,o.depth+1 FROM plan p JOIN ordered o ON json_extract(p.data,'$.desired.parentId')=o.id WHERE p.kind='collection' AND p.action IN ('create','update'))
-       SELECT p.data FROM plan p JOIN ordered o ON p.id=o.id WHERE p.kind='collection' ORDER BY o.depth,p.id`,
-    );
-    for (const row of collections.iterate())
-      await collection(context, JSON.parse(row.data as string));
+    // array of all collection payloads. CROSS JOIN fixes the recursive row as
+    // the outer loop; unary + removes TEXT affinity without changing its ID,
+    // allowing the JSON-parent expression index to seek each child's parent.
+    for (const entry of orderedCollections(context, false))
+      await collection(context, entry);
     await boundedWork(
       store.iteratePlan('upload'),
       context.concurrency,
@@ -1490,6 +1902,8 @@ export async function applyBundle(args: {
         if (entry.action === 'create' || entry.action === 'update')
           await upload(context!, entry as UploadPlan);
       },
+      undefined,
+      context.signal,
     );
     await recordPhase(context, ['create'], 'createOrder', (entry) =>
       createRecord(context!, entry),
@@ -1503,7 +1917,9 @@ export async function applyBundle(args: {
     await recordPhase(context, ['delete'], 'deleteOrder', async (entry) => {
       const ordering = await orderingBefore(context!, entry, null);
       await noReferrers(context!, entry, false);
-      await guardRecord(context!, entry.id);
+      const live = await guardRecord(context!, entry.id);
+      if (live) assertRecordWritable(context!, live);
+      assertNotAborted(context!.signal);
       await context!.client.items.destroy(entry.id);
       context!.mutations++;
       if (await focusedRecord(context!, entry.id))
@@ -1515,6 +1931,7 @@ export async function applyBundle(args: {
     });
     await reconcileOrdering(context);
     for (const entry of store.iteratePlan('upload', 'delete')) {
+      assertNotAborted(context.signal);
       const expected = store.getUpload('live', entry.id);
       const live = canonicalUpload(await context.client.uploads.find(entry.id));
       if (live.hash !== expected?.hash)
@@ -1527,18 +1944,14 @@ export async function applyBundle(args: {
         ).length
       )
         conflict('upload', entry.id, 'still has live referrers');
+      assertNotAborted(context.signal);
       await context.client.uploads.destroy(entry.id);
       context.mutations++;
     }
     // Collection deletion is child-first; uploads have already been moved or
     // removed. The CMA rejects any remaining dependency rather than cascading.
-    const collectionDeletes = store.database.prepare(`WITH RECURSIVE ordered(id,depth) AS (
-      SELECT id,0 FROM plan WHERE kind='collection' AND action='delete'
-      AND (json_extract(data,'$.baseline.parentId') IS NULL OR json_extract(data,'$.baseline.parentId') NOT IN (SELECT id FROM plan WHERE kind='collection' AND action='delete'))
-      UNION ALL SELECT p.id,o.depth+1 FROM plan p JOIN ordered o ON json_extract(p.data,'$.baseline.parentId')=o.id WHERE p.kind='collection' AND p.action='delete')
-      SELECT p.data FROM plan p JOIN ordered o ON p.id=o.id WHERE p.kind='collection' ORDER BY o.depth DESC,p.id`);
-    for (const row of collectionDeletes.iterate()) {
-      const entry = JSON.parse(row.data as string) as CollectionPlan;
+    for (const entry of orderedCollections(context, true)) {
+      assertNotAborted(context.signal);
       const expected = store.getCollection('live', entry.id);
       const resource = await context.client.uploadCollections.find(entry.id);
       const live = canonicalCollection(resource);
@@ -1561,9 +1974,18 @@ export async function applyBundle(args: {
       }
       if (membership.meta.total_count !== 0)
         conflict('collection', entry.id, 'still contains uploads');
+      assertNotAborted(context.signal);
       await context.client.uploadCollections.destroy(entry.id);
       context.mutations++;
+      if (
+        await findMaybe(() => context!.client.uploadCollections.find(entry.id))
+      )
+        conflict('collection', entry.id, 'collection remained after deletion');
+      store.database
+        .prepare("DELETE FROM collections WHERE side='live' AND id=?")
+        .run(entry.id);
     }
+    await reconcileCollectionOrdering(context);
     // Deletions can shift positions. Reconcile after them and before the final
     // full capture, preserving every managed and untouched sibling.
     await recordPhase(context, ['create', 'update'], 'updateOrder', (entry) =>
@@ -1581,20 +2003,27 @@ export async function applyBundle(args: {
       );
     // Recheck the complete reviewed and preserved namespace after writes.
     // This detects observable concurrent edits; it does not make apply atomic.
+    context.log?.('Verifying final content before restoring schedules.');
     await captureLive(context, environmentId);
-    verifyFinal(context, false);
-    for (const entry of scheduledRecords(context, true))
-      await restoreSchedules(
-        context,
-        entry.id,
-        entry.action === 'noop'
-          ? entry.guard!.schedules
-          : entry.desired!.schedules,
-      );
+    verifyFinal(context, !context.writesPlanned);
+    // An all-noop export still receives full independent verification, but
+    // touching its schedules would introduce unnecessary content writes when
+    // a stale validity stamp requires a refresh during schedule restoration.
+    if (context.writesPlanned)
+      for (const entry of scheduledRecords(context, true))
+        await restoreSchedules(
+          context,
+          entry.id,
+          entry.action === 'noop'
+            ? entry.guard!.schedules
+            : entry.desired!.schedules,
+        );
     // Schedules are writes too. Verify exact dates and all content again after
     // restoring them, using a second independently checked complete capture.
+    context.log?.('Verifying final content and schedules.');
     await captureLive(context, environmentId);
     verifyFinal(context, true);
+    assertNotAborted(context.signal);
     complete = true;
     return {
       environmentId,
@@ -1604,6 +2033,10 @@ export async function applyBundle(args: {
       ),
     };
   } catch (error) {
+    // Cancellation stops new work, then all already-submitted writes drain.
+    // Repairs must run with the ordinary client and without that abort signal:
+    // abandoning restoration would leave schedules or field settings changed.
+    if (context) context.signal = undefined;
     if (context && changedSchema) {
       for (const change of context.manifest.temporarySchemaChanges) {
         try {
@@ -1663,18 +2096,27 @@ export async function applyBundle(args: {
           if (equal(live.schedules, original.schedules)) continue;
           const expectedRow = store.database
             .prepare(
-              'SELECT schedules_json FROM apply_schedule_state WHERE id=?',
+              'SELECT schedules_json,previous_schedules_json FROM apply_schedule_state WHERE id=?',
             )
             .get(original.id);
           if (
             !expectedRow ||
-            !equal(
+            (!equal(
               live.schedules,
               JSON.parse(expectedRow.schedules_json as string),
-            )
+            ) &&
+              (!expectedRow.previous_schedules_json ||
+                !equal(
+                  live.schedules,
+                  JSON.parse(expectedRow.previous_schedules_json as string),
+                )))
           ) {
             throw new Error('schedules changed concurrently');
           }
+          // With no persistent sandbox freeze, a rejected request has two
+          // legitimate observed outcomes: its exact prewrite or intended state.
+          // Accept either only while that request is unverified; a third state
+          // still belongs to a competing writer and must not be overwritten.
           store.putRecord('live', live);
           await cancelSchedules(context, original.id);
           await restoreSchedules(context, original.id, original.schedules);
@@ -1694,11 +2136,13 @@ export async function applyBundle(args: {
             (args.options.destinationEnvironmentId ??
               context?.manifest.destination.environmentId)
         ) {
+          args.options.log?.(`Removing failed fork "${ownedFork}".`);
           await args.rootClient.environments.destroy(ownedFork);
           if (
             await findMaybe(() => args.rootClient.environments.find(ownedFork!))
           )
             throw new Error('failed fork still exists after deletion');
+          args.options.log?.(`Removed failed fork "${ownedFork}".`);
         } else if (fork) {
           throw new Error(
             'fork ownership could not be proven; environment retained',

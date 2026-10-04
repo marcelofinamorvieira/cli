@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
-import { boundedWork } from './apply-work';
+import { setImmediate } from 'node:timers/promises';
+import { batches, boundedWork } from './apply-work';
+import { assertNotAborted } from './cancellation';
 import {
   canonicalCollection,
   canonicalFields,
@@ -27,6 +29,24 @@ import type {
   Side,
 } from './types';
 
+type RecordPageQuery = Parameters<Client['items']['rawList']>[0];
+type RecordPage = Awaited<ReturnType<Client['items']['rawList']>>;
+
+function readNativeRecordPage(
+  client: Client,
+  queryParams: RecordPageQuery,
+): Promise<RecordPage> {
+  // rawList still runs the SDK's recursive item deserializer, which loses own
+  // __proto__ keys inside file/gallery custom_data. Use the same typed SDK
+  // request route so authentication, query encoding, retries and environment
+  // binding remain intact while our codec receives the exact native JSON.
+  return client.request<RecordPage>({
+    method: 'GET',
+    url: '/items',
+    queryParams,
+  });
+}
+
 function pageBody(body: unknown): { data: unknown[]; total: number } {
   if (
     !object(body) ||
@@ -47,10 +67,13 @@ async function pages(
   limit: number,
   concurrency: number,
   consume: (rows: unknown[]) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertNotAborted(signal);
   const first = pageBody(await read(0));
   const total = first.total;
   const accept = (body: unknown, offset: number) => {
+    assertNotAborted(signal);
     const page = pageBody(body);
     if (
       page.total !== total ||
@@ -68,9 +91,10 @@ async function pages(
   }
   // The SDK owns authentication, retries and async jobs. Manual bounded page
   // pulling prevents its eager paginated iterator from queuing every page.
-  await boundedWork(offsets(), concurrency, async (offset) =>
-    accept(await read(offset), offset),
-  );
+  await boundedWork(offsets(), concurrency, async (offset) => {
+    assertNotAborted(signal);
+    accept(await read(offset), offset);
+  });
 }
 
 function locales(value: unknown): string[] {
@@ -209,13 +233,13 @@ export async function readRecordBatch(
     );
   if (!ids.length) return [];
   const [currentBody, publishedBody] = await Promise.all([
-    client.items.rawList({
+    readNativeRecordPage(client, {
       filter: { ids: ids.join(',') },
       nested: true,
       version: 'current',
       page: { limit: 30 },
     }),
-    client.items.rawList({
+    readNativeRecordPage(client, {
       filter: { ids: ids.join(',') },
       nested: true,
       version: 'published',
@@ -299,6 +323,8 @@ interface CaptureInput {
 
 async function captureOnce(input: CaptureInput): Promise<void> {
   const { client, schema, store, side, options } = input;
+  const signal = options.signal;
+  assertNotAborted(signal);
   const concurrency = options.concurrency ?? 4;
   store.clearSide(side);
   const db = store.database;
@@ -311,12 +337,13 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     // Capture every regular model. Outside the selected mutation scope these
     // rows prove reference safety and preservation, including incoming links.
     for (const model of schema.models) {
+      assertNotAborted(signal);
       if (model.block) continue;
       for (const version of ['current', 'published'] as const) {
         options.progress?.(`Reading ${model.apiKey} (${version})`);
         await pages(
           (offset) =>
-            client.items.rawList({
+            readNativeRecordPage(client, {
               filter: { type: model.id },
               nested: true,
               version,
@@ -328,6 +355,7 @@ async function captureOnce(input: CaptureInput): Promise<void> {
           (rows) => {
             store.transaction(() => {
               for (const row of rows) {
+                assertNotAborted(signal);
                 if (!object(row))
                   throw new ContentError(
                     'INVALID_RESPONSE',
@@ -353,6 +381,7 @@ async function captureOnce(input: CaptureInput): Promise<void> {
               }
             });
           },
+          signal,
         );
       }
     }
@@ -362,34 +391,48 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     const rows = db.prepare(
       "SELECT id,data FROM capture_raw WHERE side=? AND slice='current' ORDER BY id",
     );
-    await boundedWork(rows.iterate(side), concurrency, async (row) => {
-      const current: unknown = JSON.parse(String(row.data));
-      const pubRow = published.get(side, String(row.id));
-      const pub: unknown = pubRow ? JSON.parse(String(pubRow.data)) : null;
-      if (
-        !object(current) ||
-        !object(current.meta) ||
-        Boolean(current.meta.published_at) !== Boolean(pub)
-      )
-        throw new ContentError(
-          'CAPTURE_DRIFT',
-          `Publication state changed for record ${row.id}.`,
-        );
-      const state = canonicalRecord(
-        current,
-        pub,
-        schema,
-        await readSchedules(client, current),
-      );
-      store.putRecord(side, state);
-      const inspected = inspectRecord(state, schema);
-      for (const reference of inspected.references)
-        store.putReference(side, reference);
-      for (const owner of inspected.blockOwners)
-        store.putBlockOwner(side, owner);
-      for (const value of inspected.uniqueValues)
-        store.putUniqueValue(side, value);
-    });
+    for (const batch of batches(rows.iterate(side))) {
+      // Most records have no schedules, so their promises resolve immediately.
+      // Yield between batches so process signal handlers can interrupt this
+      // otherwise synchronous SQLite/codec phase.
+      await setImmediate();
+      assertNotAborted(signal);
+      const states: RecordState[] = [];
+      await boundedWork(batch, concurrency, async (row) => {
+        assertNotAborted(signal);
+        const current: unknown = JSON.parse(String(row.data));
+        const pubRow = published.get(side, String(row.id));
+        const pub: unknown = pubRow ? JSON.parse(String(pubRow.data)) : null;
+        if (
+          !object(current) ||
+          !object(current.meta) ||
+          Boolean(current.meta.published_at) !== Boolean(pub)
+        )
+          throw new ContentError(
+            'CAPTURE_DRIFT',
+            `Publication state changed for record ${row.id}.`,
+          );
+        const schedules = await readSchedules(client, current);
+        assertNotAborted(signal);
+        states.push(canonicalRecord(current, pub, schema, schedules));
+      });
+      // Bound memory to one nested-read batch and commit all dependency indexes
+      // together. Autocommitting each block/reference makes large captures pay
+      // millions of disk transactions and can leave a partially indexed record.
+      store.transaction(() => {
+        for (const state of states) {
+          assertNotAborted(signal);
+          store.putRecord(side, state);
+          const inspected = inspectRecord(state, schema);
+          for (const reference of inspected.references)
+            store.putReference(side, reference);
+          for (const owner of inspected.blockOwners)
+            store.putBlockOwner(side, owner);
+          for (const value of inspected.uniqueValues)
+            store.putUniqueValue(side, value);
+        }
+      });
+    }
     const orphan = db
       .prepare(
         "SELECT p.id FROM capture_raw p WHERE p.side=? AND p.slice='published' AND NOT EXISTS(SELECT 1 FROM capture_raw c WHERE c.side=p.side AND c.slice='current' AND c.id=p.id) LIMIT 1",
@@ -412,6 +455,7 @@ async function captureOnce(input: CaptureInput): Promise<void> {
       (uploads) => {
         store.transaction(() => {
           for (const raw of uploads) {
+            assertNotAborted(signal);
             const upload = canonicalUpload(raw);
             if (store.getUpload(side, upload.id))
               throw new ContentError(
@@ -422,8 +466,11 @@ async function captureOnce(input: CaptureInput): Promise<void> {
           }
         });
       },
+      signal,
     );
+    assertNotAborted(signal);
     for (const raw of await client.uploadCollections.list()) {
+      assertNotAborted(signal);
       const collection = canonicalCollection(raw);
       if (store.getCollection(side, collection.id))
         throw new ContentError(
@@ -432,14 +479,25 @@ async function captureOnce(input: CaptureInput): Promise<void> {
         );
       store.putCollection(side, collection);
     }
+    assertNotAborted(signal);
   } finally {
     db.prepare('DELETE FROM capture_raw WHERE side=?').run(side);
   }
 }
 
-function snapshotDigest(store: SnapshotStore, side: Side): string {
+async function snapshotDigest(
+  store: SnapshotStore,
+  side: Side,
+  signal?: AbortSignal,
+): Promise<string> {
   const digest = createHash('sha256');
-  for (const record of store.records(side))
+  let count = 0;
+  const checkpoint = async () => {
+    if (++count % 30 === 0) await setImmediate();
+    assertNotAborted(signal);
+  };
+  for (const record of store.records(side)) {
+    await checkpoint();
     digest
       .update(
         stableStringify([
@@ -451,19 +509,28 @@ function snapshotDigest(store: SnapshotStore, side: Side): string {
         ]),
       )
       .update('\n');
-  for (const upload of store.uploads(side))
+  }
+  for (const upload of store.uploads(side)) {
+    await checkpoint();
     digest
       .update(stableStringify(['upload', upload.id, upload.hash]))
       .update('\n');
-  for (const collection of store.collections(side))
+  }
+  for (const collection of store.collections(side)) {
+    await checkpoint();
     digest
       .update(stableStringify(['collection', collection.id, collection.hash]))
       .update('\n');
+  }
+  assertNotAborted(signal);
   return digest.digest('hex');
 }
 
 export async function captureSnapshot(input: CaptureInput): Promise<void> {
+  const signal = input.options.signal;
+  assertNotAborted(signal);
   await assertFullReadAccess(input.client, input.schema);
+  assertNotAborted(signal);
   await captureOnce(input);
   if (input.verify === false) return;
   // These checks are necessary because DatoCMS maintenance mode applies only
@@ -472,7 +539,9 @@ export async function captureSnapshot(input: CaptureInput): Promise<void> {
   const verification = new SnapshotStore();
   try {
     input.options.progress?.('Checking capture consistency');
+    assertNotAborted(signal);
     const schema = await fetchSchema(input.client, input.environmentId);
+    assertNotAborted(signal);
     if (
       schema.hash !== input.schema.hash ||
       schema.siteId !== input.schema.siteId
@@ -482,12 +551,15 @@ export async function captureSnapshot(input: CaptureInput): Promise<void> {
         'The schema changed during capture.',
       );
     await assertFullReadAccess(input.client, schema);
+    assertNotAborted(signal);
     await captureOnce({ ...input, schema, store: verification });
+    assertNotAborted(signal);
     const after = await fetchSchema(input.client, input.environmentId);
+    assertNotAborted(signal);
     if (
       after.hash !== schema.hash ||
-      snapshotDigest(input.store, input.side) !==
-        snapshotDigest(verification, input.side)
+      (await snapshotDigest(input.store, input.side, signal)) !==
+        (await snapshotDigest(verification, input.side, signal))
     )
       throw new ContentError(
         'CAPTURE_DRIFT',

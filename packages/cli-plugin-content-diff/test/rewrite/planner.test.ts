@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { hashJson, recordHash } from '../../src/engine/codec';
+import { collectionHash, hashJson, recordHash } from '../../src/engine/codec';
 import { ContentError } from '../../src/engine/errors';
-import { createPlan } from '../../src/engine/planner';
+import { createPlan, orderedCollectionWrites } from '../../src/engine/planner';
 import { PlannerGraph } from '../../src/engine/planner-graph';
 import {
   creationEmptyValue,
@@ -11,6 +11,7 @@ import {
 } from '../../src/engine/planner-validity';
 import { SnapshotStore } from '../../src/engine/store';
 import type {
+  CollectionState,
   FieldSchema,
   JsonObject,
   ModelSchema,
@@ -113,6 +114,16 @@ function upload(uploadId = id('upload')): UploadState {
   result.hash = hashJson(result);
   return result;
 }
+function collection(
+  collectionId: string,
+  parentId: string | null = null,
+  position = 1,
+  label = collectionId,
+): CollectionState {
+  const state = { id: collectionId, parentId, position, label, hash: '' };
+  state.hash = collectionHash(state);
+  return state;
+}
 function options(overrides: Partial<PlanOptions> = {}): PlanOptions {
   return {
     modelIds: [MODEL],
@@ -148,6 +159,30 @@ async function fixture(
     store.dispose();
   }
 }
+async function collectionFixture(
+  source: CollectionState[],
+  target: CollectionState[],
+  overrides: Partial<PlanOptions> = {},
+  check?: (
+    store: SnapshotStore,
+    metadata: Awaited<ReturnType<typeof createPlan>>,
+  ) => void,
+): Promise<void> {
+  const store = new SnapshotStore();
+  try {
+    for (const state of source) store.putCollection('source', state);
+    for (const state of target) store.putCollection('target', state);
+    const metadata = await createPlan(
+      store,
+      schema(),
+      schema(),
+      options({ uploads: 'all', ...overrides }),
+    );
+    check?.(store, metadata);
+  } finally {
+    store.dispose();
+  }
+}
 const unsafe = (error: unknown) =>
   error instanceof ContentError && error.code === 'UNSAFE_REQUESTED_CHANGE';
 
@@ -169,7 +204,17 @@ describe('indexed rewrite planner', () => {
         id('independent'),
         'reference',
       );
+      const prepare = store.database.prepare.bind(store.database);
+      let indexedReadyQueue = false;
+      store.database.prepare = (sql) => {
+        if (sql.includes('AND done=0 AND degree=0'))
+          indexedReadyQueue = prepare(`EXPLAIN QUERY PLAN ${sql}`)
+            .all('create')
+            .some((row) => String(row.detail).includes('planner_nodes_ready'));
+        return prepare(sql);
+      };
       assert.equal(graph.order('create'), 0);
+      assert.equal(indexedReadyQueue, true);
       const levels = new Map(
         [...graph.ranks('create')].map((entry) => [entry.id, entry.rank]),
       );
@@ -266,6 +311,14 @@ describe('indexed rewrite planner', () => {
       ['required'],
     );
     assert.deepEqual(
+      fieldFailures(field({ validators: { required: {} } }), '\u0085'),
+      ['required'],
+    );
+    assert.deepEqual(
+      fieldFailures(field({ validators: { required: {} } }), '\uFEFF'),
+      [],
+    );
+    assert.deepEqual(
       fieldFailures(
         field({ type: 'float', validators: { number_range: { min: 1 } } }),
         null,
@@ -336,6 +389,73 @@ describe('indexed rewrite planner', () => {
         assert.equal(metadata.counts.record.update, 1);
       },
     );
+  });
+
+  it('rejects lossy native metadata payloads and skips only their requested dependency closure', async () => {
+    const state = schema([
+      model({
+        fields: [
+          field({ apiKey: 'asset', type: 'file' }),
+          field({ id: LINK, apiKey: 'link', type: 'link' }),
+        ],
+      }),
+    ]);
+    for (const key of ['__proto__', '__itemTypeId']) {
+      for (const slice of ['current', 'published']) {
+        const store = new SnapshotStore();
+        try {
+          const asset = upload();
+          store.putUpload('source', asset);
+          store.putUpload('target', asset);
+          const safe: JsonObject = { asset: null, link: null };
+          const lossy: JsonObject = {
+            asset: {
+              upload_id: asset.id,
+              custom_data: { [key]: 'business value' },
+            },
+            link: null,
+          };
+          store.putRecord(
+            'source',
+            record(
+              A,
+              slice === 'current' ? lossy : safe,
+              slice === 'published'
+                ? {
+                    published: lossy,
+                    validity: { current: true, published: true },
+                  }
+                : {},
+            ),
+          );
+          store.putRecord('source', record(B, { asset: null, link: A }));
+          store.putRecord('source', record(C, safe));
+          await assert.rejects(
+            createPlan(store, state, state, options()),
+            (error: unknown) =>
+              error instanceof ContentError &&
+              error.code === 'UNSAFE_REQUESTED_CHANGE' &&
+              error.details?.reason === 'UNSUPPORTED_PAYLOAD_KEY',
+          );
+          assert.deepEqual([...store.planEntries()], []);
+          await createPlan(
+            store,
+            state,
+            state,
+            options({ allowPartial: true }),
+          );
+          assert.equal(store.getPlan('record', A)?.action, 'skip');
+          assert.equal(store.getPlan('record', B)?.action, 'skip');
+          assert.equal(store.getPlan('record', C)?.action, 'create');
+          store.putRecord('target', store.getRecord('source', A)!);
+          await createPlan(store, state, state, options());
+          assert.equal(store.getPlan('record', A)?.action, 'noop');
+          assert.equal(store.getPlan('record', B)?.action, 'create');
+        } finally {
+          store.dispose();
+        }
+      }
+    }
   });
 
   it('retains destination-only and unselected model records without deletion warnings', async () => {
@@ -508,6 +628,65 @@ describe('indexed rewrite planner', () => {
           seed.execution!.createOrder! < dependant.execution!.createOrder!,
         );
         assert.deepEqual(metadata.temporarySchemaChanges, []);
+      },
+    );
+  });
+
+  it('defers auto-published creation references to existing drafts until their publication phase', async () => {
+    const automatic = model({
+      id: id('automatic'),
+      apiKey: 'automatic',
+      draftMode: false,
+      fields: [field({ id: LINK, apiKey: 'link', type: 'link' })],
+    });
+    const state = schema([model(), automatic]);
+    const source = [
+      record(
+        A,
+        { link: B },
+        {
+          modelId: automatic.id,
+          published: { link: B },
+          validity: { current: true, published: true },
+        },
+      ),
+      record(
+        B,
+        { title: 'published dependency' },
+        {
+          published: { title: 'published dependency' },
+          validity: { current: true, published: true },
+        },
+      ),
+    ];
+    const target = [record(B, { title: 'existing draft' })];
+    const opts = options({ modelIds: [MODEL, automatic.id] });
+    await fixture(source, target, state, opts, (store, metadata) => {
+      const owner = store.getPlan('record', A) as RecordPlan;
+      const dependency = store.getPlan('record', B) as RecordPlan;
+      assert.deepEqual(owner.execution?.creationFields, { link: null });
+      assert.ok(
+        dependency.execution!.publishOrder! < owner.execution!.publishOrder!,
+      );
+      assert.deepEqual(metadata.temporarySchemaChanges, []);
+    });
+    automatic.fields[0].validators.required = {};
+    await assert.rejects(fixture(source, target, state, opts), unsafe);
+    await fixture(
+      source,
+      target,
+      state,
+      { ...opts, allowTemporarySchemaChanges: true },
+      (store, metadata) => {
+        assert.deepEqual(
+          (store.getPlan('record', A) as RecordPlan).execution?.creationFields,
+          { link: null },
+        );
+        assert.equal(metadata.temporarySchemaChanges[0].fieldId, LINK);
+        assert.deepEqual(
+          metadata.temporarySchemaChanges[0].temporary.validators,
+          {},
+        );
       },
     );
   });
@@ -833,7 +1012,7 @@ describe('indexed rewrite planner', () => {
     );
   });
 
-  it('diagnoses managed unchanged schedules that the CMA cannot recreate under restored validators', async () => {
+  it('preserves invalid unchanged schedules without writes and diagnoses their recreation in mixed plans', async () => {
     const state = schema([
       model({
         saveInvalidDrafts: true,
@@ -851,9 +1030,16 @@ describe('indexed rewrite planner', () => {
         },
       },
     );
+    await fixture(
+      [scheduled],
+      [scheduled],
+      state,
+      options({ allowPartial: true, allowTemporarySchemaChanges: true }),
+      (_store, metadata) => assert.equal(metadata.counts.record.noop, 1),
+    );
     await assert.rejects(
       fixture(
-        [scheduled],
+        [scheduled, record(B, { title: 'new content' })],
         [scheduled],
         state,
         options({ allowPartial: true, allowTemporarySchemaChanges: true }),
@@ -872,6 +1058,354 @@ describe('indexed rewrite planner', () => {
       legacy,
       options(),
       (_store, metadata) => assert.equal(metadata.counts.record.noop, 1),
+    );
+  });
+
+  it('diagnoses duplicate unique schedules before writes and preserves existing schedules without writes', async () => {
+    const state = schema([
+      model({
+        saveInvalidDrafts: true,
+        fields: [field({ validators: { unique: {} } })],
+      }),
+    ]);
+    const schedules: RecordState['schedules'] = {
+      publication: { at: '2099-01-01T12:00:00.000Z', selective: null },
+      unpublishing: null,
+    };
+    const duplicate = record(B, { title: 'duplicate' });
+    for (const published of [null, { title: 'previous publication' }]) {
+      const scheduled = record(
+        A,
+        { title: 'duplicate' },
+        {
+          published,
+          schedules,
+          validity: { current: false, published: published ? true : null },
+        },
+      );
+      await assert.rejects(
+        fixture(
+          [scheduled, duplicate],
+          [],
+          state,
+          options({ allowTemporarySchemaChanges: true }),
+        ),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.details?.reason === 'INVALID_SCHEDULED_PUBLICATION',
+      );
+      await fixture(
+        [scheduled, duplicate],
+        [],
+        state,
+        options({ allowPartial: true }),
+        (store) => {
+          assert.equal(store.getPlan('record', A)?.action, 'skip');
+          assert.equal(store.getPlan('record', B)?.action, 'create');
+        },
+      );
+      await assert.rejects(
+        fixture(
+          [scheduled, duplicate, record(C, { title: 'new content' })],
+          [scheduled, duplicate],
+          state,
+          options({ allowPartial: true }),
+        ),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE' &&
+          /unique/.test(error.message),
+      );
+      await fixture(
+        [scheduled, duplicate],
+        [scheduled, duplicate],
+        state,
+        options({ allowPartial: true }),
+        (_store, metadata) => assert.equal(metadata.counts.record.noop, 2),
+      );
+    }
+  });
+
+  it('checks scheduled uniqueness only in the requested locale scope', async () => {
+    const state = schema([
+      model({
+        saveInvalidDrafts: true,
+        fields: [field({ localized: true, validators: { unique: {} } })],
+      }),
+    ]);
+    state.locales = ['en', 'it'];
+    const scheduled = (locale: string) =>
+      record(
+        A,
+        { title: { en: 'duplicate', it: 'a' } },
+        {
+          validity: { current: false, published: null },
+          schedules: {
+            publication: {
+              at: '2099-01-01T12:00:00.000Z',
+              selective: { locales: [locale], nonLocalized: false },
+            },
+            unpublishing: null,
+          },
+        },
+      );
+    const duplicate = record(
+      B,
+      { title: { en: 'duplicate', it: 'b' } },
+      { validity: { current: false, published: null } },
+    );
+    await fixture([scheduled('it'), duplicate], [], state);
+    await assert.rejects(
+      fixture([scheduled('en'), duplicate], [], state),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.reason === 'INVALID_SCHEDULED_PUBLICATION',
+    );
+  });
+
+  it('diagnoses unsafe scheduled noop refreshes when any final plan kind writes', async () => {
+    const state = schema([
+      model({
+        saveInvalidDrafts: true,
+        fields: [field({ apiKey: 'asset', type: 'file' })],
+      }),
+    ]);
+    for (const write of ['none', 'record', 'upload', 'collection']) {
+      const store = new SnapshotStore();
+      try {
+        const asset = upload();
+        store.putUpload('source', asset);
+        store.putUpload('target', asset);
+        const scheduled = record(
+          A,
+          {
+            asset: {
+              upload_id: asset.id,
+              custom_data: { __itemTypeId: 'business value' },
+            },
+          },
+          {
+            validity: { current: false, published: null },
+            schedules: {
+              publication: { at: '2099-01-01T12:00:00.000Z', selective: null },
+              unpublishing: null,
+            },
+          },
+        );
+        store.putRecord('source', scheduled);
+        store.putRecord('target', scheduled);
+        if (write === 'record')
+          store.putRecord('source', record(B, { asset: null }));
+        if (write === 'upload') {
+          const changed = { ...asset, filename: 'renamed.png', hash: '' };
+          changed.hash = hashJson(changed);
+          store.putUpload('source', changed);
+        }
+        if (write === 'collection') {
+          const collection = {
+            id: id('new-collection'),
+            label: 'New',
+            parentId: null,
+            position: 1,
+            hash: '',
+          };
+          collection.hash = hashJson(collection);
+          store.putCollection('source', collection);
+        }
+        const run = () =>
+          createPlan(
+            store,
+            state,
+            state,
+            options({ allowPartial: true, uploads: 'all' }),
+          );
+        if (write === 'none') await run();
+        else
+          await assert.rejects(
+            run(),
+            (error: unknown) =>
+              error instanceof ContentError &&
+              error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE' &&
+              error.details?.reason === 'UNSUPPORTED_PAYLOAD_KEY',
+          );
+      } finally {
+        store.dispose();
+      }
+    }
+  });
+
+  it('uses destination validity and native schedule semantics for noop refresh safety', async () => {
+    const cases = [
+      {
+        sourceValid: false,
+        targetValid: true,
+        saveInvalidDrafts: true,
+        improved: false,
+        selective: false,
+        unpublishing: false,
+        rejects: false,
+      },
+      {
+        sourceValid: true,
+        targetValid: false,
+        saveInvalidDrafts: true,
+        improved: false,
+        selective: false,
+        unpublishing: false,
+        rejects: true,
+      },
+      {
+        sourceValid: false,
+        targetValid: false,
+        saveInvalidDrafts: true,
+        improved: false,
+        selective: true,
+        unpublishing: false,
+        rejects: false,
+      },
+      {
+        sourceValid: false,
+        targetValid: false,
+        saveInvalidDrafts: false,
+        improved: false,
+        selective: false,
+        unpublishing: false,
+        rejects: false,
+      },
+      {
+        sourceValid: false,
+        targetValid: false,
+        saveInvalidDrafts: false,
+        improved: true,
+        selective: false,
+        unpublishing: false,
+        rejects: true,
+      },
+      {
+        sourceValid: false,
+        targetValid: false,
+        saveInvalidDrafts: true,
+        improved: false,
+        selective: false,
+        unpublishing: true,
+        rejects: false,
+      },
+    ];
+    for (const entry of cases) {
+      const state = schema([
+        model({
+          saveInvalidDrafts: entry.saveInvalidDrafts,
+          fields: [field({ apiKey: 'asset', type: 'file' })],
+        }),
+      ]);
+      state.semantics.improved_validation_at_publishing = entry.improved;
+      const store = new SnapshotStore();
+      try {
+        const asset = upload();
+        store.putUpload('source', asset);
+        store.putUpload('target', asset);
+        const scheduled = record(
+          A,
+          {
+            asset: {
+              upload_id: asset.id,
+              custom_data: { __itemTypeId: 'business value' },
+            },
+          },
+          {
+            validity: { current: entry.sourceValid, published: null },
+            schedules: entry.unpublishing
+              ? {
+                  publication: null,
+                  unpublishing: {
+                    at: '2099-01-01T12:00:00.000Z',
+                    locales: null,
+                  },
+                }
+              : {
+                  publication: {
+                    at: '2099-01-01T12:00:00.000Z',
+                    selective: entry.selective
+                      ? { locales: [], nonLocalized: true }
+                      : null,
+                  },
+                  unpublishing: null,
+                },
+          },
+        );
+        store.putRecord('source', scheduled);
+        store.putRecord('target', {
+          ...scheduled,
+          validity: { current: entry.targetValid, published: null },
+        });
+        store.putRecord('source', record(B, { asset: null }));
+        const run = createPlan(store, state, state, options());
+        if (entry.rejects)
+          await assert.rejects(
+            run,
+            (error: unknown) =>
+              error instanceof ContentError &&
+              error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE',
+          );
+        else await run;
+      } finally {
+        store.dispose();
+      }
+    }
+  });
+
+  it('rechecks scheduled uniqueness after a partial skip restores a destination owner', async () => {
+    const state = schema([
+      model({
+        saveInvalidDrafts: true,
+        fields: [field({ validators: { unique: {} } })],
+      }),
+    ]);
+    const schedules: RecordState['schedules'] = {
+      publication: { at: '2099-01-01T12:00:00.000Z', selective: null },
+      unpublishing: null,
+    };
+    const source = [
+      record(A, { title: 'held' }, { schedules }),
+      record(B, { title: 'released' }),
+      record(C, { title: 'independent' }),
+    ];
+    const target = [
+      record(A, { title: 'previous' }, { schedules }),
+      record(B, { title: 'held' }, { currentVersion: null }),
+    ];
+    await fixture(
+      source,
+      target,
+      state,
+      options({ allowPartial: true }),
+      (store) => {
+        assert.equal(store.getPlan('record', A)?.action, 'skip');
+        assert.equal(store.getPlan('record', B)?.action, 'skip');
+        assert.equal(store.getPlan('record', C)?.action, 'create');
+      },
+    );
+    await assert.rejects(
+      fixture(
+        source,
+        [source[0], target[1]],
+        state,
+        options({ allowPartial: true }),
+      ),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE',
+    );
+    await fixture(
+      source.slice(0, 2),
+      [source[0], target[1]],
+      state,
+      options({ allowPartial: true }),
+      (_store, metadata) => {
+        assert.equal(metadata.counts.record.noop, 1);
+        assert.equal(metadata.counts.record.skip, 1);
+        assert.deepEqual(metadata.temporarySchemaChanges, []);
+      },
     );
   });
 
@@ -968,6 +1502,104 @@ describe('indexed rewrite planner', () => {
     );
   });
 
+  it('plans native self-reference publication, unpublication, and deletion', async () => {
+    const dast: JsonObject = {
+      schema: 'dast',
+      document: {
+        type: 'root',
+        children: [
+          {
+            type: 'paragraph',
+            children: [
+              { type: 'inlineItem', item: A },
+              {
+                type: 'itemLink',
+                item: A,
+                children: [{ type: 'span', value: 'self' }],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    for (const [type, value] of [
+      ['link', A],
+      ['links', [A]],
+      ['structured_text', dast],
+    ] as const) {
+      const state = schema([
+        model({ fields: [field({ apiKey: 'body', type })] }),
+      ]);
+      const fields = { body: value } as JsonObject;
+      const draft = record(A, fields);
+      const published = record(A, fields, {
+        published: fields,
+        validity: { current: true, published: true },
+      });
+      for (const target of [[], [draft]]) {
+        await fixture([published], target, state, options(), (store) => {
+          const plan = store.getPlan('record', A) as RecordPlan;
+          assert.equal(plan.execution?.publishOrder, 0);
+          if (target.length === 0)
+            assert.deepEqual(plan.execution?.creationFields, {
+              body: creationEmptyValue(type),
+            });
+        });
+      }
+      await fixture([draft], [published], state, options(), (store) => {
+        assert.equal(
+          (store.getPlan('record', A) as RecordPlan).execution?.publishOrder,
+          0,
+        );
+      });
+      await fixture(
+        [],
+        [published],
+        state,
+        options({ includeDeletions: true }),
+        (store) => {
+          assert.equal(
+            (store.getPlan('record', A) as RecordPlan).execution?.deleteOrder,
+            0,
+          );
+        },
+      );
+    }
+  });
+
+  it('still rejects multi-record deletion cycles and self-parented trees', async () => {
+    const state = schema([
+      model({ fields: [field({ apiKey: 'link', type: 'link' })] }),
+    ]);
+    await assert.rejects(
+      fixture(
+        [],
+        [record(A, { link: B }), record(B, { link: A })],
+        state,
+        options({ includeDeletions: true }),
+      ),
+      unsafe,
+    );
+    const tree = schema([model({ tree: true })]);
+    await assert.rejects(
+      fixture(
+        [record(A, { title: 'self' }, { parentId: A, position: 0 })],
+        [],
+        tree,
+      ),
+      unsafe,
+    );
+    await assert.rejects(
+      fixture(
+        [],
+        [record(A, { title: 'self' }, { parentId: A, position: 0 })],
+        tree,
+        options({ includeDeletions: true }),
+      ),
+      unsafe,
+    );
+  });
+
   it('copies invalid published values with a proven narrow relaxation and ignores stale derived validity flags', async () => {
     const state = schema([
       model({
@@ -1049,6 +1681,36 @@ describe('indexed rewrite planner', () => {
     );
   });
 
+  it('suppresses localized defaults with every environment locale retained', async () => {
+    const state = schema([
+      model({
+        fields: [
+          field({
+            localized: true,
+            defaultValue: { en: 'default', it: 'predefinito', fr: null },
+          }),
+        ],
+      }),
+    ]);
+    state.locales = ['en', 'it', 'fr'];
+    await fixture(
+      [record(A, { title: { en: null, it: null } })],
+      [],
+      state,
+      options({ allowTemporarySchemaChanges: true }),
+      (_store, metadata) => {
+        assert.deepEqual(
+          metadata.temporarySchemaChanges[0].temporary.defaultValue,
+          { en: null, it: null, fr: null },
+        );
+        assert.deepEqual(
+          metadata.temporarySchemaChanges[0].original.defaultValue,
+          { en: 'default', it: 'predefinito', fr: null },
+        );
+      },
+    );
+  });
+
   it('detects defaults inside nested blocks without inspecting opaque JSON', async () => {
     const state = schema([
       model({
@@ -1113,6 +1775,400 @@ describe('indexed rewrite planner', () => {
         options({ includeDeletions: true }),
       ),
       unsafe,
+    );
+  });
+
+  it('diagnoses actual published writes that would reintroduce published-only block IDs', async () => {
+    const blockId = id('published-only-block');
+    const block = {
+      id: blockId,
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { title: 'Block' },
+    };
+    for (const type of ['rich_text', 'single_block', 'structured_text']) {
+      const value =
+        type === 'rich_text'
+          ? [block]
+          : type === 'single_block'
+            ? block
+            : {
+                schema: 'dast',
+                document: {
+                  type: 'root',
+                  children: [{ type: 'block', item: block }],
+                },
+              };
+      const empty = creationEmptyValue(type);
+      const state = schema([
+        model({
+          fields: [
+            field(),
+            field({ id: BLOCK_FIELD, apiKey: 'body', type }),
+            field({ id: LINK, apiKey: 'link', type: 'link' }),
+          ],
+        }),
+        model({
+          id: BLOCK_MODEL,
+          apiKey: 'content_block',
+          block: true,
+          fields: [field({ id: id('block-title') })],
+        }),
+      ]);
+      const baseline = record(
+        A,
+        { title: 'Draft', body: empty, link: null },
+        {
+          published: { title: 'Old publication', body: value, link: null },
+          validity: { current: true, published: true },
+        },
+      );
+      const desired = record(A, baseline.current, {
+        published: { title: 'New publication', body: value, link: null },
+        validity: baseline.validity,
+      });
+      await assert.rejects(
+        fixture([desired], [baseline], state),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.details?.reason === 'UNSUPPORTED_BLOCK_REINTRODUCTION',
+      );
+      await fixture(
+        [
+          desired,
+          record(B, { title: 'Dependent', body: empty, link: A }),
+          record(C, { title: 'Independent', body: empty, link: null }),
+        ],
+        [baseline],
+        state,
+        options({ allowPartial: true }),
+        (store) => {
+          assert.equal(store.getPlan('record', A)?.action, 'skip');
+          assert.equal(store.getPlan('record', B)?.action, 'skip');
+          assert.equal(store.getPlan('record', C)?.action, 'create');
+        },
+      );
+    }
+  });
+
+  it('preserves matching publications and allows blocks owned by destination current', async () => {
+    const block = {
+      id: id('published-block'),
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { title: 'Block' },
+    };
+    const state = schema([
+      model({
+        fields: [
+          field(),
+          field({ id: BLOCK_FIELD, apiKey: 'body', type: 'rich_text' }),
+        ],
+      }),
+      model({
+        id: BLOCK_MODEL,
+        apiKey: 'content_block',
+        block: true,
+        fields: [field({ id: id('block-title') })],
+      }),
+    ]);
+    const published = { title: 'Publication', body: [block] };
+    const baseline = record(
+      A,
+      { title: 'Draft', body: [] },
+      { published, validity: { current: true, published: true } },
+    );
+    await fixture(
+      [
+        record(
+          A,
+          { title: 'Changed draft', body: [] },
+          { published, validity: baseline.validity },
+        ),
+      ],
+      [baseline],
+      state,
+    );
+    const updatedPublication = { title: 'New publication', body: [block] };
+    await fixture(
+      [
+        record(A, baseline.current, {
+          published: updatedPublication,
+          validity: baseline.validity,
+        }),
+      ],
+      [record(A, published, { published, validity: baseline.validity })],
+      state,
+    );
+    await fixture(
+      [
+        record(A, baseline.current, {
+          published: updatedPublication,
+          validity: baseline.validity,
+        }),
+      ],
+      [
+        record(A, baseline.current, {
+          published: { title: 'Old publication', body: [] },
+          validity: baseline.validity,
+        }),
+      ],
+      state,
+    );
+  });
+
+  it('models orphan removal before allowing a same-ID block recreation', async () => {
+    const block = {
+      id: id('recreated-block'),
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { title: 'Block' },
+    };
+    const state = schema([
+      model({
+        fields: [
+          field(),
+          field({ id: BLOCK_FIELD, apiKey: 'body', type: 'rich_text' }),
+        ],
+      }),
+      model({
+        id: BLOCK_MODEL,
+        apiKey: 'content_block',
+        block: true,
+        fields: [field({ id: id('block-title') })],
+      }),
+    ]);
+    const withBlock = { title: 'Body', body: [block] };
+    const withoutBlock = { title: 'Body', body: [] };
+    const baseline = record(A, withoutBlock, {
+      published: withBlock,
+      validity: { current: true, published: true },
+    });
+    await assert.rejects(
+      fixture(
+        [
+          record(A, withBlock, {
+            published: withBlock,
+            validity: baseline.validity,
+          }),
+        ],
+        [baseline],
+        state,
+      ),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.reason === 'UNSUPPORTED_BLOCK_REINTRODUCTION',
+    );
+    await fixture(
+      [record(A, withBlock, { firstPublishedAt: baseline.firstPublishedAt })],
+      [baseline],
+      state,
+    );
+    for (const priorPublication of [null, withBlock]) {
+      const prior = record(A, withBlock, {
+        published: priorPublication,
+        validity: { current: true, published: priorPublication ? true : null },
+      });
+      await fixture(
+        [
+          record(A, withBlock, {
+            published: withoutBlock,
+            validity: { current: true, published: true },
+          }),
+        ],
+        [prior],
+        state,
+      );
+    }
+  });
+
+  it('checks published-only nested ownership at a stable parent block and permits reordering', async () => {
+    const parentId = id('parent-block');
+    const childId = id('nested-published-only');
+    const childModel = id('child-model');
+    const nested = {
+      id: childId,
+      __itemTypeId: childModel,
+      attributes: { title: 'Child' },
+    };
+    const parent = (children: JsonObject[]) => ({
+      id: parentId,
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { nested: { en: children } },
+    });
+    const state = schema([
+      model({
+        fields: [
+          field(),
+          field({ id: BLOCK_FIELD, apiKey: 'body', type: 'rich_text' }),
+        ],
+      }),
+      model({
+        id: BLOCK_MODEL,
+        apiKey: 'parent_block',
+        block: true,
+        fields: [
+          field({
+            id: id('nested-field'),
+            apiKey: 'nested',
+            type: 'rich_text',
+            localized: true,
+          }),
+        ],
+      }),
+      model({
+        id: childModel,
+        apiKey: 'child_block',
+        block: true,
+        fields: [field({ id: id('child-title') })],
+      }),
+    ]);
+    const baseline = record(
+      A,
+      { title: 'Draft', body: [parent([])] },
+      {
+        published: { title: 'Old', body: [parent([nested])] },
+        validity: { current: true, published: true },
+      },
+    );
+    const desired = record(A, baseline.current, {
+      published: { title: 'New', body: [parent([nested])] },
+      validity: baseline.validity,
+    });
+    await assert.rejects(
+      fixture([desired], [baseline], state),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.reason === 'UNSUPPORTED_BLOCK_REINTRODUCTION' &&
+        error.details?.dependencyId === childId,
+    );
+    const second = { ...nested, id: id('second-child') };
+    const original = { title: 'Original', body: [parent([nested, second])] };
+    await fixture(
+      [record(A, { title: 'New', body: [parent([second, nested])] })],
+      [record(A, original)],
+      state,
+    );
+  });
+
+  it('requires an already-declared suppression when publication staging recreates an existing defaulted block', async () => {
+    const blockId = id('defaulted-recreated-block');
+    const block = {
+      id: blockId,
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { amount: null },
+    };
+    const blockAmount = id('defaulted-block-amount');
+    const state = schema([
+      model({
+        fields: [
+          field(),
+          field({ id: BLOCK_FIELD, apiKey: 'body', type: 'rich_text' }),
+        ],
+      }),
+      model({
+        id: BLOCK_MODEL,
+        apiKey: 'content_block',
+        block: true,
+        fields: [
+          field({
+            id: blockAmount,
+            apiKey: 'amount',
+            type: 'integer',
+            defaultValue: 7,
+          }),
+        ],
+      }),
+    ]);
+    const fields = { title: 'Draft', body: [block] };
+    const baseline = record(A, fields);
+    const desired = record(A, fields, {
+      published: { title: 'Publication', body: [] },
+      validity: { current: true, published: true },
+    });
+    await assert.rejects(
+      fixture(
+        [desired],
+        [baseline],
+        state,
+        options({ allowTemporarySchemaChanges: true }),
+      ),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.reason === 'UNSUPPORTED_BLOCK_RECREATION_DEFAULT',
+    );
+    const newBlock = { ...block, id: id('new-defaulted-block') };
+    const requiringSuppression = record(B, { title: 'New', body: [newBlock] });
+    await fixture(
+      [desired, requiringSuppression],
+      [baseline],
+      state,
+      options({ allowTemporarySchemaChanges: true }),
+      (_store, metadata) => {
+        assert.equal(metadata.temporarySchemaChanges.length, 1);
+        assert.equal(metadata.temporarySchemaChanges[0].fieldId, blockAmount);
+        assert.equal(
+          metadata.temporarySchemaChanges[0].temporary.defaultValue,
+          null,
+        );
+      },
+    );
+    await fixture(
+      [
+        desired,
+        record('legacy', requiringSuppression.current),
+        record(C, { title: 'Independent', body: [] }),
+      ],
+      [baseline],
+      state,
+      options({ allowPartial: true, allowTemporarySchemaChanges: true }),
+      (store, metadata) => {
+        assert.equal(store.getPlan('record', A)?.action, 'skip');
+        assert.equal(store.getPlan('record', 'legacy')?.action, 'skip');
+        assert.equal(store.getPlan('record', C)?.action, 'create');
+        assert.deepEqual(metadata.temporarySchemaChanges, []);
+      },
+    );
+  });
+
+  it('rejects a legacy block only when the planned phases must recreate its identity', async () => {
+    const block = {
+      id: '42',
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { title: 'Existing legacy block' },
+    };
+    const state = schema([
+      model({
+        fields: [
+          field(),
+          field({ id: BLOCK_FIELD, apiKey: 'body', type: 'rich_text' }),
+        ],
+      }),
+      model({
+        id: BLOCK_MODEL,
+        apiKey: 'content_block',
+        block: true,
+        fields: [field({ id: id('legacy-block-title') })],
+      }),
+    ]);
+    const fields = { title: 'Draft', body: [block] };
+    const baseline = record(A, fields);
+    await fixture(
+      [record(A, { ...fields, title: 'Edited draft' })],
+      [baseline],
+      state,
+    );
+    await assert.rejects(
+      fixture(
+        [
+          record(A, fields, {
+            published: { title: 'Publication', body: [] },
+            validity: { current: true, published: true },
+          }),
+        ],
+        [baseline],
+        state,
+      ),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.reason === 'UNSUPPORTED_LEGACY_BLOCK_ID',
     );
   });
 
@@ -1348,20 +2404,48 @@ describe('indexed rewrite planner', () => {
     );
   });
 
-  it('handles a bounded long dependency chain without a recursive graph traversal', async () => {
+  it('plans a 6000-record dependency chain from disk without a recursive graph traversal', async () => {
     const state = schema([model({ tree: true })]);
-    const records: RecordState[] = [];
-    for (let index = 0; index < 1200; index++)
-      records.push(
-        record(
-          id(`node-${index}`),
-          { title: `node-${index}` },
-          { parentId: index ? id(`node-${index - 1}`) : null, position: 0 },
-        ),
+    const store = new SnapshotStore();
+    try {
+      // Build the fixture in bounded transactions too: no array of all record
+      // payloads should hide a project-sized memory requirement in this test.
+      for (let start = 0; start < 6000; start += 100)
+        store.transaction(() => {
+          for (let index = start; index < start + 100; index++)
+            store.putRecord(
+              'source',
+              record(
+                id(`node-${index}`),
+                { title: `node-${index}` },
+                {
+                  parentId: index ? id(`node-${index - 1}`) : null,
+                  position: 0,
+                },
+              ),
+            );
+        });
+      const metadata = await createPlan(
+        store,
+        state,
+        { ...state, environmentId: 'target' },
+        options(),
       );
-    await fixture(records, [], state, options(), (_store, metadata) =>
-      assert.equal(metadata.counts.record.create, 1200),
-    );
+      assert.equal(metadata.counts.record.create, 6000);
+      let checked = 0;
+      for (const entry of store.planEntries('record')) {
+        assert.equal(entry.kind, 'record');
+        if (entry.kind !== 'record') continue;
+        const depth = Number(String(entry.desired!.current.title).slice(5));
+        assert.equal(entry.execution?.createOrder, depth);
+        assert.equal(entry.execution?.updateOrder, depth);
+        assert.equal(entry.execution?.publishOrder, depth);
+        checked++;
+      }
+      assert.equal(checked, 6000);
+    } finally {
+      store.dispose();
+    }
   });
 
   it('preserves already published dependency cycles when both targets are available', async () => {
@@ -1450,6 +2534,99 @@ describe('indexed rewrite planner', () => {
     );
   });
 
+  it('releases previous published references before unpublishing their dependencies', async () => {
+    const state = schema([
+      model({
+        fields: [field(), field({ id: LINK, apiKey: 'link', type: 'link' })],
+      }),
+    ]);
+    const target = [
+      record(
+        A,
+        { title: 'owner', link: B },
+        {
+          published: { title: 'owner', link: B },
+          validity: { current: true, published: true },
+        },
+      ),
+      record(
+        B,
+        { title: 'dependency', link: null },
+        {
+          published: { title: 'dependency', link: null },
+          validity: { current: true, published: true },
+        },
+      ),
+    ];
+    for (const published of [{ title: 'owner', link: null }, null]) {
+      await fixture(
+        [
+          record(
+            A,
+            { title: 'owner', link: null },
+            {
+              published,
+              validity: { current: true, published: published ? true : null },
+            },
+          ),
+          record(B, { title: 'dependency', link: null }),
+        ],
+        target,
+        state,
+        options(),
+        (store) => {
+          const owner = store.getPlan('record', A) as RecordPlan;
+          const dependency = store.getPlan('record', B) as RecordPlan;
+          assert.ok(
+            owner.execution!.publishOrder! <
+              dependency.execution!.publishOrder!,
+          );
+        },
+      );
+    }
+  });
+
+  it('diagnoses unpublishing when a published referrer will only be deleted later', async () => {
+    const state = schema([
+      model({
+        fields: [field(), field({ id: LINK, apiKey: 'link', type: 'link' })],
+      }),
+    ]);
+    const source = [record(B, { title: 'dependency', link: null })];
+    const target = [
+      record(
+        A,
+        { title: 'owner', link: B },
+        {
+          published: { title: 'owner', link: B },
+          validity: { current: true, published: true },
+        },
+      ),
+      record(
+        B,
+        { title: 'dependency', link: null },
+        {
+          published: { title: 'dependency', link: null },
+          validity: { current: true, published: true },
+        },
+      ),
+    ];
+    await assert.rejects(
+      fixture(source, target, state, options({ includeDeletions: true })),
+      unsafe,
+    );
+    await fixture(
+      source,
+      target,
+      state,
+      options({ includeDeletions: true, allowPartial: true }),
+      (store) => {
+        assert.equal(store.getPlan('record', A)?.action, 'delete');
+        assert.equal(store.getPlan('record', B)?.action, 'skip');
+      },
+    );
+  });
+
   it('allows a native invalid current unique value without temporary schema changes', async () => {
     const state = schema([
       model({
@@ -1535,15 +2712,9 @@ describe('indexed rewrite planner', () => {
 
   it('detects collection movement cycles and proves isolated collection skips', async () => {
     const store = new SnapshotStore();
-    const collection = (collectionId: string, parentId: string | null) => ({
-      id: collectionId,
-      label: collectionId,
-      parentId,
-      hash: hashJson({ collectionId, parentId }),
-    });
     try {
       store.putCollection('target', collection(A, null));
-      store.putCollection('target', collection(B, null));
+      store.putCollection('target', collection(B, null, 2));
       store.putCollection('source', collection(A, B));
       store.putCollection('source', collection(B, A));
       await assert.rejects(
@@ -1557,6 +2728,310 @@ describe('indexed rewrite planner', () => {
         options({ uploads: 'all', allowPartial: true }),
       );
       assert.equal(metadata.counts.collection.skip, 2);
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('plans position-only collection reorders, sparse positions, and parent moves', async () => {
+    const parent = id('parent');
+    const other = id('other-parent');
+    const cases = [
+      {
+        target: [
+          collection(A, null, 1),
+          collection(B, null, 2),
+          collection(C, null, 3),
+        ],
+        source: [
+          collection(A, null, 3),
+          collection(B, null, 1),
+          collection(C, null, 2),
+        ],
+      },
+      {
+        target: [collection(A, null, -5), collection(B, null, 10)],
+        source: [collection(A, null, 10), collection(B, null, 20)],
+      },
+      {
+        target: [
+          collection(parent),
+          collection(other, null, 2),
+          collection(A, parent),
+          collection(B, parent, 2),
+          collection(C, other),
+        ],
+        source: [
+          collection(parent),
+          collection(other, null, 2),
+          collection(A, other, 2),
+          collection(B, parent),
+          collection(C, other),
+        ],
+      },
+    ];
+    for (const { source, target } of cases)
+      await collectionFixture(source, target, {}, (store, metadata) => {
+        assert(metadata.counts.collection.update > 0);
+        for (const state of source) {
+          const final = store.database
+            .prepare(
+              'SELECT parent_id,position FROM planner_collection_live WHERE id=?',
+            )
+            .get(state.id);
+          assert.equal(final?.parent_id, state.parentId);
+          assert.equal(final?.position, state.position);
+          const previous = target.find((entry) => entry.id === state.id)!;
+          assert.equal(
+            store.getPlan('collection', state.id)?.action,
+            previous.hash === state.hash ? 'noop' : 'update',
+          );
+        }
+      });
+  });
+
+  it('preserves legal collection duplicates for noops, explicit creates, deletes, and unaffected updates', async () => {
+    const peers = [collection(A), collection(B)];
+    await collectionFixture(peers, peers);
+    await collectionFixture(peers, []);
+    await collectionFixture([...peers, collection(C, null, 3)], peers);
+    await collectionFixture([peers[0]], peers, { includeDeletions: true });
+    await collectionFixture(
+      [...peers, collection(C, null, 3, 'Renamed')],
+      [...peers, collection(C, null, 3)],
+      {},
+      (store) => {
+        assert.equal(store.getPlan('collection', C)?.action, 'update');
+        assert.equal(
+          store.database
+            .prepare('SELECT position FROM planner_collection_live WHERE id=?')
+            .get(A)?.position,
+          1,
+        );
+        assert.equal(
+          store.database
+            .prepare('SELECT position FROM planner_collection_live WHERE id=?')
+            .get(B)?.position,
+          1,
+        );
+      },
+    );
+  });
+
+  it('diagnoses only collection collisions that cannot survive native shifts', async () => {
+    for (const { source, target } of [
+      {
+        source: [collection(A, null, 2), collection(B, null, 2)],
+        target: [collection(A), collection(B, null, 2)],
+      },
+      {
+        source: [collection(A, null, 1, 'Renamed'), collection(B)],
+        target: [collection(A), collection(B)],
+      },
+    ]) {
+      await assert.rejects(
+        collectionFixture(source, target),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.details?.reason === 'COLLECTION_ORDERING_CONFLICT',
+      );
+      await collectionFixture(
+        source,
+        target,
+        { allowPartial: true },
+        (store) => {
+          assert.equal(store.getPlan('collection', A)?.action, 'skip');
+          assert.equal(store.getPlan('collection', B)?.action, 'noop');
+        },
+      );
+    }
+  });
+
+  it('rejects retained collection label collisions and transient label swaps before writes', async () => {
+    const source = [collection(A, null, 1, 'Images')];
+    const target = [collection(B, null, 2, 'Images')];
+    const labelConflict = (error: unknown) =>
+      error instanceof ContentError &&
+      error.details?.reason === 'COLLECTION_LABEL_CONFLICT';
+    await assert.rejects(collectionFixture(source, target), labelConflict);
+    await collectionFixture(source, target, { allowPartial: true }, (store) => {
+      assert.equal(store.getPlan('collection', A)?.action, 'skip');
+      assert.equal(store.getPlan('collection', B)?.action, 'noop');
+    });
+    const swap = [
+      collection(A, null, 1, 'Beta'),
+      collection(B, null, 2, 'Alpha'),
+    ];
+    const original = [
+      collection(A, null, 1, 'Alpha'),
+      collection(B, null, 2, 'Beta'),
+    ];
+    await assert.rejects(collectionFixture(swap, original), labelConflict);
+    await collectionFixture(
+      swap,
+      original,
+      { allowPartial: true },
+      (_store, metadata) => assert.equal(metadata.counts.collection.skip, 2),
+    );
+  });
+
+  it('allows ordinary collection renames and moves, case-sensitive labels, and untouched grandfathered labels', async () => {
+    await collectionFixture(
+      [collection(A, null, 1, 'Renamed')],
+      [collection(A, null, 1, 'Original')],
+    );
+    await collectionFixture(
+      [collection(A, null, 1, 'Images')],
+      [collection(B, null, 2, 'images')],
+    );
+    const parent = id('label-parent');
+    await collectionFixture(
+      [collection(parent), collection(A, parent, 2, 'Images')],
+      [
+        collection(parent),
+        collection(A, null, 2, 'Images'),
+        collection(B, parent, 1, 'Other'),
+      ],
+    );
+    const grandfathered = [
+      collection(A, null, 1, 'Duplicate'),
+      collection(B, null, 2, 'Duplicate'),
+    ];
+    await collectionFixture(grandfathered, grandfathered);
+    await collectionFixture(
+      [...grandfathered, collection(C, null, 3, 'New')],
+      grandfathered,
+    );
+  });
+
+  it('reconciles every bounded three-collection permutation with sparse targets', async () => {
+    const identities = [A, B, C];
+    const target = identities.map((collectionId, index) =>
+      collection(collectionId, null, index + 1),
+    );
+    for (const first of [1, 5, 10])
+      for (const second of [1, 5, 10])
+        for (const third of [1, 5, 10]) {
+          if (new Set([first, second, third]).size !== 3) continue;
+          const source = identities.map((collectionId, index) =>
+            collection(collectionId, null, [first, second, third][index]),
+          );
+          await collectionFixture(source, target, {}, (store) => {
+            for (const state of source)
+              assert.equal(
+                store.database
+                  .prepare(
+                    'SELECT position FROM planner_collection_live WHERE id=?',
+                  )
+                  .get(state.id)?.position,
+                state.position,
+              );
+          });
+        }
+  });
+
+  it('orders collection updates by their desired parent rather than their old parent', async () => {
+    await collectionFixture(
+      [collection(A, B), collection(B)],
+      [collection(A), collection(B, A)],
+      {},
+      (store) => {
+        const rank = (collectionId: string) =>
+          Number(
+            store.database
+              .prepare(
+                "SELECT rank FROM planner_nodes WHERE phase='collection-create' AND id=?",
+              )
+              .get(collectionId)?.rank,
+          );
+        assert(rank(B) < rank(A));
+      },
+    );
+  });
+
+  it('detaches an ancestor before moving beneath its unchanged descendant', async () => {
+    const [outer, inner, middle] = [A, B, C].sort();
+    const target = [
+      collection(outer),
+      collection(middle, outer),
+      collection(inner, middle),
+    ];
+    const source = [
+      collection(middle),
+      collection(inner, middle),
+      collection(outer, inner),
+    ];
+    await collectionFixture(source, target, {}, (store) => {
+      assert.deepEqual(
+        [...orderedCollectionWrites(store)].map((entry) => entry.id),
+        [middle, outer],
+      );
+      for (const state of source) {
+        const actual = store.database
+          .prepare(
+            'SELECT parent_id,position FROM planner_collection_live WHERE id=?',
+          )
+          .get(state.id);
+        assert.equal(actual?.parent_id, state.parentId);
+        assert.equal(actual?.position, state.position);
+      }
+    });
+  });
+
+  it('closes collection skips across old and new sibling groups while retaining unrelated groups', async () => {
+    const parents = [id('parent-p'), id('parent-q'), id('parent-r')];
+    const unaffected = id('unaffected-collection');
+    const store = new SnapshotStore();
+    try {
+      for (const side of ['source', 'target'] as const)
+        for (const [index, parent] of parents.entries())
+          store.putCollection(side, collection(parent, null, index + 1));
+      for (const state of [
+        collection(B, parents[0]),
+        collection(C, parents[1]),
+        collection(unaffected, parents[2]),
+      ])
+        store.putCollection('target', state);
+      for (const state of [
+        collection('legacy', parents[0]),
+        collection(B, parents[1]),
+        collection(C, parents[1], 2),
+        collection(unaffected, parents[2], 1, 'Renamed'),
+      ])
+        store.putCollection('source', state);
+      const asset = upload();
+      asset.collectionId = B;
+      asset.hash = hashJson(asset);
+      store.putUpload('source', asset);
+      const state = schema([
+        model({
+          fields: [
+            field(),
+            field({ id: BLOCK_FIELD, apiKey: 'asset', type: 'file' }),
+          ],
+        }),
+      ]);
+      store.putRecord(
+        'source',
+        record(A, { title: 'Dependent', asset: { upload_id: asset.id } }),
+      );
+      const independent = id('independent-record');
+      store.putRecord(
+        'source',
+        record(independent, { title: 'Independent', asset: null }),
+      );
+      await createPlan(
+        store,
+        state,
+        state,
+        options({ uploads: 'all', allowPartial: true }),
+      );
+      for (const collectionId of ['legacy', B, C])
+        assert.equal(store.getPlan('collection', collectionId)?.action, 'skip');
+      assert.equal(store.getPlan('collection', unaffected)?.action, 'update');
+      assert.equal(store.getPlan('upload', asset.id)?.action, 'skip');
+      assert.equal(store.getPlan('record', A)?.action, 'skip');
+      assert.equal(store.getPlan('record', independent)?.action, 'create');
     } finally {
       store.dispose();
     }

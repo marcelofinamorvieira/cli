@@ -11,8 +11,16 @@ import {
 } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { hashJson, recordGuard, recordHash } from './codec';
+import { setImmediate } from 'node:timers/promises';
+import { assertNotAborted } from './cancellation';
+import {
+  assertMetadataIntegerPrecision,
+  hashJson,
+  recordGuard,
+  recordHash,
+} from './codec';
 import { ContentError } from './errors';
+import { suppressedDefaultValue } from './planner-validity';
 import { schemaHash } from './schema';
 import type { SnapshotStore } from './store';
 import type {
@@ -127,12 +135,16 @@ async function readSmallFile(
   directory: string,
   file: string,
   maximum: number,
+  signal?: AbortSignal,
 ): Promise<Buffer> {
+  assertNotAborted(signal);
   const handle = await safeFile(directory, file);
   try {
     if ((await handle.stat()).size > maximum)
       invalid(`Bundle metadata is too large: ${file}`);
-    return await handle.readFile();
+    const bytes = await handle.readFile();
+    assertNotAborted(signal);
+    return bytes;
   } finally {
     await handle.close();
   }
@@ -221,6 +233,14 @@ function validateManifest(value: unknown): asserts value is BundleManifest {
       changedFields.has(change.fieldId)
     )
       invalid('Invalid or duplicate temporary schema change.');
+    assertMetadataIntegerPrecision(
+      change.original.validators,
+      `field ${change.fieldId} original validators`,
+    );
+    assertMetadataIntegerPrecision(
+      change.temporary.validators,
+      `field ${change.fieldId} temporary validators`,
+    );
     changedFields.add(change.fieldId);
     const model = (value.schema.models as SchemaState['models']).find(
       (model) => model.id === change.modelId,
@@ -246,7 +266,10 @@ function validateManifest(value: unknown): asserts value is BundleManifest {
         );
     }
     if (
-      change.temporary.defaultValue !== null &&
+      hashJson(change.temporary.defaultValue) !==
+        hashJson(
+          suppressedDefaultValue(field, value.schema.locales as string[]),
+        ) &&
       hashJson(change.temporary.defaultValue) !==
         hashJson(change.original.defaultValue)
     )
@@ -313,8 +336,15 @@ function validateState(value: unknown, entry: PlanEntry): boolean {
     return (
       text(value.label) &&
       nullableText(value.parentId) &&
+      typeof value.position === 'number' &&
+      Number.isSafeInteger(value.position) &&
       value.hash ===
-        hashJson({ id: value.id, label: value.label, parentId: value.parentId })
+        hashJson({
+          id: value.id,
+          label: value.label,
+          parentId: value.parentId,
+          position: value.position,
+        })
     );
   if (entry.kind === 'upload')
     return (
@@ -491,9 +521,14 @@ function compactEntry(entry: PlanEntry): PlanEntry {
   return result;
 }
 
-async function writeBytes(handle: FileHandle, bytes: Buffer): Promise<void> {
+async function writeBytes(
+  handle: FileHandle,
+  bytes: Buffer,
+  signal?: AbortSignal,
+): Promise<void> {
   let offset = 0;
   while (offset < bytes.length) {
+    assertNotAborted(signal);
     const { bytesWritten } = await handle.write(
       bytes,
       offset,
@@ -506,13 +541,16 @@ async function writeBytes(handle: FileHandle, bytes: Buffer): Promise<void> {
       );
     offset += bytesWritten;
   }
+  assertNotAborted(signal);
 }
 
 async function fetchBinary(
   entry: UploadPlan,
   staging: string,
   fetchFn: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<BinaryFile> {
+  assertNotAborted(signal);
   const desired = entry.desired!;
   const url = new URL(desired.url);
   if (
@@ -524,19 +562,29 @@ async function fetchBinary(
       'INVALID_ASSET_URL',
       `Upload ${entry.id} has an unsupported asset URL.`,
     );
-  const response = await fetchFn(url);
-  if (!response.ok || !response.body)
-    throw new ContentError(
-      'ASSET_DOWNLOAD_FAILED',
-      `Upload ${entry.id} could not be downloaded (${response.status}).`,
-    );
+  // The ordinary CMA URL can serve optimized images or a sanitized SVG whose
+  // bytes differ from the stored upload. Match the dashboard's original-file
+  // download controls on this request only; retain the captured URL and other
+  // query values, and still require the exact captured byte count and MD5.
+  url.searchParams.set('dl', desired.filename);
+  url.searchParams.set('skip-default-optimizations', 'true');
+  url.searchParams.set('svg-sanitize', 'false');
+  const response = await fetchFn(url, { signal });
   const temporary = join(staging, 'binaries', '.download');
-  const handle = await open(temporary, 'wx', 0o600);
+  let handle: FileHandle | undefined;
   const md5 = createHash('md5');
   const hash = createHash('sha256');
   let bytes = 0;
   try {
+    assertNotAborted(signal);
+    if (!response.ok || !response.body)
+      throw new ContentError(
+        'ASSET_DOWNLOAD_FAILED',
+        `Upload ${entry.id} could not be downloaded (${response.status}).`,
+      );
+    handle = await open(temporary, 'wx', 0o600);
     for await (const chunk of response.body) {
+      assertNotAborted(signal);
       const buffer = Buffer.from(chunk);
       bytes += buffer.length;
       if (bytes > desired.size)
@@ -546,13 +594,17 @@ async function fetchBinary(
         );
       md5.update(buffer);
       hash.update(buffer);
-      await writeBytes(handle, buffer);
+      await writeBytes(handle, buffer, signal);
     }
+    assertNotAborted(signal);
   } catch (error) {
-    await response.body.cancel().catch(() => undefined);
+    // Release unread error responses and interrupted downloads alike. Native
+    // fetch receives the signal too, so an idle network stream can be aborted.
+    await response.body?.cancel().catch(() => undefined);
+    assertNotAborted(signal);
     throw error;
   } finally {
-    await handle.close();
+    await handle?.close();
   }
   const actualMd5 = md5.digest('hex');
   const actualSha256 = hash.digest('hex');
@@ -562,6 +614,7 @@ async function fetchBinary(
       `Upload ${entry.id} differs from the captured binary.`,
     );
   const file = `binaries/${actualSha256}.bin`;
+  assertNotAborted(signal);
   const destination = join(staging, file);
   try {
     await lstat(destination);
@@ -579,13 +632,16 @@ export async function writeBundle({
   outputPath,
   chunkBytes = DEFAULT_CHUNK_BYTES,
   fetchFn = fetch,
+  signal,
 }: {
   store: SnapshotStore;
   metadata: PlanMetadata;
   outputPath: string;
   chunkBytes?: number;
   fetchFn?: typeof fetch;
+  signal?: AbortSignal;
 }): Promise<string> {
+  assertNotAborted(signal);
   if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 1)
     throw new ContentError(
       'INVALID_CHUNK_SIZE',
@@ -607,6 +663,7 @@ export async function writeBundle({
     );
   };
   await ensureAbsent();
+  assertNotAborted(signal);
   const staging = await mkdtemp(join(parent, '.content-bundle-'));
   let current:
     | {
@@ -617,6 +674,7 @@ export async function writeBundle({
     | undefined;
   let indexHandle: FileHandle | undefined;
   try {
+    assertNotAborted(signal);
     await mkdir(join(staging, 'plan'));
     await mkdir(join(staging, 'binaries'));
     const chunks: BundleChunkIndex = {
@@ -629,6 +687,7 @@ export async function writeBundle({
     indexHandle = await open(join(staging, chunks.file), 'wx', 0o600);
     const actualCounts = counts();
     const finishChunk = async () => {
+      assertNotAborted(signal);
       if (!current) return;
       await current.handle.close();
       current.descriptor.sha256 = current.hash.digest('hex');
@@ -638,17 +697,18 @@ export async function writeBundle({
           'INVALID_CHUNK_INDEX',
           'Chunk descriptor exceeds the supported metadata line size.',
         );
-      await writeBytes(indexHandle!, descriptor);
+      await writeBytes(indexHandle!, descriptor, signal);
       indexHash.update(descriptor);
       chunks.bytes += descriptor.length;
       chunks.count++;
       current = undefined;
     };
     for (const original of store.planEntries()) {
+      assertNotAborted(signal);
       const entry = compactEntry(original);
       validateEntry(entry, false);
       if (entry.kind === 'upload' && requiresBinary(entry))
-        entry.binary = await fetchBinary(entry, staging, fetchFn);
+        entry.binary = await fetchBinary(entry, staging, fetchFn, signal);
       validateEntry(entry, true);
       const line = Buffer.from(`${stableJson(entry)}\n`);
       if (current && current.descriptor.bytes + line.length > chunkBytes)
@@ -662,7 +722,7 @@ export async function writeBundle({
         };
       }
       // An oversized entry occupies its own chunk; an entry is never split.
-      await writeBytes(current.handle, line);
+      await writeBytes(current.handle, line, signal);
       current.hash.update(line);
       current.descriptor.bytes += line.length;
       current.descriptor.entries++;
@@ -698,18 +758,22 @@ export async function writeBundle({
     await writeFile(join(staging, 'manifest.json'), bytes, {
       flag: 'wx',
       mode: 0o600,
+      signal,
     });
     await writeFile(join(staging, 'manifest.sha256'), `${sha256(bytes)}\n`, {
       flag: 'wx',
       mode: 0o600,
+      signal,
     });
     await ensureAbsent();
+    assertNotAborted(signal);
     await rename(staging, output);
     return output;
   } catch (error) {
     await current?.handle.close().catch(() => undefined);
     await indexHandle?.close().catch(() => undefined);
     await rm(staging, { recursive: true, force: true });
+    assertNotAborted(signal);
     throw error;
   }
 }
@@ -717,7 +781,9 @@ export async function writeBundle({
 async function verifyBinary(
   directory: string,
   binary: BinaryFile,
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertNotAborted(signal);
   const handle = await safeFile(directory, binary.file);
   try {
     if ((await handle.stat()).size !== binary.bytes)
@@ -726,10 +792,12 @@ async function verifyBinary(
     const md5 = createHash('md5');
     let bytes = 0;
     for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      assertNotAborted(signal);
       bytes += chunk.length;
       hash.update(chunk);
       md5.update(chunk);
     }
+    assertNotAborted(signal);
     if (
       bytes !== binary.bytes ||
       hash.digest('hex') !== binary.sha256 ||
@@ -748,7 +816,9 @@ async function* jsonlValues(
   expectedRows: number,
   label: string,
   maximumLineBytes?: number,
+  signal?: AbortSignal,
 ): AsyncGenerator<unknown> {
+  assertNotAborted(signal);
   const handle = await safeFile(directory, descriptor.file);
   try {
     if ((await handle.stat()).size !== descriptor.bytes)
@@ -783,6 +853,7 @@ async function* jsonlValues(
       // Raw async iteration bounds buffering while a consumer awaits a binary
       // checksum. Even a large chunk index never becomes an in-memory array.
       for await (const raw of stream) {
+        assertNotAborted(signal);
         const buffer = raw as Buffer;
         hash.update(buffer);
         bytes += buffer.length;
@@ -791,6 +862,10 @@ async function* jsonlValues(
         let offset = 0;
         let newline = buffer.indexOf(10, offset);
         while (newline !== -1) {
+          // Buffered lines can otherwise keep resolving in the microtask
+          // queue without giving process signal handlers a chance to run.
+          if (rows % 30 === 0) await setImmediate();
+          assertNotAborted(signal);
           const tail = buffer.subarray(offset, newline);
           if (
             maximumLineBytes !== undefined &&
@@ -814,7 +889,9 @@ async function* jsonlValues(
           partial.push(tail);
         }
       }
+      assertNotAborted(signal);
       if (partialBytes) yield parseLine(Buffer.concat(partial, partialBytes));
+      assertNotAborted(signal);
       if (
         bytes !== descriptor.bytes ||
         rows !== expectedRows ||
@@ -832,6 +909,7 @@ async function* jsonlValues(
 async function* chunkIndex(
   directory: string,
   descriptor: BundleChunkIndex,
+  signal?: AbortSignal,
 ): AsyncGenerator<BundleChunk> {
   let position = 0;
   for await (const value of jsonlValues(
@@ -840,6 +918,7 @@ async function* chunkIndex(
     descriptor.count,
     'Chunk index',
     MAX_INDEX_LINE_BYTES,
+    signal,
   )) {
     // Canonical sequence paths prove uniqueness/order without a chunk-sized Set.
     validateChunk(value, ++position);
@@ -850,12 +929,15 @@ async function* chunkIndex(
 async function* chunkEntries(
   directory: string,
   descriptor: BundleChunk,
+  signal?: AbortSignal,
 ): AsyncGenerator<PlanEntry> {
   for await (const value of jsonlValues(
     directory,
     descriptor,
     descriptor.entries,
     'Chunk',
+    undefined,
+    signal,
   )) {
     validateEntry(value, true);
     yield value;
@@ -886,7 +968,13 @@ function compareEntries(left: PlanEntry, right: PlanEntry): number {
 export async function readBundle({
   directory,
   store,
-}: { directory: string; store: SnapshotStore }): Promise<BundleManifest> {
+  signal,
+}: {
+  directory: string;
+  store: SnapshotStore;
+  signal?: AbortSignal;
+}): Promise<BundleManifest> {
+  assertNotAborted(signal);
   const root = resolve(directory);
   try {
     const info = await lstat(root);
@@ -896,9 +984,10 @@ export async function readBundle({
       root,
       'manifest.json',
       MAX_MANIFEST_BYTES,
+      signal,
     );
     const checksum = (
-      await readSmallFile(root, 'manifest.sha256', 65)
+      await readSmallFile(root, 'manifest.sha256', 65, signal)
     ).toString('utf8');
     if (checksum !== `${sha256(manifestBytes)}\n`)
       invalid('Manifest checksum differs.');
@@ -925,8 +1014,9 @@ export async function readBundle({
     );
     try {
       // Validate all chunks and binaries before any plan becomes executable.
-      for await (const chunk of chunkIndex(root, manifest.chunks)) {
-        for await (const entry of chunkEntries(root, chunk)) {
+      for await (const chunk of chunkIndex(root, manifest.chunks, signal)) {
+        for await (const entry of chunkEntries(root, chunk, signal)) {
+          assertNotAborted(signal);
           if (previous && compareEntries(previous, entry) >= 0)
             invalid('Bundle plan entries are not deterministically ordered.');
           try {
@@ -937,7 +1027,7 @@ export async function readBundle({
           previous = entry;
           actualCounts[entry.kind][entry.action]++;
           if (entry.kind === 'upload' && entry.binary)
-            await verifyBinary(root, entry.binary);
+            await verifyBinary(root, entry.binary, signal);
         }
       }
       if (stableJson(actualCounts) !== stableJson(manifest.counts))
@@ -947,15 +1037,18 @@ export async function readBundle({
     }
     // A second streamed pass makes import all-or-nothing without keeping the plan
     // in memory. Rechecking the chunks also detects changes between passes.
+    assertNotAborted(signal);
     store.database.exec('BEGIN');
     try {
-      for await (const chunk of chunkIndex(root, manifest.chunks)) {
-        for await (const entry of chunkEntries(root, chunk)) {
+      for await (const chunk of chunkIndex(root, manifest.chunks, signal)) {
+        for await (const entry of chunkEntries(root, chunk, signal)) {
+          assertNotAborted(signal);
           if (entry.kind === 'upload' && entry.binary)
-            await verifyBinary(root, entry.binary);
+            await verifyBinary(root, entry.binary, signal);
           store.putPlan(entry);
         }
       }
+      assertNotAborted(signal);
       store.database.exec('COMMIT');
     } catch (error) {
       store.database.exec('ROLLBACK');
@@ -963,6 +1056,7 @@ export async function readBundle({
     }
     return manifest;
   } catch (error) {
+    assertNotAborted(signal);
     if (error instanceof ContentError) throw error;
     throw new ContentError(
       'INVALID_BUNDLE',

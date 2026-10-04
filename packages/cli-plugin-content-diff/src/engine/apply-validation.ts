@@ -1,5 +1,11 @@
-import { hashJson, inspectRecord, object } from './codec';
+import {
+  hashJson,
+  inspectRecord,
+  object,
+  unsupportedRecordPayloadKey,
+} from './codec';
 import { ContentError } from './errors';
+import { recordBlockTransitionIssue } from './planner';
 import {
   aggregateFields,
   creationEmptyValue,
@@ -21,6 +27,23 @@ export function validateExecution(args: {
   const invalid = (reason: string): never => {
     throw new ContentError('INVALID_BUNDLE', `Record ${entry.id}: ${reason}`);
   };
+  if (
+    entry.desired &&
+    (entry.action === 'create' || entry.action === 'update')
+  ) {
+    for (const fields of [entry.desired.current, entry.desired.published]) {
+      if (!fields) continue;
+      const unsupported = unsupportedRecordPayloadKey(
+        fields,
+        entry.modelId,
+        schema,
+      );
+      if (unsupported)
+        invalid(
+          `payload metadata ${unsupported} cannot round-trip through the SDK`,
+        );
+    }
+  }
   if (entry.action === 'update' && !entry.baseline?.currentVersion)
     invalid('missing optimistic locking version');
   for (const key of [
@@ -35,6 +58,15 @@ export function validateExecution(args: {
   }
   if (entry.execution?.preclearFieldIds?.length)
     invalid('unsupported field preclear operation');
+  // The CMA accepts existing block IDs only from the current field/locale,
+  // not merely because publication still retains them. Recheck the actual
+  // seed/publication/current write sequence for imported bundles as well.
+  const blockIssue = recordBlockTransitionIssue(entry, schema, changes);
+  if (blockIssue)
+    throw new ContentError(blockIssue.code, blockIssue.message, {
+      recordId: entry.id,
+      dependencyId: blockIssue.dependencyId,
+    });
   const seed = entry.execution?.creationFields;
   if (!seed) return;
   if (entry.action !== 'create' || !entry.desired)
@@ -56,12 +88,22 @@ export function validateExecution(args: {
   ).references;
   for (const [key, value] of Object.entries(seed)) {
     if (hashJson(value) === hashJson(original[key])) continue;
-    const deferred = references.some(
-      (reference) =>
-        reference.kind !== 'upload' &&
-        (reference.path === key || reference.path.startsWith(`${key}.`)) &&
-        store.getPlan('record', reference.targetId)?.action === 'create',
-    );
+    const deferred = references.some((reference) => {
+      if (
+        reference.kind === 'upload' ||
+        !(reference.path === key || reference.path.startsWith(`${key}.`))
+      )
+        return false;
+      const dependency = store.getPlan('record', reference.targetId);
+      return (
+        dependency?.action === 'create' ||
+        (!model!.draftMode &&
+          dependency?.kind === 'record' &&
+          dependency.action === 'update' &&
+          !dependency.baseline?.published &&
+          !!dependency.desired?.published)
+      );
+    });
     const field = model!.fields.find((candidate) => candidate.apiKey === key);
     const emptyValue = creationEmptyValue(field?.type ?? '');
     const preservesLocaleKeys =

@@ -370,6 +370,75 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
     assert.equal(target.next().done, true);
   });
 
+  it('bounds record-scoped dependency cleanup and reads to the requested record index', () => {
+    const value = store();
+    value.transaction(() => {
+      for (let index = 0; index < 128; index++) {
+        const id = `record-${String(index).padStart(3, '0')}`;
+        for (const suffix of ['z', 'a']) {
+          value.putBlockOwner('source', {
+            blockId: `${suffix}-${id}`,
+            recordId: id,
+            modelId: 'block',
+            path: 'blocks',
+            slice: 'current',
+          });
+          value.putUniqueValue('source', {
+            recordId: id,
+            modelId: 'model-a',
+            fieldId: suffix,
+            locale: 'en',
+            slice: 'current',
+            valueKey: id,
+          });
+        }
+      }
+    });
+    const prepare = value.database.prepare.bind(value.database);
+    const checked = new Set<string>();
+    value.database.prepare = (sql) => {
+      if (
+        (sql.startsWith('DELETE FROM block_owners') ||
+          sql.startsWith('SELECT * FROM block_owners') ||
+          sql.startsWith('SELECT * FROM unique_values')) &&
+        sql.includes('record_id = ?')
+      ) {
+        const plan = prepare(`EXPLAIN QUERY PLAN ${sql}`).all(
+          'source',
+          'record-000',
+        );
+        // SQLite can prefer a side-only primary-key scan over the existing
+        // record index. At project scale that makes per-record work quadratic.
+        assert.ok(
+          plan.some((row) =>
+            String(row.detail).includes('(side=? AND record_id=?)'),
+          ),
+          JSON.stringify({ sql, plan }),
+        );
+        checked.add(sql);
+      }
+      return prepare(sql);
+    };
+    assert.deepEqual(
+      [...value.blockOwners('source', 'record-000')].map(
+        (owner) => owner.blockId,
+      ),
+      ['a-record-000', 'z-record-000'],
+    );
+    assert.deepEqual(
+      [...value.uniqueValues('source', 'record-000')].map(
+        (item) => item.fieldId,
+      ),
+      ['a', 'z'],
+    );
+    value.putRecord('source', record('record-000'));
+    assert.equal([...value.blockOwners('source', 'record-000')].length, 0);
+    assert.equal([...value.uniqueValues('source', 'record-000')].length, 0);
+    assert.equal([...value.blockOwners('source', 'record-001')].length, 2);
+    assert.equal([...value.uniqueValues('source', 'record-001')].length, 2);
+    assert.equal(checked.size, 3);
+  });
+
   it('streams deterministic UTF-8 chunks, keeps noops compact, and never splits oversized entries', async () => {
     const source = store();
     const entries: PlanEntry[] = [
@@ -678,6 +747,127 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
     }
   });
 
+  it('downloads original asset bytes with dashboard controls while preserving captured URLs and other query parameters', async () => {
+    for (const format of ['svg', 'jpg']) {
+      const source = store();
+      const bytes =
+        format === 'svg'
+          ? Buffer.from(
+              '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0"/></svg>\n',
+            )
+          : Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 1, 2, 3, 0xff, 0xd9]);
+      const filename = `original + copy.${format}`;
+      const capturedUrl = `https://assets.example/original.${format}?download_key=opaque%2Bvalue&keep=one&keep=two&dl=preview&skip-default-optimizations=false&svg-sanitize=true`;
+      const desired = withUploadHash({
+        ...upload(format, bytes),
+        filename,
+        url: capturedUrl,
+      });
+      const entry: PlanEntry = {
+        kind: 'upload',
+        id: format,
+        action: 'create',
+        baseline: null,
+        desired,
+        guard: null,
+        diagnostics: [],
+      };
+      source.putPlan(entry);
+      const requested: URL[] = [];
+      const output = await writeBundle({
+        store: source,
+        metadata: metadata([entry]),
+        outputPath: join(directory, `original-${format}`),
+        fetchFn: (async (input) => {
+          const url = new URL(String(input));
+          requested.push(url);
+          const original =
+            url.searchParams.get('svg-sanitize') === 'false' &&
+            url.searchParams.get('skip-default-optimizations') === 'true';
+          // Imgix's default SVG sanitization adds a declaration/formatting;
+          // project-level image optimizations can also change raster bytes.
+          return new Response(
+            original
+              ? bytes
+              : Buffer.concat([Buffer.from('<?xml version="1.0"?>\n'), bytes]),
+          );
+        }) as typeof fetch,
+      });
+      assert.equal(requested.length, 1);
+      assert.equal(requested[0].pathname, `/original.${format}`);
+      assert.equal(requested[0].searchParams.get('dl'), filename);
+      assert.equal(requested[0].searchParams.get('svg-sanitize'), 'false');
+      assert.equal(
+        requested[0].searchParams.get('skip-default-optimizations'),
+        'true',
+      );
+      assert.equal(
+        requested[0].searchParams.get('download_key'),
+        'opaque+value',
+      );
+      assert.deepEqual(requested[0].searchParams.getAll('keep'), [
+        'one',
+        'two',
+      ]);
+      const imported = store();
+      await readBundle({ directory: output, store: imported });
+      const saved = imported.getPlan('upload', format)!;
+      assert(saved.kind === 'upload' && saved.binary);
+      assert.equal(saved.desired!.url, capturedUrl);
+      assert.equal(saved.binary.md5, digest(bytes, 'md5'));
+      assert.equal(saved.binary.bytes, bytes.length);
+      assert.deepEqual(await readFile(join(output, saved.binary.file)), bytes);
+    }
+  });
+
+  it('retains exact size and checksum enforcement on original-download requests', async () => {
+    const bytes = Buffer.from('unchanged original binary');
+    for (const corruption of ['size', 'checksum']) {
+      const source = store();
+      const desired = upload(corruption, bytes);
+      const entry: PlanEntry = {
+        kind: 'upload',
+        id: corruption,
+        action: 'create',
+        baseline: null,
+        desired,
+        guard: null,
+        diagnostics: [],
+      };
+      source.putPlan(entry);
+      const output = join(directory, `corrupt-original-${corruption}`);
+      const corrupted =
+        corruption === 'size'
+          ? Buffer.concat([bytes, Buffer.from('extra')])
+          : Buffer.from(bytes);
+      if (corruption === 'checksum') corrupted[0] ^= 1;
+      await assert.rejects(
+        writeBundle({
+          store: source,
+          metadata: metadata([entry]),
+          outputPath: output,
+          fetchFn: (async (input) => {
+            const url = new URL(String(input));
+            assert.equal(
+              url.searchParams.get('skip-default-optimizations'),
+              'true',
+            );
+            assert.equal(url.searchParams.get('svg-sanitize'), 'false');
+            return new Response(corrupted);
+          }) as typeof fetch,
+        }),
+        /exceeds its captured size|differs from the captured binary/,
+      );
+      assert.equal(existsSync(output), false);
+      assert.equal(
+        (await readdir(directory)).some((name) =>
+          name.startsWith(`.corrupt-original-${corruption}-`),
+        ),
+        false,
+      );
+    }
+  });
+
   it('does not download an upload metadata-only update', async () => {
     const source = store();
     const baseline = upload('one', Buffer.from('asset'));
@@ -767,6 +957,162 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
       ),
       false,
     );
+  });
+
+  it('cancels an unsuccessful asset response before removing its incomplete bundle', async () => {
+    const source = store();
+    const entry: PlanEntry = {
+      kind: 'upload',
+      id: 'one',
+      action: 'create',
+      guard: null,
+      baseline: null,
+      desired: upload('one', Buffer.from('asset')),
+      diagnostics: [],
+    };
+    source.putPlan(entry);
+    let cancelled = false;
+    const output = join(directory, 'bundle');
+    await assert.rejects(
+      writeBundle({
+        store: source,
+        metadata: metadata([entry]),
+        outputPath: output,
+        fetchFn: (async () =>
+          new Response(
+            new ReadableStream({
+              cancel() {
+                cancelled = true;
+              },
+            }),
+            { status: 404 },
+          )) as typeof fetch,
+      }),
+      /could not be downloaded \(404\)/,
+    );
+    assert.equal(cancelled, true);
+    assert.equal(existsSync(output), false);
+    assert.equal(
+      (await readdir(directory)).some((name) =>
+        name.startsWith('.content-bundle-'),
+      ),
+      false,
+    );
+  });
+
+  it('aborts pending asset fetches with the supplied signal and removes their incomplete bundle', async () => {
+    const source = store();
+    const entry: PlanEntry = {
+      kind: 'upload',
+      id: 'one',
+      action: 'create',
+      guard: null,
+      baseline: null,
+      desired: upload('one', Buffer.from('asset')),
+      diagnostics: [],
+    };
+    source.putPlan(entry);
+    const controller = new AbortController();
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const output = join(directory, 'bundle');
+    const writing = writeBundle({
+      store: source,
+      metadata: metadata([entry]),
+      outputPath: output,
+      signal: controller.signal,
+      fetchFn: (async (_url, init) => {
+        assert.equal(init?.signal, controller.signal);
+        ready();
+        return new Promise<Response>((_resolve, reject) => {
+          init!.signal!.addEventListener(
+            'abort',
+            () => reject(new Error('native fetch aborted')),
+            { once: true },
+          );
+        });
+      }) as typeof fetch,
+    });
+    const rejected = assert.rejects(
+      writing,
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'INTERRUPTED',
+    );
+    await started;
+    controller.abort();
+    await rejected;
+    assert.equal(existsSync(output), false);
+    assert.equal(
+      (await readdir(directory)).some((name) =>
+        name.startsWith('.content-bundle-'),
+      ),
+      false,
+    );
+  });
+
+  it('releases an interrupted asset body and rejects pre-aborted output before creating directories', async () => {
+    const source = store();
+    const bytes = Buffer.from('asset');
+    const entry: PlanEntry = {
+      kind: 'upload',
+      id: 'one',
+      action: 'create',
+      guard: null,
+      baseline: null,
+      desired: upload('one', bytes),
+      diagnostics: [],
+    };
+    source.putPlan(entry);
+    const controller = new AbortController();
+    let cancelled = false;
+    let pulls = 0;
+    const output = join(directory, 'bundle');
+    await assert.rejects(
+      writeBundle({
+        store: source,
+        metadata: metadata([entry]),
+        outputPath: output,
+        signal: controller.signal,
+        fetchFn: (async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              pull(stream) {
+                if (++pulls > 1) controller.abort();
+                stream.enqueue(bytes.subarray(0, 1));
+              },
+              cancel() {
+                cancelled = true;
+              },
+            }),
+          )) as typeof fetch,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'INTERRUPTED',
+    );
+    assert.equal(cancelled, true);
+    assert.equal(existsSync(output), false);
+    assert.equal(
+      (await readdir(directory)).some((name) =>
+        name.startsWith('.content-bundle-'),
+      ),
+      false,
+    );
+    const parent = join(directory, 'never-created');
+    await assert.rejects(
+      writeBundle({
+        store: source,
+        metadata: metadata([entry]),
+        outputPath: join(parent, 'bundle'),
+        signal: controller.signal,
+        fetchFn: (async () =>
+          assert.fail('Pre-aborted bundle must not download')) as typeof fetch,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'INTERRUPTED',
+    );
+    assert.equal(existsSync(parent), false);
   });
 
   it('rejects chunk corruption, traversal, symlinks, and missing binary integrity before importing entries', async () => {
@@ -862,7 +1208,13 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
       id: 'collection',
       label: 'Original',
       parentId: null,
-      hash: hashJson({ id: 'collection', label: 'Original', parentId: null }),
+      position: 1,
+      hash: hashJson({
+        id: 'collection',
+        label: 'Original',
+        parentId: null,
+        position: 1,
+      }),
     };
     const cases: Array<{
       name: string;
@@ -921,6 +1273,35 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
           manifest.schema.workflows.push({ id: 'forged' });
         },
       },
+      ...['position-hash', 'position-fraction', 'position-missing'].map(
+        (name) => ({
+          name,
+          entry: {
+            kind: 'collection' as const,
+            id: collection.id,
+            action: 'create' as const,
+            guard: null,
+            baseline: null,
+            desired: collection,
+            diagnostics: [],
+          },
+          mutate: (entry: PlanEntry) => {
+            if (entry.kind !== 'collection') return;
+            if (name === 'position-hash') entry.desired!.position = 2;
+            else if (name === 'position-missing')
+              Reflect.deleteProperty(entry.desired!, 'position');
+            else {
+              entry.desired!.position = 1.5;
+              entry.desired!.hash = hashJson({
+                id: collection.id,
+                label: collection.label,
+                parentId: null,
+                position: 1.5,
+              });
+            }
+          },
+        }),
+      ),
     ];
     for (const item of cases) {
       const source = store();
@@ -955,96 +1336,198 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
     }
   });
 
-  it('accepts exact validator removal/default suppression and rejects forged temporary field changes', async () => {
-    const source = store();
-    const entry = recordPlan('record');
-    source.putPlan(entry);
-    const planMetadata = metadata([entry]);
-    planMetadata.schema.models = [
-      {
-        id: 'model-a',
-        apiKey: 'article',
-        name: 'Article',
-        block: false,
-        singleton: false,
-        sortable: false,
-        tree: false,
-        draftMode: true,
-        saveInvalidDrafts: false,
-        allLocalesRequired: false,
-        workflowId: null,
-        fields: [
-          {
-            id: 'field-a',
-            apiKey: 'title',
-            type: 'string',
-            localized: false,
-            validators: { required: {}, length: { max: 25 } },
-            defaultValue: 'automatic',
-          },
-        ],
-      },
-    ];
-    const field = planMetadata.schema.models[0].fields[0];
-    planMetadata.schema.hash = hashJson({
-      locales: planMetadata.schema.locales,
-      semantics: planMetadata.schema.semantics,
-      models: planMetadata.schema.models,
-      workflows: planMetadata.schema.workflows,
-    });
-    planMetadata.options.allowTemporarySchemaChanges = true;
-    planMetadata.temporarySchemaChanges = [
-      {
-        fieldId: field.id,
-        modelId: 'model-a',
-        original: {
-          validators: field.validators,
-          defaultValue: field.defaultValue,
+  it('rejects unsafe integer validator metadata before importing temporary schema restoration settings', async () => {
+    for (const target of ['original', 'temporary']) {
+      const source = store();
+      const entry = recordPlan('record', 'update');
+      source.putPlan(entry);
+      const meta = metadata([entry]);
+      meta.schema.models = [
+        {
+          id: 'model-a',
+          apiKey: 'article',
+          name: 'Article',
+          block: false,
+          singleton: false,
+          sortable: false,
+          tree: false,
+          draftMode: true,
+          saveInvalidDrafts: true,
+          allLocalesRequired: false,
+          workflowId: null,
+          fields: [
+            {
+              id: 'counter-field',
+              apiKey: 'title',
+              type: 'integer',
+              localized: false,
+              validators: { number_range: { min: 0 } },
+              defaultValue: null,
+            },
+          ],
         },
-        temporary: { validators: { length: { max: 25 } }, defaultValue: null },
-        reasons: ['Required creation reference is temporarily deferred.'],
-      },
-    ];
-    for (const attack of [
-      'valid',
-      'addition',
-      'modified',
-      'default',
-      'field',
-      'original',
-      'duplicate',
-      'reasons',
-    ]) {
+      ];
+      meta.schema.hash = hashJson({
+        locales: meta.schema.locales,
+        semantics: meta.schema.semantics,
+        models: meta.schema.models,
+        workflows: meta.schema.workflows,
+      });
+      meta.options.allowTemporarySchemaChanges = true;
+      meta.temporarySchemaChanges = [
+        {
+          fieldId: 'counter-field',
+          modelId: 'model-a',
+          original: {
+            validators: { number_range: { min: 0 } },
+            defaultValue: null,
+          },
+          temporary: { validators: {}, defaultValue: null },
+          reasons: ['Permit the reviewed transition.'],
+        },
+      ];
       const output = await writeBundle({
         store: source,
-        metadata: planMetadata,
-        outputPath: join(directory, attack),
+        metadata: meta,
+        outputPath: join(directory, `unsafe-validators-${target}`),
       });
       const manifest = JSON.parse(
         await readFile(join(output, 'manifest.json'), 'utf8'),
       ) as BundleManifest;
-      const change = manifest.temporarySchemaChanges[0];
-      if (attack === 'addition')
-        change.temporary.validators.enum = { values: ['other'] };
-      if (attack === 'modified')
-        change.temporary.validators.length = { max: 1 };
-      if (attack === 'default') change.temporary.defaultValue = 'different';
-      if (attack === 'field') change.fieldId = 'outside-field';
-      if (attack === 'original') change.original.defaultValue = 'different';
-      if (attack === 'duplicate') manifest.temporarySchemaChanges.push(change);
-      if (attack === 'reasons') change.reasons = [];
+      const unsafe = JSON.parse('9007199254740993') as number;
+      if (target === 'original') {
+        manifest.schema.models[0].fields[0].validators = {
+          number_range: { min: unsafe },
+        };
+        manifest.temporarySchemaChanges[0].original.validators = {
+          number_range: { min: unsafe },
+        };
+        manifest.schema.hash = hashJson({
+          locales: manifest.schema.locales,
+          semantics: manifest.schema.semantics,
+          models: manifest.schema.models,
+          workflows: manifest.schema.workflows,
+        });
+      } else
+        manifest.temporarySchemaChanges[0].temporary.validators = {
+          number_range: { min: unsafe },
+        };
       await reseal(output, manifest);
       const imported = store();
-      if (attack === 'valid')
-        await readBundle({ directory: output, store: imported });
-      else {
-        await assert.rejects(
-          readBundle({ directory: output, store: imported }),
-          (error: unknown) =>
-            error instanceof ContentError && error.code === 'INVALID_BUNDLE',
-          attack,
-        );
-        assert.equal([...imported.planEntries()].length, 0);
+      await assert.rejects(
+        readBundle({ directory: output, store: imported }),
+        (error) =>
+          error instanceof ContentError &&
+          error.code === 'UNSUPPORTED_INTEGER_PRECISION',
+      );
+      assert.equal([...imported.planEntries()].length, 0);
+    }
+  });
+
+  it('accepts exact validator removal/default suppression and rejects forged temporary field changes', async () => {
+    for (const localized of [false, true]) {
+      const source = store();
+      const entry = recordPlan('record');
+      source.putPlan(entry);
+      const planMetadata = metadata([entry]);
+      planMetadata.schema.models = [
+        {
+          id: 'model-a',
+          apiKey: 'article',
+          name: 'Article',
+          block: false,
+          singleton: false,
+          sortable: false,
+          tree: false,
+          draftMode: true,
+          saveInvalidDrafts: false,
+          allLocalesRequired: false,
+          workflowId: null,
+          fields: [
+            {
+              id: 'field-a',
+              apiKey: 'title',
+              type: 'string',
+              localized,
+              validators: { required: {}, length: { max: 25 } },
+              defaultValue: localized ? { en: 'automatic' } : 'automatic',
+            },
+          ],
+        },
+      ];
+      const field = planMetadata.schema.models[0].fields[0];
+      planMetadata.schema.hash = hashJson({
+        locales: planMetadata.schema.locales,
+        semantics: planMetadata.schema.semantics,
+        models: planMetadata.schema.models,
+        workflows: planMetadata.schema.workflows,
+      });
+      planMetadata.options.allowTemporarySchemaChanges = true;
+      planMetadata.temporarySchemaChanges = [
+        {
+          fieldId: field.id,
+          modelId: 'model-a',
+          original: {
+            validators: field.validators,
+            defaultValue: field.defaultValue,
+          },
+          temporary: {
+            validators: { length: { max: 25 } },
+            defaultValue: localized ? { en: null } : null,
+          },
+          reasons: ['Required creation reference is temporarily deferred.'],
+        },
+      ];
+      for (const attack of [
+        'valid',
+        'unchanged',
+        ...(localized ? ['scalar-null', 'missing-locale', 'extra-locale'] : []),
+        'addition',
+        'modified',
+        'default',
+        'field',
+        'original',
+        'duplicate',
+        'reasons',
+      ]) {
+        const output = await writeBundle({
+          store: source,
+          metadata: planMetadata,
+          outputPath: join(directory, `${localized}-${attack}`),
+        });
+        const manifest = JSON.parse(
+          await readFile(join(output, 'manifest.json'), 'utf8'),
+        ) as BundleManifest;
+        const change = manifest.temporarySchemaChanges[0];
+        if (attack === 'unchanged')
+          change.temporary.defaultValue = change.original.defaultValue;
+        if (attack === 'scalar-null') change.temporary.defaultValue = null;
+        if (attack === 'missing-locale') change.temporary.defaultValue = {};
+        if (attack === 'extra-locale')
+          change.temporary.defaultValue = { en: null, it: null };
+        if (attack === 'addition')
+          change.temporary.validators.enum = { values: ['other'] };
+        if (attack === 'modified')
+          change.temporary.validators.length = { max: 1 };
+        if (attack === 'default') change.temporary.defaultValue = 'different';
+        if (attack === 'field') change.fieldId = 'outside-field';
+        if (attack === 'original') change.original.defaultValue = 'different';
+        if (attack === 'duplicate')
+          manifest.temporarySchemaChanges.push(change);
+        if (attack === 'reasons') change.reasons = [];
+        await reseal(output, manifest);
+        const imported = store();
+        if (attack === 'valid' || attack === 'unchanged')
+          await readBundle({ directory: output, store: imported });
+        else {
+          await assert.rejects(
+            readBundle({ directory: output, store: imported }),
+            (error: unknown) =>
+              error instanceof ContentError && error.code === 'INVALID_BUNDLE',
+            attack,
+          );
+          assert.equal([...imported.planEntries()].length, 0);
+        }
       }
     }
   });
@@ -1082,5 +1565,76 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
       /Chunk size differs/,
     );
     assert.equal([...imported.planEntries()].length, 0);
+  });
+
+  it('interrupts buffered bundle validation and rolls back an interrupted import while retaining the completed export', async () => {
+    const source = store();
+    const entries = Array.from({ length: 128 }, (_, index) =>
+      recordPlan(`record-${String(index).padStart(3, '0')}`),
+    );
+    source.transaction(() => {
+      for (const entry of entries) source.putPlan(entry);
+    });
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata(entries),
+      outputPath: join(directory, 'bundle'),
+    });
+    for (const phase of ['validation', 'import']) {
+      const imported = store();
+      const controller = new AbortController();
+      let scanned = 0;
+      let inserted = 0;
+      const prepare = imported.database.prepare.bind(imported.database);
+      imported.database.prepare = (sql) => {
+        const statement = prepare(sql);
+        if (sql === 'INSERT INTO bundle_keys VALUES (?, ?)') {
+          const run = statement.run.bind(statement);
+          statement.run = (...parameters) => {
+            const result = Reflect.apply(
+              run,
+              statement,
+              parameters,
+            ) as ReturnType<typeof statement.run>;
+            if (++scanned === 1 && phase === 'validation')
+              setImmediate(() => controller.abort());
+            return result;
+          };
+        }
+        return statement;
+      };
+      const putPlan = imported.putPlan.bind(imported);
+      imported.putPlan = (entry) => {
+        putPlan(entry);
+        if (++inserted === 1 && phase === 'import') controller.abort();
+      };
+      await assert.rejects(
+        readBundle({
+          directory: output,
+          store: imported,
+          signal: controller.signal,
+        }),
+        (error: unknown) =>
+          error instanceof ContentError && error.code === 'INTERRUPTED',
+        phase,
+      );
+      if (phase === 'validation') {
+        assert.ok(scanned > 0 && scanned < entries.length);
+        assert.equal(inserted, 0);
+      } else {
+        assert.equal(scanned, entries.length);
+        assert.equal(inserted, 1);
+      }
+      assert.equal([...imported.planEntries()].length, 0);
+      assert.equal(
+        imported.database
+          .prepare(
+            "SELECT name FROM sqlite_temp_master WHERE name='bundle_keys'",
+          )
+          .get(),
+        undefined,
+      );
+      assert.equal(existsSync(join(output, 'manifest.json')), true);
+    }
   });
 });

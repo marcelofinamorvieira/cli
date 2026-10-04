@@ -31,6 +31,14 @@ datocms content:diff \
 
 Unsafe requested changes fail generation by default. Partial mode does not bypass incompatible schemas, incomplete access proofs, or execution conflicts. Legacy/nonportable identifiers and unsupported lifecycle states are diagnosed during planning. DatoCMS computes validity flags asynchronously; the plugin preserves content and publication state, while the restored schema determines final validity. Known field-validation failures require an explicit, narrowly scoped temporary change.
 
+Native file/gallery metadata that the CMA client cannot safely preserve is rejected before writes. This includes reserved keys such as `__proto__` and `__itemTypeId`, and metadata objects with `type: "item"`. These strings remain safe inside a JSON field's serialized JSON text. Existing unsupported values can remain unchanged. A scheduled invalid draft is rejected when its schedule cannot be recreated under the intended final schema.
+
+Asset folders include labels, parent hierarchy, and exact positions. Plans account for DatoCMS's sibling renumbering when folders move. Conflicting sibling names or transitions that cannot preserve the intended hierarchy and order are diagnosed before writes; partial mode can skip only their isolated dependency closure.
+
+Block IDs can be reused only where DatoCMS permits them in the current record version. Unsafe ownership changes and block recreation that would substitute defaults without declared suppression are diagnosed before writes.
+
+Integer fields, integer defaults, and integer-valued validator settings must stay within JavaScript's safe integer range (±9,007,199,254,740,991). Larger values are rejected before comparison or writes to prevent rounding by the CMA client's JSON parser. Floating-point fields retain their normal number semantics, and JSON fields remain opaque serialized text.
+
 Use the DatoCMS CLI's `--profile`, `--api-token`, linked-project OAuth authentication, and configured token environment variables. To compare different projects, select both endpoint profiles:
 
 ```sh
@@ -70,6 +78,8 @@ DatoCMS provides no public persistent sandbox write freeze. Maintenance mode app
 A complete bundle contains a small checksummed `manifest.json`, a streamed checksummed `chunks.jsonl` index, deterministic byte-bounded JSONL plan chunks, and checksummed asset files referenced by upload entries. Integrity checks reject unsafe relative paths, symlinks, duplicate identities, malformed executable states, and changed bytes. Bundles are content exports and exclude client authentication credentials.
 
 Generation and application are one-shot operations. Temporary SQLite databases and staging files are removed on completion or failure. Completed bundles survive application and can be retained as exports. The format does not accept progress files, checkpoints, or temporary databases as inputs. Previous unreleased generated migration/runtimes are unsupported.
+
+SIGINT and SIGTERM stop queued work, wait for submitted CMA operations to settle, and run the same restoration and cleanup as other failures. Cleanup can take time while a CMA operation is pending. Forced process termination, such as SIGKILL or a machine shutdown, cannot run cleanup; inspect the destination before starting a new operation.
 
 Both commands support `--json` and the standard CLI logging flags. Authentication credentials are redacted from request logs and surfaced errors.
 

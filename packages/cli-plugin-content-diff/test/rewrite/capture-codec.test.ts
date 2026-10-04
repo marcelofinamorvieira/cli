@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { buildBlockRecord } from '@datocms/cma-client';
-import { deserializeJsonEntity } from '@datocms/rest-client-utils';
+import { buildClient } from '@datocms/cma-client-node';
+import {
+  deserializeJsonEntity,
+  serializeRawRequestBodyWithItems,
+} from '@datocms/rest-client-utils';
 import {
   captureSnapshot,
   readRecordBatch,
@@ -17,6 +21,7 @@ import {
   inspectRecord,
   recordGuard,
   recordPayloadFields,
+  unsupportedRecordPayloadKey,
 } from '../../src/engine/codec';
 import { ContentError } from '../../src/engine/errors';
 import {
@@ -146,6 +151,15 @@ function mockClient(
     improved_hex_management: true,
   };
   const mock = {
+    request: async (request: {
+      method: string;
+      url: string;
+      queryParams?: Record<string, unknown>;
+    }): Promise<unknown> => {
+      assert.equal(request.method, 'GET');
+      assert.equal(request.url, '/items');
+      return mock.items.rawList(request.queryParams as ListArgs);
+    },
     site: {
       find: async () => ({
         id: 'site',
@@ -394,6 +408,93 @@ describe('expanded capture and native payload codec', () => {
     );
   });
 
+  it('detects custom metadata keys lost by native SDK serialization without rejecting block annotations or JSON strings', () => {
+    const localizedFile = { ...field('image', 'file'), localized: true };
+    const schema = state([
+      model(MODEL, [
+        field('images', 'gallery'),
+        field('blocks', 'rich_text'),
+        field('opaque', 'json'),
+      ]),
+      model(BLOCK, [localizedFile], true),
+    ]);
+    for (const key of ['__itemTypeId', '__proto__']) {
+      const customData = JSON.parse(
+        `{"${key}":"business-value","credit":"Artist"}`,
+      ) as JsonObject;
+      const file = {
+        upload_id: ASSET,
+        alt: null,
+        title: null,
+        custom_data: customData,
+        focal_point: null,
+        poster_time: null,
+      };
+      const sourceFields: JsonObject = {
+        images: [file],
+        blocks: [
+          {
+            id: NESTED,
+            __itemTypeId: BLOCK,
+            attributes: { image: { en: file } },
+          },
+        ],
+        opaque: JSON.stringify(customData),
+      };
+      const canonical = canonicalFields(sourceFields, MODEL, schema);
+      const native = recordPayloadFields(canonical, MODEL, schema);
+      const serialized = serializeRawRequestBodyWithItems({
+        data: { id: RECORD, type: 'item', attributes: native },
+      });
+      assert.equal(
+        Object.hasOwn(
+          (native.images as JsonObject[])[0].custom_data as JsonObject,
+          key,
+        ),
+        true,
+      );
+      assert.equal(
+        Object.hasOwn(serialized.data.attributes.images[0].custom_data, key),
+        false,
+      );
+      assert.equal(serialized.data.attributes.opaque, sourceFields.opaque);
+      assert.equal(unsupportedRecordPayloadKey(canonical, MODEL, schema), key);
+      // Check both the direct gallery and localized nested file independently.
+      assert.equal(
+        unsupportedRecordPayloadKey(
+          { ...canonical, blocks: [] },
+          MODEL,
+          schema,
+        ),
+        key,
+      );
+      assert.equal(
+        unsupportedRecordPayloadKey(
+          { ...canonical, images: [] },
+          MODEL,
+          schema,
+        ),
+        key,
+      );
+      const safe = canonicalFields(
+        {
+          images: [{ ...file, custom_data: { credit: 'Artist' } }],
+          blocks: [
+            {
+              id: NESTED,
+              __itemTypeId: BLOCK,
+              attributes: { image: { en: { ...file, custom_data: {} } } },
+            },
+          ],
+          opaque: sourceFields.opaque,
+        },
+        MODEL,
+        schema,
+      );
+      assert.equal(unsupportedRecordPayloadKey(safe, MODEL, schema), undefined);
+    }
+  });
+
   it('canonicalizes native asset and collection resources without dropping localized metadata', () => {
     const localeMetadata = {
       en: {
@@ -442,13 +543,157 @@ describe('expanded capture and native payload codec', () => {
     const collection = {
       id: identity('collection'),
       type: 'upload_collection',
-      attributes: { label: 'Images' },
+      attributes: { label: 'Images', position: 1 },
       relationships: { parent: { data: null } },
     };
     assert.deepEqual(
       canonicalCollection(collection),
       canonicalCollection(deserializeJsonEntity(collection)),
     );
+  });
+
+  it('retains native collection positions in fingerprints, including sparse negative indexes', () => {
+    const input = {
+      id: identity('positioned-collection'),
+      label: 'Collection',
+      parent: null,
+    };
+    assert.notDeepEqual(
+      canonicalCollection({ ...input, position: -3 }),
+      canonicalCollection({ ...input, position: 8 }),
+    );
+    assert.throws(() => canonicalCollection(input), /position/);
+    assert.throws(
+      () => canonicalCollection({ ...input, position: 1.5 }),
+      /position/,
+    );
+  });
+
+  it('rejects collection-position-only drift during the independent capture check', async () => {
+    const fixture = mockClient();
+    let reads = 0;
+    fixture.client.uploadCollections.list = async () => [
+      {
+        id: identity('moving-collection'),
+        type: 'upload_collection',
+        label: 'Collection',
+        position: ++reads,
+        parent: null,
+        children: [],
+      },
+    ];
+    const store = new SnapshotStore();
+    try {
+      const schema = await fetchSchema(fixture.client, 'source');
+      await assert.rejects(
+        captureSnapshot({
+          client: fixture.client,
+          environmentId: 'source',
+          schema,
+          store,
+          side: 'source',
+          options: { modelIds: [MODEL], uploads: 'all', concurrency: 1 },
+          verify: true,
+        }),
+        /changed during capture/,
+      );
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('rejects metadata mistaken for an item by SDK response adaptation while allowing real blocks and JSON strings', async () => {
+    const schema = state([
+      model(MODEL, [
+        field('image', 'file'),
+        field('images', 'gallery'),
+        field('blocks', 'rich_text'),
+        field('content', 'structured_text'),
+        field('opaque', 'json'),
+      ]),
+      model(BLOCK, [{ ...field('image', 'file'), localized: true }], true),
+    ]);
+    const image = (type: string): JsonObject => ({
+      upload_id: ASSET,
+      alt: null,
+      title: null,
+      custom_data: { type, credit: 'Artist' },
+      focal_point: null,
+      poster_time: null,
+    });
+    const block = (type: string): JsonObject => ({
+      id: NESTED,
+      __itemTypeId: BLOCK,
+      attributes: { image: { en: image(type) } },
+    });
+    const safe: JsonObject = {
+      image: image('photo'),
+      images: [image('photo')],
+      blocks: [block('photo')],
+      content: {
+        schema: 'dast',
+        document: {
+          type: 'root',
+          children: [{ type: 'block', item: block('photo') }],
+        },
+      },
+      opaque: JSON.stringify({ type: 'item', __itemTypeId: 'business-data' }),
+    };
+    assert.equal(
+      unsupportedRecordPayloadKey(
+        canonicalFields(safe, MODEL, schema),
+        MODEL,
+        schema,
+      ),
+      undefined,
+    );
+    for (const placement of ['file', 'gallery', 'nested', 'dast']) {
+      const fields = structuredClone(safe);
+      if (placement === 'file') fields.image = image('item');
+      if (placement === 'gallery') fields.images = [image('item')];
+      if (placement === 'nested') fields.blocks = [block('item')];
+      if (placement === 'dast')
+        fields.content = {
+          schema: 'dast',
+          document: {
+            type: 'root',
+            children: [{ type: 'block', item: block('item') }],
+          },
+        };
+      const canonical = canonicalFields(fields, MODEL, schema);
+      let writes = 0;
+      const client = buildClient({
+        apiToken: 'offline-fixture-token',
+        fetchFn: async (_url, init) => {
+          writes++;
+          const body = JSON.parse(String(init?.body)) as {
+            data: { attributes: JsonObject };
+          };
+          // The native write succeeds, but the SDK adapter then mistakes the
+          // custom_data object for a record and throws after the transport.
+          return new Response(
+            JSON.stringify({ data: rawRecord(RECORD, body.data.attributes) }),
+            { headers: { 'content-type': 'application/json' } },
+          );
+        },
+      });
+      await assert.rejects(
+        client.items.rawUpdate(RECORD, {
+          data: {
+            id: RECORD,
+            type: 'item',
+            attributes: recordPayloadFields(canonical, MODEL, schema),
+          },
+        }),
+        /item_type/,
+      );
+      assert.equal(writes, 1);
+      assert.equal(
+        unsupportedRecordPayloadKey(canonical, MODEL, schema),
+        'type',
+        placement,
+      );
+    }
   });
 
   it('captures 30-record nested pages with backpressure and the complete unselected namespace', async () => {
@@ -515,6 +760,300 @@ describe('expanded capture and native payload codec', () => {
     }
   });
 
+  it('rejects unsafe native INTEGER wire values before capture can merge distinct integers', async () => {
+    const schema = state([
+      model(MODEL, [
+        field('counter', 'integer'),
+        field('opaque', 'json'),
+        field('fraction', 'float'),
+      ]),
+    ]);
+    const opaque = '{"counter":9007199254740993}';
+    for (const literal of [
+      '9007199254740992',
+      '9007199254740993',
+      '-9007199254740993',
+    ]) {
+      for (const slice of ['current', 'published']) {
+        const client = buildClient({
+          apiToken: 'offline-fixture-token',
+          fetchFn: async (input) => {
+            const version = new URL(String(input)).searchParams.get('version');
+            const row = rawRecord(
+              RECORD,
+              {
+                counter: version === slice ? '__WIRE_INTEGER__' : 1,
+                opaque,
+                fraction: 1e30,
+              },
+              true,
+            );
+            const wire = JSON.stringify(response([row])).replace(
+              '"__WIRE_INTEGER__"',
+              literal,
+            );
+            return new Response(wire, {
+              headers: { 'content-type': 'application/json' },
+            });
+          },
+        });
+        await assert.rejects(
+          readRecordBatch(client, [RECORD], schema),
+          errorCode('UNSUPPORTED_INTEGER_PRECISION'),
+        );
+      }
+    }
+    for (const value of [
+      Number.MAX_SAFE_INTEGER,
+      Number.MIN_SAFE_INTEGER,
+      0,
+      null,
+    ]) {
+      const client = buildClient({
+        apiToken: 'offline-fixture-token',
+        fetchFn: async () =>
+          new Response(
+            JSON.stringify(
+              response([
+                rawRecord(
+                  RECORD,
+                  { counter: value, opaque, fraction: 1e30 },
+                  true,
+                ),
+              ]),
+            ),
+            { headers: { 'content-type': 'application/json' } },
+          ),
+      });
+      const [captured] = await readRecordBatch(client, [RECORD], schema);
+      assert.equal(captured.current.counter, value);
+      assert.equal(captured.published!.counter, value);
+      assert.equal(captured.current.opaque, opaque);
+      assert.equal(captured.current.fraction, 1e30);
+    }
+  });
+
+  it('checks INTEGER precision in localized and nested capture/write fields without parsing opaque JSON', () => {
+    const schema = state([
+      model(MODEL, [
+        { ...field('count', 'integer'), localized: true },
+        field('blocks', 'rich_text'),
+      ]),
+      model(
+        BLOCK,
+        [
+          field('count', 'integer'),
+          field('opaque', 'json'),
+          field('fraction', 'float'),
+        ],
+        true,
+      ),
+    ]);
+    const opaque = '{"count":9007199254740993}';
+    const block = (count: number): JsonObject => ({
+      id: NESTED,
+      __itemTypeId: BLOCK,
+      attributes: { count, opaque, fraction: 1e30 },
+    });
+    const invalidFields: JsonObject[] = [
+      { count: { en: 1, it: Number.MAX_SAFE_INTEGER + 1 }, blocks: [] },
+      { count: { en: 1 }, blocks: [block(Number.MIN_SAFE_INTEGER - 1)] },
+    ];
+    for (const convert of [canonicalFields, recordPayloadFields]) {
+      for (const fields of invalidFields)
+        assert.throws(
+          () => convert(fields, MODEL, schema),
+          errorCode('UNSUPPORTED_INTEGER_PRECISION'),
+        );
+      assert.doesNotThrow(() =>
+        convert(
+          {
+            count: { en: Number.MAX_SAFE_INTEGER, it: null },
+            blocks: [block(Number.MIN_SAFE_INTEGER)],
+          },
+          MODEL,
+          schema,
+        ),
+      );
+    }
+  });
+
+  it('captures exact native custom_data through the authenticated SDK request path before serializer diagnostics', async () => {
+    const models = [
+      model(MODEL, [
+        field('image', 'file'),
+        field('images', 'gallery'),
+        field('blocks', 'rich_text'),
+      ]),
+      model(
+        BLOCK,
+        [{ ...field('localized_image', 'file'), localized: true }],
+        true,
+      ),
+    ];
+    const customData = JSON.parse(
+      '{"ordinary":"kept","__proto__":"native-proto-value","__itemTypeId":"native-item-type-value"}',
+    ) as JsonObject;
+    const file = {
+      upload_id: ASSET,
+      alt: null,
+      title: null,
+      custom_data: customData,
+      focal_point: null,
+      poster_time: null,
+    };
+    const row = rawRecord(RECORD, {
+      image: file,
+      images: [file],
+      blocks: [
+        {
+          id: NESTED,
+          type: 'item',
+          attributes: { localized_image: { en: file } },
+          relationships: {
+            item_type: { data: { id: BLOCK, type: 'item_type' } },
+          },
+        },
+      ],
+    });
+    let fetches = 0;
+    const native = buildClient({
+      apiToken: 'offline-fixture-token',
+      environment: 'native-capture',
+      fetchFn: async (input, init) => {
+        fetches++;
+        const url = new URL(String(input));
+        assert.equal(url.pathname, '/items');
+        assert.equal(url.searchParams.get('nested'), 'true');
+        const headers = new Headers(init?.headers);
+        assert.equal(
+          headers.get('authorization'),
+          'Bearer offline-fixture-token',
+        );
+        assert.equal(headers.get('x-environment'), 'native-capture');
+        return new Response(
+          JSON.stringify(
+            response(
+              url.searchParams.get('version') === 'published' ? [] : [row],
+            ),
+          ),
+          { headers: { 'content-type': 'application/json' } },
+        );
+      },
+    });
+    // Even the SDK rawList adapter loses this own key before returning data.
+    const lossy = await native.items.rawList({
+      nested: true,
+      version: 'current',
+    });
+    assert.equal(
+      Object.hasOwn(
+        (lossy.data[0].attributes.image as JsonObject)
+          .custom_data as JsonObject,
+        '__proto__',
+      ),
+      false,
+    );
+    const fixture = mockClient(models);
+    Reflect.set(fixture.mock, 'request', native.request.bind(native));
+    fixture.mock.items.rawList = async () =>
+      assert.fail('Native capture must avoid the lossy item adapter');
+    const store = new SnapshotStore();
+    try {
+      const schema = await fetchSchema(fixture.client, 'source');
+      await captureSnapshot({
+        client: fixture.client,
+        environmentId: 'source',
+        schema,
+        store,
+        side: 'source',
+        options: { modelIds: [MODEL], uploads: 'all' },
+        verify: false,
+      });
+      const captured = store.getRecord('source', RECORD)!;
+      assert.deepEqual(
+        (captured.current.image as JsonObject).custom_data,
+        customData,
+      );
+      assert.deepEqual(
+        (captured.current.images as JsonObject[])[0].custom_data,
+        customData,
+      );
+      const block = (captured.current.blocks as JsonObject[])[0];
+      assert.deepEqual(
+        (
+          ((block.attributes as JsonObject).localized_image as JsonObject)
+            .en as JsonObject
+        ).custom_data,
+        customData,
+      );
+      assert.equal(
+        Object.getPrototypeOf(
+          (captured.current.image as JsonObject).custom_data,
+        ),
+        Object.prototype,
+      );
+      assert.notEqual(
+        unsupportedRecordPayloadKey(captured.current, MODEL, schema),
+        undefined,
+      );
+      assert.deepEqual(
+        await readRecordBatch(fixture.client, [RECORD], schema),
+        [captured],
+      );
+      assert.equal(fetches, 5);
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('excludes Ruby Unicode whitespace from localized unique indexes while retaining BOM and nonblank values', () => {
+    const unique = {
+      ...field('slug', 'string', { unique: {} }),
+      localized: true,
+    };
+    const schema = state([model(MODEL, [unique])]);
+    // Ruby /\A[[:space:]]*\z/u agrees with Unicode White_Space. NEL is blank;
+    // BOM and zero-width space are not, whereas JavaScript trim treats BOM as blank.
+    const blank = [
+      '',
+      ' \t\r\n',
+      '\u0085',
+      '\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000',
+    ];
+    for (const value of blank) {
+      const record = canonicalRecord(
+        rawRecord(RECORD, { slug: { en: value, it: value } }, true),
+        rawRecord(RECORD, { slug: { en: value, it: value } }, true),
+        schema,
+      );
+      assert.deepEqual(
+        inspectRecord(record, schema).uniqueValues,
+        [],
+        JSON.stringify(value),
+      );
+    }
+    for (const value of [
+      '\ufeff',
+      '\u200b',
+      '\u180e',
+      '  occupied  ',
+      '\u0085occupied\u0085',
+    ]) {
+      const record = canonicalRecord(
+        rawRecord(RECORD, { slug: { en: value, it: value } }, true),
+        rawRecord(RECORD, { slug: { en: value, it: value } }, true),
+        schema,
+      );
+      const values = inspectRecord(record, schema).uniqueValues;
+      assert.equal(values.length, 4, JSON.stringify(value));
+      assert.deepEqual(
+        new Set(values.map((entry) => entry.valueKey)),
+        new Set([JSON.stringify(value)]),
+      );
+    }
+  });
+
   it('rejects changed page totals, duplicated identities, and missing publication slices', async () => {
     for (const scenario of ['total', 'duplicate', 'publication'] as const) {
       const records = Array.from({ length: 31 }, (_, index) =>
@@ -558,6 +1097,180 @@ describe('expanded capture and native payload codec', () => {
       } finally {
         store.dispose();
       }
+    }
+  });
+
+  it('rolls back a bounded record batch when a nested dependency cannot be indexed', async () => {
+    const models = [
+      model(MODEL, [field('blocks', 'rich_text')]),
+      model(BLOCK, [field('related', 'link')], true),
+    ];
+    const records = Array.from({ length: 31 }, (_, index) =>
+      rawRecord(identity(`batch-${index}`), {
+        blocks: [
+          {
+            id: identity(`block-${index}`),
+            __itemTypeId: BLOCK,
+            attributes: { related: LINKED },
+          },
+        ],
+      }),
+    );
+    const fixture = mockClient(models, records);
+    const store = new SnapshotStore();
+    try {
+      // Failure after the record and reference writes must not leave a partial
+      // record or dependency index in the temporary snapshot.
+      store.database.exec(`
+        CREATE TRIGGER reject_block_owner BEFORE INSERT ON block_owners
+        BEGIN SELECT RAISE(ABORT, 'block index unavailable'); END;
+      `);
+      const schema = await fetchSchema(fixture.client, 'source');
+      await assert.rejects(
+        captureSnapshot({
+          client: fixture.client,
+          environmentId: 'source',
+          schema,
+          store,
+          side: 'source',
+          options: { modelIds: [MODEL], uploads: 'all' },
+          verify: false,
+        }),
+        /block index unavailable/,
+      );
+      assert.equal([...store.records('source')].length, 0);
+      assert.equal([...store.references('source')].length, 0);
+      assert.equal(
+        store.database
+          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
+          .get()?.count,
+        0,
+      );
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('drains active capture pages on cancellation without starting queued requests', async () => {
+    const fixture = mockClient(
+      [model()],
+      Array.from({ length: 125 }, (_, index) =>
+        rawRecord(identity(`abort-${index}`)),
+      ),
+    );
+    const controller = new AbortController();
+    const original = fixture.mock.items.rawList;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let ready!: () => void;
+    const active = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    let started = 0;
+    let completed = 0;
+    let finished = false;
+    fixture.mock.items.rawList = async (args) => {
+      if ((args.page.offset ?? 0) > 0) {
+        if (++started === 2) ready();
+        await pending;
+        completed++;
+      }
+      return original(args);
+    };
+    const store = new SnapshotStore();
+    try {
+      const schema = await fetchSchema(fixture.client, 'source');
+      const capture = captureSnapshot({
+        client: fixture.client,
+        environmentId: 'source',
+        schema,
+        store,
+        side: 'source',
+        options: {
+          modelIds: [MODEL],
+          uploads: 'all',
+          concurrency: 2,
+          signal: controller.signal,
+        },
+      });
+      const rejected = assert
+        .rejects(capture, errorCode('INTERRUPTED'))
+        .then(() => {
+          finished = true;
+        });
+      await active;
+      controller.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(finished, false);
+      assert.equal(completed, 0);
+      release();
+      await rejected;
+      assert.equal(started, 2);
+      assert.equal(completed, 2);
+      assert.deepEqual(
+        fixture.calls
+          .map((call) => call.page.offset)
+          .sort((a, b) => (a ?? 0) - (b ?? 0)),
+        [0, 30, 60],
+      );
+      assert.equal(
+        store.database
+          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
+          .get()?.count,
+        0,
+      );
+    } finally {
+      release();
+      store.dispose();
+    }
+  });
+
+  it('processes cancellation between SQLite record batches even when schedule reads resolve immediately', async () => {
+    const fixture = mockClient(
+      [model()],
+      Array.from({ length: 65 }, (_, index) =>
+        rawRecord(identity(`yield-${index}`)),
+      ),
+    );
+    const store = new SnapshotStore();
+    const controller = new AbortController();
+    const original = store.putRecord.bind(store);
+    let written = 0;
+    store.putRecord = (side, state) => {
+      original(side, state);
+      if (++written === 1) setImmediate(() => controller.abort());
+    };
+    try {
+      const schema = await fetchSchema(fixture.client, 'source');
+      await assert.rejects(
+        captureSnapshot({
+          client: fixture.client,
+          environmentId: 'source',
+          schema,
+          store,
+          side: 'source',
+          options: {
+            modelIds: [MODEL],
+            uploads: 'all',
+            signal: controller.signal,
+          },
+          verify: false,
+        }),
+        errorCode('INTERRUPTED'),
+      );
+      assert.equal(written, 30);
+      assert.equal(
+        store.database
+          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
+          .get()?.count,
+        0,
+      );
+    } finally {
+      const directory = store.directory;
+      store.dispose();
+      assert.equal(existsSync(directory), false);
     }
   });
 

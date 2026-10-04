@@ -2,6 +2,7 @@ import { lstat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
 import { writeBundle } from '../../engine/bundle';
+import { assertNotAborted } from '../../engine/cancellation';
 import { captureSnapshot } from '../../engine/capture';
 import { ContentError } from '../../engine/errors';
 import { createPlan } from '../../engine/planner';
@@ -18,6 +19,7 @@ import {
   environmentId,
   selectedModels,
 } from '../../utils/content-command';
+import { withInterruptHandling } from '../../utils/interruption';
 
 export type ContentDiffCommandResult = {
   bundlePath: string;
@@ -95,6 +97,18 @@ export default class ContentDiffCommand extends ContentCommand {
   };
 
   async run(): Promise<ContentDiffCommandResult> {
+    return withInterruptHandling(
+      (signal) => this.runOperation(signal),
+      () =>
+        this.progress(
+          'Interrupted. Waiting for active requests and cleaning up temporary state.',
+        ),
+    );
+  }
+
+  private async runOperation(
+    signal: AbortSignal,
+  ): Promise<ContentDiffCommandResult> {
     const { flags } = await this.parse(ContentDiffCommand);
     const maximum = concurrency(flags.concurrency);
     if (!Number.isSafeInteger(flags['chunk-bytes']) || flags['chunk-bytes'] < 1)
@@ -150,6 +164,7 @@ export default class ContentDiffCommand extends ContentCommand {
         'Source and destination must be different environments or projects.',
       );
     const modelIds = selectedModels(sourceSchema, flags['item-types']);
+    assertNotAborted(signal);
     const store = new SnapshotStore();
     try {
       // Full namespaces prove inbound dependencies and preservation. The model
@@ -162,6 +177,7 @@ export default class ContentDiffCommand extends ContentCommand {
         store,
         side: 'source',
         options: {
+          signal,
           modelIds: sourceSchema.models
             .filter((model) => !model.block)
             .map((model) => model.id),
@@ -178,6 +194,7 @@ export default class ContentDiffCommand extends ContentCommand {
         store,
         side: 'target',
         options: {
+          signal,
           modelIds: destinationSchema.models
             .filter((model) => !model.block)
             .map((model) => model.id),
@@ -209,6 +226,7 @@ export default class ContentDiffCommand extends ContentCommand {
         await assertSchemaEditAccess(destinationClient);
       this.progress('Writing content bundle and required asset binaries.');
       const bundlePath = await writeBundle({
+        signal,
         store,
         metadata,
         outputPath,

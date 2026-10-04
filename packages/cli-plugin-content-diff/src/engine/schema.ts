@@ -1,4 +1,6 @@
 import {
+  assertIntegerFieldPrecision,
+  assertMetadataIntegerPrecision,
   hashJson,
   json,
   jsonObject,
@@ -16,6 +18,16 @@ const compareIds = (a: string, b: string): number =>
 export function schemaHash(
   schema: Pick<SchemaState, 'locales' | 'semantics' | 'models' | 'workflows'>,
 ): string {
+  // Field settings may be restored during apply, including an imported bundle.
+  // A rounded integer must not become an apparently exact schema guard.
+  for (const model of schema.models)
+    for (const field of model.fields) {
+      assertIntegerFieldPrecision(field, field.defaultValue, model.id);
+      assertMetadataIntegerPrecision(
+        field.validators,
+        `Validators for ${model.id}.${field.apiKey}`,
+      );
+    }
   return hashJson({
     locales: schema.locales,
     semantics: schema.semantics,
@@ -55,17 +67,27 @@ export async function fetchSchema(
           allLocalesRequired: model.all_locales_required,
           workflowId: referenceId(model.workflow),
           fields: fields
-            .map((field) => ({
-              id: field.id,
-              apiKey: field.api_key,
-              type: field.field_type,
-              localized: field.localized,
-              validators: jsonObject(field.validators),
-              defaultValue:
-                field.default_value === undefined
-                  ? null
-                  : json(field.default_value),
-            }))
+            .map((field) => {
+              const shape = {
+                apiKey: field.api_key,
+                type: field.field_type,
+                localized: field.localized,
+              };
+              assertIntegerFieldPrecision(shape, field.default_value, model.id);
+              assertMetadataIntegerPrecision(
+                field.validators,
+                `Validators for ${model.id}.${field.api_key}`,
+              );
+              return {
+                id: field.id,
+                ...shape,
+                validators: jsonObject(field.validators),
+                defaultValue:
+                  field.default_value === undefined
+                    ? null
+                    : json(field.default_value),
+              };
+            })
             .sort((a, b) => compareIds(a.id, b.id)),
         });
       }
@@ -249,6 +271,7 @@ export async function assertApplyAccess(
     rule.environment === schema.environmentId &&
     rule.on_creator === 'anyone' &&
     !rule.on_stage &&
+    !rule.to_stage &&
     (rule.localization_scope === undefined ||
       rule.localization_scope === null ||
       rule.localization_scope === 'all');

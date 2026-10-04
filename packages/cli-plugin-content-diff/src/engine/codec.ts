@@ -20,6 +20,61 @@ export function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** Native integer fields retain arbitrary integers; SDK JSON numbers do not. */
+export function assertIntegerFieldPrecision(
+  field: Pick<FieldSchema, 'type' | 'localized' | 'apiKey'>,
+  value: unknown,
+  modelId: string,
+): void {
+  if (field.type !== 'integer') return;
+  const check = (entry: unknown, locale?: string): void => {
+    if (typeof entry === 'number' && !Number.isSafeInteger(entry))
+      throw new ContentError(
+        'UNSUPPORTED_INTEGER_PRECISION',
+        `Integer field ${modelId}.${field.apiKey}${
+          locale ? `.${locale}` : ''
+        } cannot be represented as an exact safe integer.`,
+        { modelId, field: field.apiKey, ...(locale ? { locale } : {}) },
+      );
+  };
+  if (field.localized && object(value))
+    for (const [locale, entry] of Object.entries(value)) check(entry, locale);
+  else check(value);
+}
+
+/** Validator metadata must also survive a later exact schema restoration. */
+export function assertMetadataIntegerPrecision(
+  value: unknown,
+  description: string,
+): void {
+  const pending: Array<{ value: unknown; path: string }> = [
+    { value, path: description },
+  ];
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (
+      typeof current.value === 'number' &&
+      Number.isInteger(current.value) &&
+      !Number.isSafeInteger(current.value)
+    )
+      throw new ContentError(
+        'UNSUPPORTED_INTEGER_PRECISION',
+        `Numeric metadata ${current.path} cannot be represented as an exact safe integer.`,
+        { path: current.path },
+      );
+    if (Array.isArray(current.value)) {
+      for (let index = 0; index < current.value.length; index++)
+        pending.push({
+          value: current.value[index],
+          path: `${current.path}[${index}]`,
+        });
+    } else if (object(current.value)) {
+      for (const [key, entry] of Object.entries(current.value))
+        pending.push({ value: entry, path: `${current.path}.${key}` });
+    }
+  }
+}
+
 export function json(value: unknown): JsonValue {
   if (
     value === null ||
@@ -192,6 +247,10 @@ function mapFields(
 ): JsonObject {
   const result: JsonObject = {};
   for (const field of model(schema, modelId).fields) {
+    // A rounded native integer remains outside the safe range. Refuse it
+    // before fingerprinting or writing; JSON strings and float fields retain
+    // their distinct native semantics, including inside nested blocks.
+    assertIntegerFieldPrecision(field, fields[field.apiKey], modelId);
     const value =
       fields[field.apiKey] === undefined ? null : json(fields[field.apiKey]);
     if (field.localized && value !== null) {
@@ -244,6 +303,16 @@ export function recordPayloadFields(
   schema: SchemaState,
   options: { validation?: boolean } = {},
 ): JsonObject {
+  return payloadFields(fields, modelId, schema, options);
+}
+
+function payloadFields(
+  fields: JsonObject,
+  modelId: string,
+  schema: SchemaState,
+  options: { validation?: boolean },
+  nativeBlocks?: WeakSet<object>,
+): JsonObject {
   return mapFields(fields, modelId, schema, (value) => {
     if (!object(value))
       throw new ContentError(
@@ -259,17 +328,50 @@ export function recordPayloadFields(
     const attributes = object(value.attributes) ? value.attributes : value;
     const result: JsonObject = {
       type: 'item',
-      attributes: recordPayloadFields(
+      attributes: payloadFields(
         jsonObject(attributes),
         typeId,
         schema,
         options,
+        nativeBlocks,
       ),
       relationships: { item_type: { data: { type: 'item_type', id: typeId } } },
     };
     if (!options.validation) result.id = string(value.id, 'block ID');
+    nativeBlocks?.add(result);
     return result;
   });
+}
+
+/** Report content the SDK's recursive item request/response adapters mishandle. */
+export function unsupportedRecordPayloadKey(
+  fields: JsonObject,
+  modelId: string,
+  schema: SchemaState,
+): string | undefined {
+  // Adapt blocks first: their canonical __itemTypeId annotations are expected
+  // to disappear. An identically named key in native custom_data is content,
+  // but the SDK also removes it (and loses own __proto__ properties). JSON
+  // fields are strings in the CMA contract and remain opaque here. Track only
+  // schema-identified block wrappers: an opaque object with type='item' is
+  // mistaken for a record by the SDK response adapter after a successful write.
+  const nativeBlocks = new WeakSet<object>();
+  const pending: JsonValue[] = [
+    payloadFields(fields, modelId, schema, {}, nativeBlocks),
+  ];
+  while (pending.length) {
+    const value = pending.pop();
+    if (Array.isArray(value)) {
+      for (const item of value) pending.push(item);
+    } else if (object(value)) {
+      if (value.type === 'item' && !nativeBlocks.has(value)) return 'type';
+      for (const [key, item] of Object.entries(value)) {
+        if (key === '__itemTypeId' || key === '__proto__') return key;
+        pending.push(item as JsonValue);
+      }
+    }
+  }
+  return undefined;
 }
 
 export function recordHash(
@@ -473,6 +575,17 @@ export function canonicalUpload(input: unknown): UploadState {
   return state;
 }
 
+export function collectionHash(
+  state: Pick<CollectionState, 'id' | 'label' | 'parentId' | 'position'>,
+): string {
+  return hashJson({
+    id: state.id,
+    label: state.label,
+    parentId: state.parentId,
+    position: state.position,
+  });
+}
+
 export function canonicalCollection(resource: unknown): CollectionState {
   if (!object(resource))
     throw new ContentError(
@@ -486,17 +599,22 @@ export function canonicalCollection(resource: unknown): CollectionState {
     object(resource.relationships) && object(resource.relationships.parent)
       ? resource.relationships.parent.data
       : resource.parent;
+  if (
+    typeof attributes.position !== 'number' ||
+    !Number.isSafeInteger(attributes.position)
+  )
+    throw new ContentError(
+      'INVALID_RESPONSE',
+      'Upload collection position is missing or invalid.',
+    );
   const state = {
     id: string(resource.id, 'collection ID'),
     label: string(attributes.label, 'collection label'),
     parentId: referenceId(parent),
+    position: attributes.position,
     hash: '',
   };
-  state.hash = hashJson({
-    id: state.id,
-    label: state.label,
-    parentId: state.parentId,
-  });
+  state.hash = collectionHash(state);
   return state;
 }
 
@@ -633,7 +751,9 @@ export function inspectRecord(
             ownerModel.id === record.modelId &&
             Object.hasOwn(field.validators, 'unique') &&
             value !== null &&
-            value !== ''
+            // Native uniqueness excludes Rails blank strings. Unicode space
+            // includes NEL but excludes BOM, unlike JavaScript trim().
+            !(typeof value === 'string' && /^\p{White_Space}*$/u.test(value))
           ) {
             const rule = field.validators.unique;
             const normalized =

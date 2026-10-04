@@ -1,8 +1,11 @@
-import type { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import type { Kind } from './types';
 
 /** Disk-backed Kahn ordering. No recursion, graph-sized queue, or global scan per vertex. */
 export class PlannerGraph {
+  private readonly insertNode: StatementSync;
+  private readonly insertEdge: StatementSync;
+
   constructor(readonly database: DatabaseSync) {
     database.exec(`
       CREATE TEMP TABLE IF NOT EXISTS planner_graph (
@@ -20,6 +23,13 @@ export class PlannerGraph {
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS planner_nodes_ready ON planner_nodes(phase,done,degree,kind,id);
     `);
+    // The same bounded pair of statements serves every vertex/edge. Preparing
+    // one per insertion can retain substantial native SQLite memory until GC.
+    this.insertNode = database.prepare(
+      'INSERT OR IGNORE INTO planner_nodes(phase,kind,id) VALUES(?,?,?)',
+    );
+    this.insertEdge = database.prepare(`INSERT OR IGNORE INTO planner_graph
+      (phase,owner_kind,owner_id,dependency_kind,dependency_id,field_id,reason) VALUES(?,?,?,?,?,?,?)`);
   }
 
   clear(phase: string): void {
@@ -28,11 +38,7 @@ export class PlannerGraph {
   }
 
   node(phase: string, kind: Kind, id: string): void {
-    this.database
-      .prepare(
-        'INSERT OR IGNORE INTO planner_nodes(phase,kind,id) VALUES(?,?,?)',
-      )
-      .run(phase, kind, id);
+    this.insertNode.run(phase, kind, id);
   }
 
   edge(
@@ -44,18 +50,15 @@ export class PlannerGraph {
     reason: string,
     fieldId = '',
   ): void {
-    this.database
-      .prepare(`INSERT OR IGNORE INTO planner_graph
-      (phase,owner_kind,owner_id,dependency_kind,dependency_id,field_id,reason) VALUES(?,?,?,?,?,?,?)`)
-      .run(
-        phase,
-        ownerKind,
-        ownerId,
-        dependencyKind,
-        dependencyId,
-        fieldId,
-        reason,
-      );
+    this.insertEdge.run(
+      phase,
+      ownerKind,
+      ownerId,
+      dependencyKind,
+      dependencyId,
+      fieldId,
+      reason,
+    );
   }
 
   order(phase: string): number {
@@ -66,7 +69,9 @@ export class PlannerGraph {
       WHERE g.phase=planner_nodes.phase AND g.owner_kind=planner_nodes.kind AND g.owner_id=planner_nodes.id
     ) WHERE phase=?`)
       .run(phase);
-    const ready = this.database.prepare(`SELECT kind,id,rank FROM planner_nodes
+    // Without an explicit index, SQLite may prefer the primary key's kind/id
+    // order and scan a whole phase for each ready vertex on long chains.
+    const ready = this.database.prepare(`SELECT kind,id,rank FROM planner_nodes INDEXED BY planner_nodes_ready
       WHERE phase=? AND done=0 AND degree=0 ORDER BY kind,id LIMIT 1`);
     const dependants = this.database.prepare(`SELECT g.owner_kind AS kind,g.owner_id AS id,COUNT(*) AS edges
       FROM planner_graph g JOIN planner_nodes n ON n.phase=g.phase AND n.kind=g.owner_kind AND n.id=g.owner_id

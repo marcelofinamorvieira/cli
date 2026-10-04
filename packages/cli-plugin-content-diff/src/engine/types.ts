@@ -92,6 +92,7 @@ export interface CollectionState {
   hash: string;
   label: string;
   parentId: string | null;
+  position: number;
 }
 export interface Reference {
   ownerId: string;
@@ -214,12 +215,14 @@ export interface BundleManifest extends PlanMetadata {
   chunks: BundleChunkIndex;
 }
 export interface CaptureOptions {
+  signal?: AbortSignal;
   modelIds: string[];
   uploads: 'referenced' | 'all';
   concurrency?: number;
   progress?: (message: string) => void;
 }
 export interface ApplyOptions {
+  signal?: AbortSignal;
   inPlace: boolean;
   allowPrimary: boolean;
   keepFailedFork: boolean;

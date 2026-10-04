@@ -102,9 +102,10 @@ export class SnapshotStore {
         CREATE INDEX uploads_collection ON uploads(side, collection_id, id);
         CREATE TABLE collections (
           side TEXT NOT NULL, id TEXT NOT NULL, parent_id TEXT,
-          hash TEXT NOT NULL, state_json TEXT NOT NULL, PRIMARY KEY(side, id)
+          position INTEGER NOT NULL, hash TEXT NOT NULL, state_json TEXT NOT NULL, PRIMARY KEY(side, id)
         ) WITHOUT ROWID;
         CREATE INDEX collections_parent ON collections(side, parent_id, id);
+        CREATE INDEX collections_siblings ON collections(side, parent_id, position, id);
         CREATE TABLE refs (
           side TEXT NOT NULL, owner_id TEXT NOT NULL, target_id TEXT NOT NULL,
           kind TEXT NOT NULL, path TEXT NOT NULL, field_id TEXT NOT NULL,
@@ -192,8 +193,10 @@ export class SnapshotStore {
       side,
       state.id,
     );
+    // Without statistics SQLite can choose the side-only primary-key prefix,
+    // rescanning every accumulated block for every record in a large capture.
     this.statement(
-      'DELETE FROM block_owners WHERE side = ? AND record_id = ?',
+      'DELETE FROM block_owners INDEXED BY block_owners_record WHERE side = ? AND record_id = ?',
     ).run(side, state.id);
     this.statement(
       'DELETE FROM unique_values WHERE side = ? AND record_id = ?',
@@ -266,8 +269,15 @@ export class SnapshotStore {
 
   putCollection(side: Side, state: CollectionState): void {
     this.statement(
-      'INSERT OR REPLACE INTO collections VALUES (?, ?, ?, ?, ?)',
-    ).run(side, state.id, state.parentId, state.hash, JSON.stringify(state));
+      'INSERT OR REPLACE INTO collections VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      side,
+      state.id,
+      state.parentId,
+      state.position,
+      state.hash,
+      JSON.stringify(state),
+    );
   }
 
   getCollection(side: Side, id: string): CollectionState | undefined {
@@ -338,7 +348,7 @@ export class SnapshotStore {
     const sql =
       recordId === undefined
         ? 'SELECT * FROM block_owners WHERE side = ? ORDER BY block_id, record_id, slice, path'
-        : 'SELECT * FROM block_owners WHERE side = ? AND record_id = ? ORDER BY block_id, slice, path';
+        : 'SELECT * FROM block_owners INDEXED BY block_owners_record WHERE side = ? AND record_id = ? ORDER BY block_id, slice, path';
     for (const row of this.database
       .prepare(sql)
       .iterate(...(recordId === undefined ? [side] : [side, recordId]))) {
@@ -367,7 +377,11 @@ export class SnapshotStore {
   }
 
   *uniqueValues(side: Side, recordId?: string): Generator<UniqueValue> {
-    const sql = `SELECT * FROM unique_values WHERE side = ?${
+    // The primary key matches output order but not record_id. Restrict to the
+    // requested record first, then sort only that record's uniqueness claims.
+    const sql = `SELECT * FROM unique_values${
+      recordId === undefined ? '' : ' INDEXED BY unique_values_record'
+    } WHERE side = ?${
       recordId === undefined ? '' : ' AND record_id = ?'
     } ORDER BY model_id, field_id, locale, slice, value, record_id`;
     for (const row of this.database

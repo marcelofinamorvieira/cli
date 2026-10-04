@@ -27,6 +27,7 @@ export async function boundedWork<T>(
   concurrency: number,
   work: (entry: T) => Promise<void>,
   group: (entry: T) => string | WorkLocks | null = () => null,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
     throw new Error('Work concurrency must be a positive integer.');
@@ -40,6 +41,7 @@ export async function boundedWork<T>(
   }
   try {
     for (const entry of entries) {
+      assertNotAborted(signal);
       const keys = group(entry);
       const lock: ActiveLocks = {
         writes: new Set(typeof keys === 'string' ? [keys] : keys?.writes ?? []),
@@ -52,8 +54,12 @@ export async function boundedWork<T>(
         await drainOne();
       }
       if (failed) throw failure;
+      assertNotAborted(signal);
       const task = Promise.resolve()
-        .then(() => work(entry))
+        .then(() => {
+          assertNotAborted(signal);
+          return work(entry);
+        })
         .catch((error: unknown) => {
           if (!failed) failure = error;
           failed = true;
@@ -68,6 +74,7 @@ export async function boundedWork<T>(
     await Promise.all(running.keys());
   }
   if (failed) throw failure;
+  assertNotAborted(signal);
 }
 
 export function* batches<T>(values: Iterable<T>, size = 30): Generator<T[]> {
@@ -84,3 +91,4 @@ export function* batches<T>(values: Iterable<T>, size = 30): Generator<T[]> {
   }
   if (batch.length) yield batch;
 }
+import { assertNotAborted } from './cancellation';

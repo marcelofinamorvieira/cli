@@ -18,6 +18,16 @@ export function creationEmptyValue(type: string): JsonValue {
   return type === 'rich_text' || type === 'links' ? [] : null;
 }
 
+/** Native localized field settings require every environment locale. */
+export function suppressedDefaultValue(
+  field: Pick<FieldSchema, 'localized'>,
+  locales: string[],
+): JsonValue {
+  return field.localized
+    ? Object.fromEntries(locales.map((locale) => [locale, null]))
+    : null;
+}
+
 function object(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

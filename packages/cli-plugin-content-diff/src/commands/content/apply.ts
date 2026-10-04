@@ -3,6 +3,7 @@ import { applyBundle } from '../../engine/apply';
 import { ContentError } from '../../engine/errors';
 import type { ApplyResult } from '../../engine/types';
 import { ContentCommand, concurrency } from '../../utils/content-command';
+import { withInterruptHandling } from '../../utils/interruption';
 
 export default class ContentApplyCommand extends ContentCommand {
   static description =
@@ -47,6 +48,16 @@ export default class ContentApplyCommand extends ContentCommand {
   };
 
   async run(): Promise<ApplyResult> {
+    return withInterruptHandling(
+      (signal) => this.runOperation(signal),
+      () =>
+        this.progress(
+          'Interrupted. Waiting for active requests before restoration and cleanup.',
+        ),
+    );
+  }
+
+  private async runOperation(signal: AbortSignal): Promise<ApplyResult> {
     const { flags, args } = await this.parse(ContentApplyCommand);
     const maximum = concurrency(flags.concurrency);
     if (flags['allow-primary'] && !flags['in-place'])
@@ -60,6 +71,7 @@ export default class ContentApplyCommand extends ContentCommand {
       buildEnvironmentClient: endpoint.buildEnvironmentClient,
       bundlePath: args.BUNDLE,
       options: {
+        signal,
         inPlace: flags['in-place'],
         allowPrimary: flags['allow-primary'],
         keepFailedFork: flags['keep-failed-fork'],

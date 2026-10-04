@@ -1,4 +1,10 @@
-import { hashJson, inspectRecord, object, recordGuard } from './codec';
+import {
+  hashJson,
+  inspectRecord,
+  object,
+  recordGuard,
+  unsupportedRecordPayloadKey,
+} from './codec';
 import { ContentError } from './errors';
 import { PlannerGraph } from './planner-graph';
 import {
@@ -7,10 +13,14 @@ import {
   fieldFailures,
   fieldNeedsDefaultSuppression,
   provenFailures,
+  suppressedDefaultValue,
 } from './planner-validity';
 import type { SnapshotStore } from './store';
 import type {
   Action,
+  BlockOwner,
+  CollectionPlan,
+  CollectionState,
   Diagnostic,
   FieldSchema,
   JsonObject,
@@ -145,9 +155,10 @@ class Planning {
       DELETE FROM planner_unique_owners;
       CREATE TEMP TABLE IF NOT EXISTS planner_temp_usage(field_id TEXT NOT NULL,record_id TEXT NOT NULL,validator TEXT NOT NULL,reason TEXT NOT NULL,suppress_default INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(field_id,record_id,validator,reason,suppress_default)) WITHOUT ROWID;
       CREATE TEMP TABLE IF NOT EXISTS planner_skipped_ordering(model_id TEXT PRIMARY KEY) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS planner_skipped_collection_groups(parent_id TEXT PRIMARY KEY) WITHOUT ROWID;
       CREATE TEMP TABLE IF NOT EXISTS planner_deferred_fields(owner_id TEXT NOT NULL,api_key TEXT NOT NULL,PRIMARY KEY(owner_id,api_key)) WITHOUT ROWID;
       CREATE TEMP TABLE IF NOT EXISTS planner_positions(model_id TEXT NOT NULL,parent_id TEXT NOT NULL,position REAL NOT NULL,id TEXT NOT NULL,PRIMARY KEY(model_id,parent_id,position,id)) WITHOUT ROWID;
-      DELETE FROM planner_skipped_ordering; DELETE FROM planner_positions; DELETE FROM planner_deferred_fields;
+      DELETE FROM planner_skipped_ordering; DELETE FROM planner_skipped_collection_groups; DELETE FROM planner_positions; DELETE FROM planner_deferred_fields;
       DELETE FROM planner_unsafe; DELETE FROM planner_asset_scope; DELETE FROM planner_effective_refs; DELETE FROM planner_effective_uniques; DELETE FROM planner_temp_usage;
       DELETE FROM planner_graph; DELETE FROM planner_nodes;
     `);
@@ -381,6 +392,17 @@ class Planning {
             desired: source ?? null,
           });
         this.store.putPlan(plan);
+        if (
+          kind === 'collection' &&
+          (action === 'create' || action === 'update') &&
+          !Number.isSafeInteger((source as CollectionState).position)
+        )
+          this.unsafe(
+            'collection',
+            id,
+            'UNSUPPORTED_COLLECTION_POSITION',
+            `Collection ${id} has no authoritative integer position.`,
+          );
         if (action === 'create' && !PORTABLE_ID.test(id))
           this.unsafe(
             kind,
@@ -463,6 +485,18 @@ class Planning {
       }
       for (const slice of [desired.current, desired.published]) {
         if (!slice) continue;
+        const unsupportedKey = unsupportedRecordPayloadKey(
+          slice,
+          model.id,
+          this.target,
+        );
+        if (unsupportedKey)
+          this.unsafe(
+            'record',
+            plan.id,
+            'UNSUPPORTED_PAYLOAD_KEY',
+            `Record ${plan.id} contains native field metadata at ${unsupportedKey} that the CMA client cannot safely preserve through writes and responses.`,
+          );
         for (const value of aggregateFields(slice, model, this.target)) {
           if (
             !value.blockId ||
@@ -604,13 +638,7 @@ class Planning {
             'UNSUPPORTED_SCHEDULE_SCOPE',
             `Record ${plan.id} has an invalid selective publication scope.`,
           );
-        if (this.scheduledFailures(desired).length)
-          this.unsafe(
-            'record',
-            plan.id,
-            'INVALID_SCHEDULED_PUBLICATION',
-            `Record ${plan.id} schedules publication of values with proven validator failures in the requested scope.`,
-          );
+        this.checkScheduledPublication(plan, desired);
       }
       if (
         desired.schedules.unpublishing &&
@@ -634,26 +662,6 @@ class Planning {
           'UNSUPPORTED_SCHEDULE_SCOPE',
           `Record ${plan.id} has an invalid unpublishing locale scope.`,
         );
-    }
-    for (const plan of this.store.planEntries('record', 'noop')) {
-      if (plan.kind !== 'record' || !this.selected.has(plan.modelId)) continue;
-      const desired =
-        this.store.getRecord('source', plan.id) ??
-        this.store.getRecord('target', plan.id);
-      if (!desired?.schedules.publication) continue;
-      const failures = this.scheduledFailures(desired);
-      if (failures.length) {
-        const fields = sortedUnique(
-          failures.map(
-            (failure) => `${failure.field.apiKey} (${failure.validator})`,
-          ),
-        ).join(', ');
-        throw new ContentError(
-          'UNEXECUTABLE_EXISTING_SCHEDULE',
-          `Managed unchanged record ${plan.id} has an existing enforced publication schedule whose selected values fail ${fields}. The CMA cannot reliably recreate this schedule under the restored validators.`,
-          { id: plan.id, scope: desired.schedules.publication.selective },
-        );
-      }
     }
     for (const model of this.models.values()) {
       if (!model.singleton || !this.selected.has(model.id)) continue;
@@ -732,7 +740,105 @@ class Planning {
         scopeFields[field.apiKey] = locales;
       } else scopeFields[field.apiKey] = value;
     }
-    return provenFailures(scopeFields, scopeModel, this.target);
+    const failures = provenFailures(scopeFields, scopeModel, this.target);
+    // A valid record can be scheduled and later edited into a duplicate draft.
+    // That native state exists, but its schedule cannot be recreated after the
+    // managed cancellation phase. Check effective peers, including retained
+    // destination records and baselines restored by partial skips.
+    for (const value of inspectRecord(
+      { ...record, current: scopeFields, published: null },
+      {
+        ...this.target,
+        models: this.target.models.map((entry) =>
+          entry.id === model.id ? scopeModel : entry,
+        ),
+      },
+    ).uniqueValues) {
+      let duplicate = false;
+      for (const side of ['source', 'target']) {
+        duplicate = Boolean(
+          this.store.database
+            .prepare(`SELECT 1 FROM unique_values peer
+          JOIN plan p ON p.kind='record' AND p.id=peer.record_id
+          WHERE peer.side=? AND peer.model_id=? AND peer.field_id=? AND peer.locale=?
+          AND peer.slice='current' AND peer.value=? AND peer.record_id<>?
+          AND p.action IN (${
+            side === 'source' ? "'create','update'" : "'noop','skip'"
+          }) LIMIT 1`)
+            .get(
+              side,
+              value.modelId,
+              value.fieldId,
+              value.locale,
+              value.valueKey,
+              record.id,
+            ),
+        );
+        if (duplicate) break;
+      }
+      if (duplicate)
+        failures.push({
+          field: this.fields.get(value.fieldId)!.field,
+          modelId: value.modelId,
+          validator: 'unique',
+        });
+    }
+    return failures;
+  }
+
+  checkScheduledPublication(plan: RecordPlan, record: RecordState): void {
+    const failures = this.scheduledFailures(record);
+    if (!failures.length) return;
+    if (plan.action === 'noop') {
+      const fields = sortedUnique(
+        failures.map(
+          (failure) => `${failure.field.apiKey} (${failure.validator})`,
+        ),
+      ).join(', ');
+      throw new ContentError(
+        'UNEXECUTABLE_EXISTING_SCHEDULE',
+        `Managed unchanged record ${plan.id} has an existing enforced publication schedule whose selected values fail ${fields}. The CMA cannot reliably recreate this schedule under the restored validators.`,
+        { id: plan.id, scope: record.schedules.publication?.selective },
+      );
+    }
+    this.unsafe(
+      'record',
+      plan.id,
+      'INVALID_SCHEDULED_PUBLICATION',
+      `Record ${plan.id} schedules publication of values with proven validator failures in the requested scope; its schedule cannot be recreated under the restored validators.`,
+    );
+  }
+
+  checkNoopSchedules(): void {
+    // Run only after partial-skip closure and only when the final plan writes.
+    // A verification-only run leaves these existing schedules intact.
+    for (const plan of this.store.planEntries('record', 'noop')) {
+      if (
+        plan.kind !== 'record' ||
+        !this.selected.has(plan.modelId) ||
+        !plan.guard?.schedules.publication
+      )
+        continue;
+      const record = this.store.getRecord('target', plan.id)!;
+      this.checkScheduledPublication(plan, record);
+      const model = this.models.get(plan.modelId)!;
+      const stampRequired =
+        (model.saveInvalidDrafts ||
+          this.target.semantics.improved_validation_at_publishing === true) &&
+        !(model.saveInvalidDrafts && record.schedules.publication?.selective);
+      if (!stampRequired || record.validity.current) continue;
+      const key = unsupportedRecordPayloadKey(
+        record.current,
+        model.id,
+        this.target,
+      );
+      if (key)
+        throw new ContentError(
+          'UNEXECUTABLE_EXISTING_SCHEDULE',
+          `Managed unchanged record ${plan.id} needs a current-content validity refresh before its publication schedule can be restored, but native field metadata named ${key} cannot be rewritten safely by the CMA client.`,
+          { id: plan.id, reason: 'UNSUPPORTED_PAYLOAD_KEY', key },
+        );
+    }
   }
 
   localeStructure(plan: RecordPlan): void {
@@ -1034,9 +1140,19 @@ class Planning {
         .iterate(entry.id))
         deferred.add(String(row.api_key));
       for (const row of this.store.database
-        .prepare(`SELECT r.path,r.target_id,p.model_id FROM refs r JOIN plan p ON p.kind='record' AND p.id=r.target_id
-        WHERE r.side='source' AND r.owner_id=? AND r.kind=? AND r.field_id<>'' AND p.action='create'`)
+        .prepare(`SELECT r.path,r.target_id,p.model_id,p.action FROM refs r JOIN plan p ON p.kind='record' AND p.id=r.target_id
+        WHERE r.side='source' AND r.owner_id=? AND r.kind=? AND r.field_id<>'' AND p.action IN ('create','update')`)
         .iterate(entry.id, slice)) {
+        // Models without draft mode publish during create. An existing draft
+        // is therefore unavailable to their seed until the publication phase,
+        // just like a newly created draft. Keeping the reference could fail or
+        // invoke the field's cascading publication strategy prematurely.
+        if (
+          row.action === 'update' &&
+          (model.draftMode ||
+            this.store.getRecord('target', String(row.target_id))?.published)
+        )
+          continue;
         const dependency = this.store.database
           .prepare(
             "SELECT done FROM planner_nodes WHERE phase='creation-discovery' AND kind='record' AND id=?",
@@ -1127,6 +1243,22 @@ class Planning {
       if (record.parentId)
         refInsert.run(entry.id, 'record', record.parentId, 'parent', '');
       uniqueInsert.run(side, entry.id);
+    }
+  }
+
+  blockTransitions(): void {
+    const changes = this.temporaryChanges();
+    for (const entry of this.store.planEntries('record')) {
+      if (entry.kind !== 'record') continue;
+      const issue = recordBlockTransitionIssue(entry, this.target, changes);
+      if (issue)
+        this.unsafe(
+          'record',
+          entry.id,
+          issue.code,
+          issue.message,
+          issue.dependencyId,
+        );
     }
   }
 
@@ -1276,6 +1408,15 @@ class Planning {
           'record',
           String(row.record_id),
         ) as RecordPlan;
+        if (
+          group.slice === 'current' &&
+          this.selected.has(plan.modelId) &&
+          ['create', 'update'].includes(plan.action)
+        ) {
+          const scheduled = plan.desired;
+          if (scheduled?.schedules.publication)
+            this.checkScheduledPublication(plan, scheduled);
+        }
         if (!['create', 'update'].includes(plan.action) || !plan.desired)
           continue;
         const nativeInvalid =
@@ -1372,6 +1513,23 @@ class Planning {
             );
         }
       }
+      if (entry.kind === 'collection') {
+        for (const state of [entry.baseline, entry.desired]) {
+          if (!state) continue;
+          const inserted = this.store.database
+            .prepare(
+              'INSERT OR IGNORE INTO planner_skipped_collection_groups VALUES(?)',
+            )
+            .run(state.parentId ?? '').changes;
+          if (!inserted) continue;
+          this.collectionGroupUnsafe(
+            state.parentId,
+            'COLLECTION_ORDERING_SKIP_CLOSURE',
+            `Collection ordering shares an affected sibling group with skipped collection ${entry.id}; that group is preserved.`,
+            entry.id,
+          );
+        }
+      }
       // Propagate to requested dependants. Separately, preserve the complete
       // baseline closure of each skipped entity, including optional references.
       for (const dependant of this.store.database
@@ -1407,6 +1565,25 @@ class Planning {
         }
     }
     return true;
+  }
+
+  collectionGroupUnsafe(
+    parentId: string | null,
+    code: string,
+    message: string,
+    dependencyId?: string,
+  ): number {
+    let marked = 0;
+    for (const row of this.store.database
+      .prepare(`SELECT DISTINCT p.id FROM collections c INDEXED BY collections_parent
+      CROSS JOIN plan p ON p.kind='collection' AND p.id=c.id
+      WHERE c.side IN ('source','target') AND c.parent_id IS ? AND p.action IN ('create','update','delete')
+      ORDER BY p.id`)
+      .iterate(parentId)) {
+      this.unsafe('collection', String(row.id), code, message, dependencyId);
+      marked++;
+    }
+    return marked;
   }
 
   uniqueTransitions(): void {
@@ -1529,8 +1706,12 @@ class Planning {
           this.graph.node('update', 'record', entry.id);
           this.graph.node('publish', 'record', entry.id);
         } else this.graph.node('delete', 'record', entry.id);
-      } else if (entry.kind === 'collection' && entry.action !== 'update')
-        this.graph.node(`collection-${entry.action}`, entry.kind, entry.id);
+      } else if (entry.kind === 'collection')
+        this.graph.node(
+          entry.action === 'delete' ? 'collection-delete' : 'collection-create',
+          entry.kind,
+          entry.id,
+        );
     }
     // Trees must remain forests even when their parent already exists. Use all
     // effective managed/preserved vertices, not just the newly created ones.
@@ -1630,7 +1811,7 @@ class Planning {
     for (const row of this.store.database
       .prepare(`SELECT r.owner_id,r.target_id FROM planner_effective_refs r
       JOIN planner_nodes a ON a.phase='publish' AND a.kind='record' AND a.id=r.owner_id
-      WHERE r.slice='published' ORDER BY r.owner_id,r.target_id`)
+      WHERE r.slice='published' AND r.owner_id<>r.target_id ORDER BY r.owner_id,r.target_id`)
       .iterate()) {
       const dependency = this.store.getPlan('record', String(row.target_id)) as
         | RecordPlan
@@ -1662,9 +1843,39 @@ class Planning {
           'publication',
         );
     }
+    // Final-state references prove that unpublishing is safe eventually, but
+    // the old published referrers must first release their live references.
+    // Deletes run after publication, so they cannot provide that release.
+    // Native publication/unpublication/deletion allows content self-references;
+    // tree-parent self references remain checked by their separate graph.
+    for (const row of this.store.database
+      .prepare(`SELECT r.owner_id,r.target_id,owner.action AS owner_action FROM refs r
+      JOIN plan dependency ON dependency.kind='record' AND dependency.id=r.target_id AND dependency.action='update'
+      JOIN plan owner ON owner.kind='record' AND owner.id=r.owner_id
+      WHERE r.side='target' AND r.kind='published' AND r.owner_id<>r.target_id AND json_extract(dependency.data,'$.desired.published') IS NULL
+      ORDER BY r.target_id,r.owner_id`)
+      .iterate()) {
+      if (row.owner_action === 'update')
+        this.graph.edge(
+          'publish',
+          'record',
+          String(row.target_id),
+          'record',
+          String(row.owner_id),
+          'publication-release',
+        );
+      else if (row.owner_action === 'delete')
+        this.unsafe(
+          'record',
+          String(row.target_id),
+          'UNSUPPORTED_PUBLICATION_RELEASE',
+          `Record ${row.target_id} cannot be unpublished before its published referrer ${row.owner_id} is deleted in the later deletion phase.`,
+          String(row.owner_id),
+        );
+    }
     for (const row of this.store.database
       .prepare(`SELECT r.owner_id,r.target_id FROM refs r JOIN plan a ON a.kind='record' AND a.id=r.owner_id AND a.action='delete'
-      JOIN plan b ON b.kind='record' AND b.id=r.target_id AND b.action='delete' WHERE r.side='target' AND r.kind<>'upload' ORDER BY r.target_id,r.owner_id`)
+      JOIN plan b ON b.kind='record' AND b.id=r.target_id AND b.action='delete' WHERE r.side='target' AND r.kind<>'upload' AND r.owner_id<>r.target_id ORDER BY r.target_id,r.owner_id`)
       .iterate())
       this.graph.edge(
         'delete',
@@ -1713,7 +1924,7 @@ class Planning {
         !['create', 'update', 'delete'].includes(entry.action)
       )
         continue;
-      const state = entry.action === 'create' ? entry.desired : entry.baseline;
+      const state = entry.action === 'delete' ? entry.baseline : entry.desired;
       if (!state?.parentId) continue;
       const phase =
         entry.action === 'delete' ? 'collection-delete' : 'collection-create';
@@ -1784,6 +1995,43 @@ class Planning {
     }
   }
 
+  collectionOrdering(): void {
+    const entries = (phase: string): Iterable<CollectionPlan> => {
+      const planning = this;
+      return (function* () {
+        for (const node of planning.graph.ranks(phase)) {
+          const entry = planning.store.getPlan('collection', node.id);
+          if (entry?.kind === 'collection') yield entry;
+        }
+      })();
+    };
+    for (const issue of collectionTransitionIssues({
+      store: this.store,
+      baselineSide: 'target',
+      writes: orderedCollectionWrites(this.store),
+      deletes: entries('collection-delete'),
+    })) {
+      const entry = this.store.getPlan('collection', issue.id);
+      if (entry && MUTATIONS.has(entry.action))
+        this.unsafe(
+          'collection',
+          issue.id,
+          issue.code,
+          issue.message,
+          issue.dependencyId,
+        );
+      else if (
+        !this.collectionGroupUnsafe(
+          issue.parentId,
+          issue.code,
+          issue.message,
+          issue.id,
+        )
+      )
+        throw new ContentError('UNPROVEN_COLLECTION_ORDERING', issue.message);
+    }
+  }
+
   temporaryChanges(): TemporarySchemaChange[] {
     const changes: TemporarySchemaChange[] = [];
     for (const field of this.fields.values()) {
@@ -1806,7 +2054,7 @@ class Planning {
         temporary: {
           validators: temporary,
           defaultValue: uses.some((use) => use.suppress_default)
-            ? null
+            ? suppressedDefaultValue(field.field, this.source.locales)
             : field.field.defaultValue,
         },
         reasons: sortedUnique(
@@ -1866,6 +2114,14 @@ class Planning {
       )
       .iterate())
       counts[row.kind as Kind][row.action as Action] = Number(row.count);
+    const temporarySchemaChanges = this.temporaryChanges();
+    if (
+      temporarySchemaChanges.length ||
+      Object.values(counts).some(
+        (kind) => kind.create || kind.update || kind.delete,
+      )
+    )
+      this.checkNoopSchedules();
     // The bundle carries the destination schema: it includes retained models,
     // while all managed/source block schemas have been proven identical.
     return {
@@ -1883,7 +2139,390 @@ class Planning {
         modelIds: sortedUnique(this.options.modelIds),
       },
       counts,
-      temporarySchemaChanges: this.temporaryChanges(),
+      temporarySchemaChanges,
+    };
+  }
+}
+
+/** Native nested updates can reuse an existing ID only from their current slot. */
+export function recordBlockTransitionIssue(
+  entry: RecordPlan,
+  schema: SchemaState,
+  changes: TemporarySchemaChange[] = [],
+): Diagnostic | undefined {
+  if (!['create', 'update'].includes(entry.action) || !entry.desired) return;
+  const desired = entry.desired;
+  const model = schema.models.find(
+    (candidate) => candidate.id === entry.modelId,
+  );
+  if (
+    !model ||
+    !model.fields.some((field) =>
+      ['rich_text', 'single_block', 'structured_text'].includes(field.type),
+    )
+  )
+    return;
+  if (entry.action === 'update' && !entry.baseline) return;
+  let current: JsonObject =
+    entry.action === 'create'
+      ? entry.execution?.creationFields ?? desired.published ?? desired.current
+      : entry.baseline!.current;
+  let published: JsonObject | null =
+    entry.action === 'create'
+      ? model.draftMode
+        ? null
+        : current
+      : entry.baseline!.published;
+  const owners = (fields: JsonObject | null): Map<string, BlockOwner> =>
+    new Map(
+      fields
+        ? inspectRecord(
+            { ...desired, current: fields, published: null },
+            schema,
+          ).blockOwners.map((owner) => [owner.blockId, owner])
+        : [],
+    );
+  const write = (fields: JsonObject, phase: string): Diagnostic | undefined => {
+    if (hashJson(current) === hashJson(fields)) return;
+    const currentOwners = owners(current);
+    const publishedOwners = owners(published);
+    const created = new Set<string>();
+    for (const wanted of owners(fields).values()) {
+      const existing = currentOwners.get(wanted.blockId);
+      if (!existing && !publishedOwners.has(wanted.blockId)) {
+        if (!PORTABLE_ID.test(wanted.blockId))
+          return {
+            code: 'UNSUPPORTED_LEGACY_BLOCK_ID',
+            message: `Record ${entry.id} must recreate block ${wanted.blockId} while writing ${phase}, but its identity cannot be used for a new block.`,
+            dependencyId: wanted.blockId,
+          };
+        created.add(wanted.blockId);
+        continue;
+      }
+      // Paths identify the field/locale and stable ancestor block IDs. Array
+      // indices and Structured Text node positions do not define ownership.
+      if (
+        !existing ||
+        existing.path !== wanted.path ||
+        existing.modelId !== wanted.modelId
+      )
+        return {
+          code: 'UNSUPPORTED_BLOCK_REINTRODUCTION',
+          message: `Record ${entry.id} cannot write its ${phase} values because existing block ${wanted.blockId} is not owned by the required current field, locale, parent block, and model (${wanted.path}).`,
+          dependencyId: wanted.blockId,
+        };
+    }
+    if (created.size)
+      for (const value of aggregateFields(fields, model, schema)) {
+        if (!value.blockId || !created.has(value.blockId)) continue;
+        const change = changes.find(
+          (candidate) =>
+            candidate.fieldId === value.field.id &&
+            candidate.modelId === value.modelId,
+        );
+        const effective = change
+          ? { ...value.field, defaultValue: change.temporary.defaultValue }
+          : value.field;
+        if (fieldNeedsDefaultSuppression(effective, value.value))
+          return {
+            code: 'UNSUPPORTED_BLOCK_RECREATION_DEFAULT',
+            message: `Record ${entry.id} must create block ${value.blockId} while writing ${phase}, but the default of ${value.field.apiKey} would replace its explicit null and no matching suppression is declared.`,
+            dependencyId: value.blockId,
+          };
+      }
+    // Native cleanup deletes blocks removed from current unless publication
+    // still retains them. The union of these two slices is the live namespace.
+    current = fields;
+    if (!model.draftMode) published = fields;
+  };
+  if (hashJson(published) !== hashJson(desired.published)) {
+    if (desired.published) {
+      const issue = write(desired.published, 'published');
+      if (issue) return issue;
+      published = desired.published;
+    } else published = null;
+  }
+  return write(desired.current, 'current');
+}
+
+export interface CollectionTransitionIssue {
+  id: string;
+  parentId: string | null;
+  code:
+    | 'COLLECTION_LABEL_CONFLICT'
+    | 'COLLECTION_ORDERING_CONFLICT'
+    | 'COLLECTION_PARENT_CONFLICT';
+  message: string;
+  dependencyId?: string;
+}
+
+/** Full intended-tree depth preserves moves through unchanged ancestors. */
+export function* orderedCollectionWrites(
+  store: SnapshotStore,
+): Generator<CollectionPlan> {
+  if (
+    !store.database
+      .prepare(
+        "SELECT 1 FROM plan WHERE kind='collection' AND action IN ('create','update') LIMIT 1",
+      )
+      .get()
+  )
+    return;
+  for (const row of store.database
+    .prepare(`SELECT p.data FROM planner_nodes n
+    JOIN plan p ON p.kind='collection' AND p.id=n.id
+    WHERE n.phase='collection-final-parent-proof' AND n.kind='collection' AND n.done=1
+    AND p.action IN ('create','update') ORDER BY n.rank,p.id`)
+    .iterate())
+    yield JSON.parse(String(row.data)) as CollectionPlan;
+}
+
+/** Shared planner/import proof. Ordered inputs must match actual execution. */
+export function* collectionTransitionIssues({
+  store,
+  baselineSide,
+  writes,
+  deletes,
+}: {
+  store: SnapshotStore;
+  baselineSide: 'target' | 'live';
+  writes: Iterable<CollectionPlan>;
+  deletes: Iterable<CollectionPlan>;
+}): Generator<CollectionTransitionIssue> {
+  if (
+    !store.database
+      .prepare(
+        "SELECT 1 FROM plan WHERE kind='collection' AND action IN ('create','update','delete') LIMIT 1",
+      )
+      .get()
+  )
+    return;
+  // Collections allow gaps and duplicate positions. Simulate the executor's
+  // exact native shifts and two reconciliation passes instead of assuming a
+  // dense or unique order. A collection CREATE/DELETE does not shift peers.
+  store.database.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS planner_collection_live(id TEXT PRIMARY KEY,parent_id TEXT,position INTEGER NOT NULL,label TEXT NOT NULL) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS planner_collection_live_siblings ON planner_collection_live(parent_id,position,id);
+      CREATE INDEX IF NOT EXISTS planner_collection_live_labels ON planner_collection_live(parent_id,label,id);
+      CREATE TEMP TABLE IF NOT EXISTS planner_collection_intended(id TEXT PRIMARY KEY,parent_id TEXT,position INTEGER NOT NULL,label TEXT NOT NULL) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS planner_collection_intended_order ON planner_collection_intended(parent_id,position,id);
+      DELETE FROM planner_collection_live; DELETE FROM planner_collection_intended;
+    `);
+  store.database
+    .prepare(
+      "INSERT INTO planner_collection_live SELECT id,parent_id,position,json_extract(state_json,'$.label') FROM collections WHERE side=?",
+    )
+    .run(baselineSide);
+  const intended = store.database.prepare(
+    'INSERT INTO planner_collection_intended VALUES(?,?,?,?)',
+  );
+  for (const entry of store.planEntries('collection')) {
+    if (
+      entry.kind !== 'collection' ||
+      entry.action === 'delete' ||
+      (entry.action === 'skip' && !entry.guard)
+    )
+      continue;
+    const state =
+      entry.action === 'create' || entry.action === 'update'
+        ? entry.desired
+        : store.getCollection(baselineSide, entry.id);
+    if (state && Number.isSafeInteger(state.position))
+      intended.run(state.id, state.parentId, state.position, state.label);
+  }
+  let invalidParent = false;
+  for (const row of store.database
+    .prepare(`SELECT child.id,child.parent_id FROM planner_collection_intended child
+    LEFT JOIN planner_collection_intended parent ON parent.id=child.parent_id
+    WHERE child.parent_id IS NOT NULL AND parent.id IS NULL ORDER BY child.id`)
+    .iterate()) {
+    invalidParent = true;
+    const parent = store.getPlan('collection', String(row.parent_id));
+    const removed =
+      parent?.kind === 'collection' && parent.action === 'delete'
+        ? parent
+        : undefined;
+    yield {
+      id: removed?.id ?? String(row.id),
+      parentId: removed?.baseline?.parentId ?? String(row.parent_id),
+      code: 'COLLECTION_PARENT_CONFLICT',
+      message: `Collection ${row.id} requires parent ${row.parent_id}, which is absent from the intended result.`,
+      dependencyId: String(row.parent_id),
+    };
+  }
+  // Validate the complete effective forest, including unchanged descendants.
+  // Kahn ordering keeps a deep create chain linear in vertices and edges.
+  const graph = new PlannerGraph(store.database);
+  const phase = 'collection-final-parent-proof';
+  graph.clear(phase);
+  for (const row of store.database
+    .prepare('SELECT id,parent_id FROM planner_collection_intended ORDER BY id')
+    .iterate()) {
+    graph.node(phase, 'collection', String(row.id));
+    if (row.parent_id !== null)
+      graph.edge(
+        phase,
+        'collection',
+        String(row.id),
+        'collection',
+        String(row.parent_id),
+        'parent',
+      );
+  }
+  if (graph.order(phase)) {
+    invalidParent = true;
+    let changedCycle = false;
+    for (const node of graph.cycles(phase)) {
+      const entry = store.getPlan('collection', node.id);
+      if (entry?.kind !== 'collection' || !MUTATIONS.has(entry.action))
+        continue;
+      changedCycle = true;
+      yield {
+        id: node.id,
+        parentId: entry.desired?.parentId ?? null,
+        code: 'COLLECTION_PARENT_CONFLICT',
+        message: `Collection ${node.id} is in or depends on an intended parent cycle.`,
+      };
+    }
+    if (!changedCycle) {
+      const first = graph.cycles(phase).next().value;
+      if (first)
+        yield {
+          id: first.id,
+          parentId: null,
+          code: 'COLLECTION_PARENT_CONFLICT',
+          message: `Preserved collection ${first.id} is in an invalid parent cycle.`,
+        };
+    }
+  }
+  if (invalidParent) return;
+  const current = store.database.prepare(
+    'SELECT * FROM planner_collection_live WHERE id=?',
+  );
+  const write = store.database.prepare(
+    'INSERT OR REPLACE INTO planner_collection_live VALUES(?,?,?,?)',
+  );
+  const range = store.database.prepare(
+    'UPDATE planner_collection_live SET position=position+? WHERE parent_id IS ? AND id<>? AND position BETWEEN ? AND ?',
+  );
+  const tail = store.database.prepare(
+    'UPDATE planner_collection_live SET position=position+? WHERE parent_id IS ? AND id<>? AND position>=?',
+  );
+  const remove = store.database.prepare(
+    'DELETE FROM planner_collection_live WHERE id=?',
+  );
+  const duplicateLabel = store.database.prepare(
+    'SELECT id FROM planner_collection_live WHERE parent_id IS ? AND label=? AND id<>? LIMIT 1',
+  );
+  const ancestor = store.database.prepare(`WITH RECURSIVE ancestors(id,parent_id) AS (
+    SELECT id,parent_id FROM planner_collection_live WHERE id=?
+    UNION SELECT p.id,p.parent_id FROM ancestors a CROSS JOIN planner_collection_live p ON p.id=a.parent_id
+  ) SELECT 1 FROM ancestors WHERE id=? LIMIT 1`);
+  const move = (
+    state: Pick<CollectionState, 'id' | 'parentId' | 'position' | 'label'>,
+  ): CollectionTransitionIssue | undefined => {
+    const previous = current.get(state.id);
+    if (
+      previous &&
+      previous.parent_id === state.parentId &&
+      Number(previous.position) === state.position &&
+      previous.label === state.label
+    )
+      return;
+    if (state.parentId !== null) {
+      if (!current.get(state.parentId))
+        return {
+          id: state.id,
+          parentId: state.parentId,
+          code: 'COLLECTION_PARENT_CONFLICT',
+          message: `Collection ${state.id} requires unavailable parent ${state.parentId} during the planned transition.`,
+          dependencyId: state.parentId,
+        };
+      // Only reparenting existing vertices can introduce a transient cycle.
+      // New identities cannot already be an ancestor of an existing parent.
+      if (
+        previous &&
+        previous.parent_id !== state.parentId &&
+        ancestor.get(state.parentId, state.id)
+      )
+        return {
+          id: state.id,
+          parentId: state.parentId,
+          code: 'COLLECTION_PARENT_CONFLICT',
+          message: `Collection ${state.id} would move beneath itself or its descendant ${state.parentId} during the planned transition.`,
+          dependencyId: state.parentId,
+        };
+    }
+    const duplicate = duplicateLabel.get(state.parentId, state.label, state.id);
+    if (duplicate)
+      return {
+        id: state.id,
+        parentId: state.parentId,
+        code: 'COLLECTION_LABEL_CONFLICT',
+        message: `Collection ${state.id} requests a sibling label still owned by collection ${duplicate.id} during the planned transition.`,
+        dependencyId: String(duplicate.id),
+      };
+    if (previous) {
+      const position = Number(previous.position);
+      if (previous.parent_id === state.parentId)
+        range.run(
+          state.position < position ? 1 : -1,
+          state.parentId,
+          state.id,
+          Math.min(position, state.position),
+          Math.max(position, state.position),
+        );
+      else {
+        tail.run(1, state.parentId, state.id, state.position);
+        tail.run(-1, previous.parent_id, state.id, position);
+      }
+    }
+    write.run(state.id, state.parentId, state.position, state.label);
+  };
+  for (const entry of writes) {
+    if (entry.desired && Number.isSafeInteger(entry.desired.position)) {
+      const issue = move(entry.desired);
+      if (issue) yield issue;
+    }
+  }
+  for (const entry of deletes) remove.run(entry.id);
+  for (const ascending of [false, true]) {
+    for (const row of store.database
+      .prepare(
+        `SELECT * FROM planner_collection_intended ORDER BY parent_id,position ${
+          ascending ? 'ASC' : 'DESC'
+        },id`,
+      )
+      .iterate()) {
+      const actual = current.get(row.id);
+      if (
+        !actual ||
+        (ascending
+          ? Number(actual.position) <= Number(row.position)
+          : Number(actual.position) >= Number(row.position))
+      )
+        continue;
+      const issue = move({
+        id: String(row.id),
+        parentId: row.parent_id === null ? null : String(row.parent_id),
+        position: Number(row.position),
+        label: String(row.label),
+      });
+      if (issue) yield issue;
+    }
+  }
+  for (const row of store.database
+    .prepare(`SELECT MIN(wanted.id) AS id,wanted.parent_id FROM planner_collection_intended wanted
+      LEFT JOIN planner_collection_live actual ON actual.id=wanted.id
+      WHERE actual.id IS NULL OR actual.parent_id IS NOT wanted.parent_id OR actual.position<>wanted.position
+      GROUP BY wanted.parent_id ORDER BY wanted.parent_id`)
+    .iterate()) {
+    yield {
+      id: String(row.id),
+      parentId: row.parent_id === null ? null : String(row.parent_id),
+      code: 'COLLECTION_ORDERING_CONFLICT',
+      message: `Collection ${row.id} cannot retain its exact intended position after native sibling shifts.`,
+      dependencyId: String(row.id),
     };
   }
 }
@@ -1895,23 +2534,30 @@ export async function createPlan(
   options: PlanOptions,
 ): Promise<PlanMetadata> {
   schemaCompatible(sourceSchema, targetSchema, new Set(options.modelIds));
-  const planning = new Planning(store, sourceSchema, targetSchema, options);
-  planning.indexRecords();
-  planning.initialRecords();
-  planning.assetScope();
-  planning.initialAssets();
-  planning.basicSafety();
-  planning.dependencies();
-  planning.creationFields();
-  // Each pass permanently skips at least one requested mutation. SQLite holds
-  // the closure queue and uniqueness ownership; project-sized arrays are never
-  // retained. Effective checks are rerun because skipped baselines can protect
-  // records/assets or acquire a unique value that the source had released.
-  for (;;) {
-    planning.effectiveSafety();
-    planning.uniqueTransitions();
-    planning.executionOrders();
-    if (!planning.processUnsafe()) break;
-  }
-  return planning.finish();
+  // This private working database has no competing readers or network awaits.
+  // One disk-backed transaction avoids a journal/fsync cycle for every index
+  // and plan write while leaving no partially planned result after an error.
+  return store.transaction(() => {
+    const planning = new Planning(store, sourceSchema, targetSchema, options);
+    planning.indexRecords();
+    planning.initialRecords();
+    planning.assetScope();
+    planning.initialAssets();
+    planning.basicSafety();
+    planning.dependencies();
+    planning.creationFields();
+    // Each pass permanently skips at least one requested mutation. SQLite holds
+    // the closure queue and uniqueness ownership; project-sized arrays are never
+    // retained. Effective checks are rerun because skipped baselines can protect
+    // records/assets or acquire a unique value that the source had released.
+    for (;;) {
+      planning.effectiveSafety();
+      planning.uniqueTransitions();
+      planning.blockTransitions();
+      planning.executionOrders();
+      planning.collectionOrdering();
+      if (!planning.processUnsafe()) break;
+    }
+    return planning.finish();
+  });
 }
