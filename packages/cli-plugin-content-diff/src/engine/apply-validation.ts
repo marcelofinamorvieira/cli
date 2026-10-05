@@ -5,7 +5,10 @@ import {
   unsupportedRecordPayloadKey,
 } from './codec';
 import { ContentError } from './errors';
-import { recordBlockTransitionIssue } from './planner';
+import {
+  omitPublicationReferences,
+  recordBlockTransitionIssue,
+} from './planner';
 import {
   aggregateFields,
   creationEmptyValue,
@@ -67,6 +70,68 @@ export function validateExecution(args: {
       recordId: entry.id,
       dependencyId: blockIssue.dependencyId,
     });
+  const provisional = entry.execution?.provisionalPublished;
+  if (provisional) {
+    // A provisional publication may only drop links that the desired
+    // published fields hold in top-level link/links fields, and only to
+    // records this bundle publishes; everything else must match exactly.
+    const published = entry.desired?.published;
+    if (!published || (entry.action !== 'create' && entry.action !== 'update'))
+      invalid('provisional publication without a publication');
+    const model = schema.models.find(
+      (candidate) => candidate.id === entry.modelId,
+    );
+    if (!model) invalid('unknown provisional publication model');
+    const targets = (fields: typeof published) =>
+      new Set(
+        inspectRecord(
+          { ...entry.desired!, current: fields!, published: null },
+          schema,
+        )
+          .references.filter((reference) => reference.kind === 'current')
+          .map((reference) => reference.targetId),
+      );
+    const kept = targets(provisional);
+    const dropped = new Set(
+      [...targets(published)].filter((target) => !kept.has(target)),
+    );
+    const expected = dropped.size
+      ? omitPublicationReferences(
+          entry.desired!,
+          published!,
+          model!,
+          schema,
+          dropped,
+        )
+      : null;
+    if (!expected || hashJson(expected) !== hashJson(provisional))
+      invalid('provisional publication changes more than cycle links');
+    for (const target of dropped) {
+      const dependency = store.getPlan('record', target);
+      if (
+        dependency?.kind !== 'record' ||
+        (dependency.action !== 'create' && dependency.action !== 'update')
+      )
+        invalid('provisional publication drops a link it does not restore');
+    }
+    for (const field of model!.fields) {
+      if (
+        hashJson(provisional[field.apiKey] ?? null) ===
+        hashJson(published![field.apiKey] ?? null)
+      )
+        continue;
+      const change = changes.find(
+        (candidate) => candidate.fieldId === field.id,
+      );
+      const effective = change
+        ? { ...field, validators: change.temporary.validators }
+        : field;
+      if (fieldFailures(effective, provisional[field.apiKey]).length)
+        invalid(
+          'provisional publication requires an undeclared validator relaxation',
+        );
+    }
+  }
   const seed = entry.execution?.creationFields;
   if (!seed) return;
   if (entry.action !== 'create' || !entry.desired)

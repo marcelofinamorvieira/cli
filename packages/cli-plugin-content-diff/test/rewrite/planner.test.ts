@@ -1462,36 +1462,178 @@ describe('indexed rewrite planner', () => {
     );
   });
 
-  it('diagnoses publication reference cycles before execution', async () => {
+  it('publishes link cycles among new records in two steps', async () => {
     const state = schema([
       model({ fields: [field({ id: LINK, apiKey: 'link', type: 'link' })] }),
     ]);
-    const source = [
+    const linked = (recordId: string, link: string) =>
       record(
-        A,
-        { link: B },
+        recordId,
+        { link },
         {
-          published: { link: B },
+          published: { link },
+          validity: { current: true, published: true },
+        },
+      );
+    await fixture(
+      [linked(A, B), linked(B, A)],
+      [],
+      state,
+      options(),
+      (store, metadata) => {
+        assert.equal(metadata.counts.record.create, 2);
+        assert.deepEqual(metadata.temporarySchemaChanges, []);
+        const [first, second] = [A, B]
+          .map((recordId) => store.getPlan('record', recordId) as RecordPlan)
+          .sort((left, right) =>
+            left.execution?.provisionalPublished
+              ? -1
+              : right.execution?.provisionalPublished
+                ? 1
+                : 0,
+          );
+        // One record publishes without its cycle link, the other can then
+        // publish, and apply republishes the first one with the link.
+        assert.deepEqual([first.diagnostics, second.diagnostics], [[], []]);
+        assert.deepEqual(first.execution?.provisionalPublished, {
+          link: null,
+        });
+        assert.equal(first.execution?.publishOrder, 0);
+        assert.equal(second.execution?.provisionalPublished, undefined);
+        assert.equal(second.execution?.publishOrder, 1);
+      },
+    );
+  });
+
+  it('drops one link per cycle and keeps links outside it', async () => {
+    const LINKS = id('links');
+    const X = id('x');
+    const state = schema([
+      model({
+        fields: [field({ id: LINKS, apiKey: 'links', type: 'links' })],
+      }),
+    ]);
+    const linked = (recordId: string, links: string[]) =>
+      record(
+        recordId,
+        { links },
+        {
+          published: { links },
+          validity: { current: true, published: true },
+        },
+      );
+    const existing = linked(X, []);
+    await fixture(
+      [linked(A, [B, X]), linked(B, [C, X]), linked(C, [A, X]), existing],
+      [existing],
+      state,
+      options(),
+      (store) => {
+        const entries = [A, B, C].map(
+          (recordId) => store.getPlan('record', recordId) as RecordPlan,
+        );
+        const provisional = entries.filter(
+          (entry) => entry.execution?.provisionalPublished,
+        );
+        assert.equal(provisional.length, 1);
+        const [entry] = provisional;
+        const links = entry.desired!.published!.links as string[];
+        assert.deepEqual(entry.execution!.provisionalPublished, {
+          links: links.filter((target) => target === X),
+        });
+        assert.deepEqual(
+          entries.map((candidate) => candidate.diagnostics),
+          [[], [], []],
+        );
+      },
+    );
+  });
+
+  it('relaxes a required cycle link only with temporary schema changes', async () => {
+    const state = schema([
+      model({
+        fields: [
+          field({
+            id: LINK,
+            apiKey: 'link',
+            type: 'link',
+            validators: { required: {} },
+          }),
+        ],
+      }),
+    ]);
+    const source = [A, B].map((recordId) =>
+      record(
+        recordId,
+        { link: recordId === A ? B : A },
+        {
+          published: { link: recordId === A ? B : A },
           validity: { current: true, published: true },
         },
       ),
-      record(
-        B,
-        { link: A },
-        {
-          published: { link: A },
-          validity: { current: true, published: true },
-        },
-      ),
-    ];
+    );
     await assert.rejects(
-      fixture(
-        source,
-        [],
-        state,
-        options({ allowTemporarySchemaChanges: true }),
-      ),
-      unsafe,
+      fixture(source, [], state, options()),
+      (error: unknown) =>
+        unsafe(error) &&
+        (error as ContentError).details?.reason ===
+          'TEMPORARY_SCHEMA_CHANGE_REQUIRED',
+    );
+    await fixture(
+      source,
+      [],
+      state,
+      options({ allowTemporarySchemaChanges: true }),
+      (_store, metadata) => {
+        assert.equal(metadata.counts.record.create, 2);
+        assert.deepEqual(
+          metadata.temporarySchemaChanges.map((change) => [
+            change.fieldId,
+            change.temporary.validators,
+          ]),
+          [[LINK, {}]],
+        );
+      },
+    );
+  });
+
+  it('still diagnoses publication cycles through links inside blocks', async () => {
+    const state = schema([
+      model({
+        fields: [
+          field({ id: BLOCK_FIELD, apiKey: 'blocks', type: 'rich_text' }),
+        ],
+      }),
+      model({
+        id: BLOCK_MODEL,
+        apiKey: 'block',
+        block: true,
+        fields: [field({ id: LINK, apiKey: 'related', type: 'link' })],
+      }),
+    ]);
+    const linked = (recordId: string, related: string) => {
+      const blocks = [
+        {
+          id: id(`${recordId}-block`),
+          __itemTypeId: BLOCK_MODEL,
+          attributes: { related },
+        },
+      ];
+      return record(
+        recordId,
+        { blocks },
+        {
+          published: { blocks },
+          validity: { current: true, published: true },
+        },
+      );
+    };
+    const source = [linked(A, B), linked(B, A)];
+    await assert.rejects(
+      fixture(source, [], state, options()),
+      (error: unknown) =>
+        unsafe(error) &&
+        (error as ContentError).details?.reason === 'PUBLISH_CYCLE',
     );
     await fixture(
       source,

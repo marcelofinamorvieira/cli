@@ -2082,6 +2082,131 @@ describe('apply executor with the SDK resource contract', () => {
     ]);
   });
 
+  it('publishes a cycle of new linked records in two steps', async () => {
+    const otherId = 'dddddddddddddddddddddd';
+    const desired = [
+      { id: recordId, fields: { title: 'a', link: otherId } },
+      { id: otherId, fields: { title: 'b', link: recordId } },
+    ].map(({ id, fields }) =>
+      state(fields, {
+        id,
+        published: fields,
+        firstPublishedAt: '2019-01-01T00:00:00.000Z',
+        publishedUpdatedAt: '2020-01-02T00:00:00.000Z',
+        validity: { current: true, published: true },
+      }),
+    );
+    const entries = (provisional: boolean) =>
+      desired.map((record, index) => {
+        const entry = plan(null, record);
+        entry.execution = {
+          ...entry.execution,
+          creationFields: { ...record.current, link: null },
+          publishOrder: index,
+          ...(provisional && index === 0
+            ? { provisionalPublished: { ...record.current, link: null } }
+            : {}),
+        };
+        entry.safety.currentReferences = [record.current.link as string];
+        entry.safety.publishedReferences = [record.current.link as string];
+        return entry;
+      });
+    for (const provisional of [false, true]) {
+      const runDirectory = join(directory, String(provisional));
+      mkdirSync(runDirectory);
+      const mock = sdk();
+      mock.withLinks();
+      // DatoCMS refuses to publish a record linking to an unpublished one.
+      const environmentClient = (environmentId: string) => {
+        const client = mock.client(environmentId);
+        const publish = client.items.publish.bind(client.items);
+        client.items.publish = (async (id: string, ...rest: unknown[]) => {
+          const records = mock.environments.get(environmentId)!;
+          const link = records.get(id)?.current.link as string | null;
+          if (link && link !== id && !records.get(link)?.published)
+            throw new Error(`${id} links to unpublished record ${link}`);
+          return Reflect.apply(publish, client.items, [id, ...rest]);
+        }) as typeof client.items.publish;
+        return client;
+      };
+      const bundlePath = await bundle(runDirectory, mock, entries(provisional));
+      const run = applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: environmentClient,
+        bundlePath,
+        options: defaults,
+      });
+      if (!provisional) {
+        // Without the provisional step, the dependency guard refuses first.
+        await assert.rejects(run, /dependency \w+ is not published/);
+        continue;
+      }
+      const result = await run;
+      for (const record of desired) {
+        const actual = mock.environments
+          .get(result.environmentId)!
+          .get(record.id)!;
+        assert.deepEqual(actual.current, record.current);
+        assert.deepEqual(actual.published, record.published);
+      }
+      // The first record publishes without its link, the second publishes,
+      // and the first is republished with the link restored.
+      assert.deepEqual(
+        mock.events.filter((event) => event.startsWith('publish:')),
+        [`publish:${recordId}`, `publish:${otherId}`, `publish:${recordId}`],
+      );
+    }
+  });
+
+  it('rejects a provisional publication that changes more than cycle links', async () => {
+    const otherId = 'dddddddddddddddddddddd';
+    const desired = [
+      { id: recordId, fields: { title: 'a', link: otherId } },
+      { id: otherId, fields: { title: 'b', link: recordId } },
+    ].map(({ id, fields }) =>
+      state(fields, {
+        id,
+        published: fields,
+        firstPublishedAt: '2019-01-01T00:00:00.000Z',
+        publishedUpdatedAt: '2020-01-02T00:00:00.000Z',
+        validity: { current: true, published: true },
+      }),
+    );
+    const entries = desired.map((record, index) => {
+      const entry = plan(null, record);
+      entry.execution = {
+        ...entry.execution,
+        creationFields: { ...record.current, link: null },
+        publishOrder: index,
+        ...(index === 0
+          ? { provisionalPublished: { title: 'not reviewed', link: null } }
+          : {}),
+      };
+      entry.safety.currentReferences = [record.current.link as string];
+      entry.safety.publishedReferences = [record.current.link as string];
+      return entry;
+    });
+    const mock = sdk();
+    mock.withLinks();
+    const bundlePath = await bundle(directory, mock, entries);
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: defaults,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.code === 'INVALID_BUNDLE' &&
+        /changes more than cycle links/.test(error.message),
+    );
+    assert.deepEqual(
+      mock.events.filter((event) => /^(create|update|publish):/.test(event)),
+      [],
+    );
+  });
+
   it('publishes, unpublishes, and deletes records with self references without bypassing external referrers', async () => {
     for (const action of [
       'publish',

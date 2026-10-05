@@ -843,8 +843,35 @@ async function createRecord(
   if (ordering) await orderingAfter(context, entry);
 }
 
-async function publication(context: Context, entry: RecordPlan): Promise<void> {
+async function publication(
+  context: Context,
+  entry: RecordPlan,
+  republish = false,
+): Promise<void> {
   const desired = entry.desired!;
+  // A record in a publication cycle is first published without its links to
+  // the rest of the cycle (see the planner's breakPublicationCycles), so its
+  // dependency check covers only what that provisional version references.
+  // The republication pass then publishes the full desired fields, once every
+  // record it links to is published.
+  const provisional = republish
+    ? undefined
+    : entry.execution?.provisionalPublished;
+  const published = provisional ?? desired.published;
+  const publicationPlan: RecordPlan = provisional
+    ? {
+        ...entry,
+        safety: {
+          ...entry.safety,
+          publishedReferences: inspectRecord(
+            { ...desired, current: provisional, published: null },
+            context.schema,
+          )
+            .references.filter((reference) => reference.kind === 'current')
+            .map((reference) => reference.targetId),
+        },
+      }
+    : entry;
   let live = await guardRecord(context, entry.id);
   if (!live) conflict('record', entry.id, 'missing before publication');
   const model = context.schema.models.find((m) => m.id === entry.modelId)!;
@@ -864,8 +891,8 @@ async function publication(context: Context, entry: RecordPlan): Promise<void> {
   }
   if (Object.keys(preparation).length)
     live = await updateRecord(context, entry, preparation);
-  if (equal(live.published, desired.published)) return;
-  if (!desired.published) {
+  if (equal(live.published, published)) return;
+  if (!published) {
     await noReferrers(context, entry, true);
     await guardRecord(context, entry.id);
     assertRecordWritable(context, live);
@@ -882,8 +909,8 @@ async function publication(context: Context, entry: RecordPlan): Promise<void> {
       conflict('record', entry.id, 'unpublishing did not converge');
     return;
   }
-  await dependencies(context, entry, true);
-  await writeFields(context, entry, desired.published);
+  await dependencies(context, publicationPlan, true);
+  await writeFields(context, entry, published);
   live = await guardRecord(context, entry.id);
   if (!live) conflict('record', entry.id, 'missing before publication');
   if (!live.validity.current) {
@@ -902,17 +929,14 @@ async function publication(context: Context, entry: RecordPlan): Promise<void> {
       `Record ${entry.id} is invalid before publication.`,
     );
   }
-  await dependencies(context, entry, true);
+  await dependencies(context, publicationPlan, true);
   await guardRecord(context, entry.id);
   assertRecordWritable(context, live);
   assertNotAborted(context.signal);
   await context.client.items.publish(entry.id, undefined, { recursive: false });
   context.mutations++;
-  live = await rememberRecord(context, entry.id, {
-    ...live,
-    published: desired.published,
-  });
-  if (!equal(live.published, desired.published))
+  live = await rememberRecord(context, entry.id, { ...live, published });
+  if (!equal(live.published, published))
     conflict('record', entry.id, 'published payload did not converge');
 }
 
@@ -1920,6 +1944,14 @@ export async function applyBundle(args: {
     );
     await recordPhase(context, ['create', 'update'], 'publishOrder', (entry) =>
       publication(context!, entry),
+    );
+    // Every record is now published as planned, except cycle members that were
+    // published without their cycle links. Restore and republish those before
+    // the current phase, which would otherwise be overwritten by this write.
+    await recordPhase(context, ['create', 'update'], 'publishOrder', (entry) =>
+      entry.execution?.provisionalPublished
+        ? publication(context!, entry, true)
+        : Promise.resolve(),
     );
     await recordPhase(context, ['create', 'update'], 'updateOrder', (entry) =>
       current(context!, entry),

@@ -151,6 +151,12 @@ export interface RecordPlan {
     publishOrder?: number;
     deleteOrder?: number;
     creationFields?: JsonObject;
+    /**
+     * Published fields for a first publication that omits links to other
+     * records in a publication cycle; the full desired published fields are
+     * published again once those records are published.
+     */
+    provisionalPublished?: JsonObject;
     preclearFieldIds?: string[];
   };
 }

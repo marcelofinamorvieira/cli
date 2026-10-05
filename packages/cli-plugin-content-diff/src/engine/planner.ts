@@ -3,6 +3,7 @@ import {
   inspectRecord,
   object,
   recordGuard,
+  referenceId,
   unsupportedRecordPayloadKey,
 } from './codec';
 import { ContentError } from './errors';
@@ -25,6 +26,7 @@ import type {
   Diagnostic,
   FieldSchema,
   JsonObject,
+  JsonValue,
   Kind,
   ModelSchema,
   PlanCounts,
@@ -45,6 +47,218 @@ function blankCounts(): PlanCounts {
   const actions = () => ({ create: 0, update: 0, delete: 0, noop: 0, skip: 0 });
   return { record: actions(), upload: actions(), collection: actions() };
 }
+
+/**
+ * Removes references to `targets` from the top-level link and links fields of
+ * a record's fields. Only those two field types can drop a reference without
+ * editing nested content, so this returns null when a target is also
+ * referenced anywhere else (inside blocks or structured text).
+ */
+export function omitPublicationReferences(
+  record: RecordState,
+  fields: JsonObject,
+  model: ModelSchema,
+  schema: SchemaState,
+  targets: ReadonlySet<string>,
+): JsonObject | null {
+  const omitted = structuredClone(fields);
+  const omit = (field: FieldSchema, value: JsonValue): JsonValue => {
+    if (field.type === 'link') {
+      const target = referenceId(value);
+      return target && targets.has(target) ? null : value;
+    }
+    return Array.isArray(value)
+      ? value.filter((entry) => {
+          const target = referenceId(entry);
+          return !(target && targets.has(target));
+        })
+      : value;
+  };
+  for (const field of model.fields) {
+    if (field.type !== 'link' && field.type !== 'links') continue;
+    const value = omitted[field.apiKey];
+    if (value === undefined) continue;
+    omitted[field.apiKey] =
+      field.localized && object(value)
+        ? Object.fromEntries(
+            Object.entries(value).map(([locale, entry]) => [
+              locale,
+              omit(field, entry),
+            ]),
+          )
+        : omit(field, value);
+  }
+  const remaining = inspectRecord(
+    { ...record, current: omitted, published: null },
+    schema,
+  ).references;
+  return remaining.some(
+    (reference) =>
+      reference.kind === 'current' && targets.has(reference.targetId),
+  )
+    ? null
+    : omitted;
+}
+
+/** Iterative Tarjan over an owner -> dependencies map, in deterministic order. */
+function stronglyConnected(
+  edges: Map<string, Map<string, boolean>>,
+): string[][] {
+  const nodes = new Set<string>();
+  for (const [owner, dependencies] of edges) {
+    nodes.add(owner);
+    for (const dependency of dependencies.keys()) nodes.add(dependency);
+  }
+  const index = new Map<string, number>();
+  const low = new Map<string, number>();
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const components: string[][] = [];
+  let next = 0;
+  for (const root of [...nodes].sort(compareIds)) {
+    if (index.has(root)) continue;
+    const frames: Array<{ node: string; pending: string[] }> = [];
+    const visit = (node: string) => {
+      index.set(node, next);
+      low.set(node, next++);
+      stack.push(node);
+      onStack.add(node);
+      frames.push({
+        node,
+        pending: [...(edges.get(node)?.keys() ?? [])]
+          .sort(compareIds)
+          .reverse(),
+      });
+    };
+    visit(root);
+    while (frames.length) {
+      const frame = frames[frames.length - 1];
+      const dependency = frame.pending.pop();
+      if (dependency !== undefined) {
+        if (!index.has(dependency)) visit(dependency);
+        else if (onStack.has(dependency))
+          low.set(
+            frame.node,
+            Math.min(low.get(frame.node)!, index.get(dependency)!),
+          );
+        continue;
+      }
+      frames.pop();
+      const parent = frames[frames.length - 1];
+      if (parent)
+        low.set(
+          parent.node,
+          Math.min(low.get(parent.node)!, low.get(frame.node)!),
+        );
+      if (low.get(frame.node) !== index.get(frame.node)) continue;
+      const component: string[] = [];
+      let member: string;
+      do {
+        member = stack.pop()!;
+        onStack.delete(member);
+        component.push(member);
+      } while (member !== frame.node);
+      components.push(component.sort(compareIds));
+    }
+  }
+  return components;
+}
+
+/**
+ * Orders the records of a publication cycle so dependencies come first where
+ * possible. A depth-first postorder misplaces only one edge per simple cycle;
+ * with `fixedOnly`, only unbreakable edges are honoured, which succeeds
+ * whenever they are acyclic and otherwise returns null.
+ */
+function cycleOrder(
+  component: string[],
+  members: Set<string>,
+  edges: Map<string, Map<string, boolean>>,
+  fixedOnly: boolean,
+): Map<string, number> | null {
+  const position = new Map<string, number>();
+  const dependencies = (node: string) =>
+    [...(edges.get(node) ?? [])]
+      .filter(
+        ([dependency, breakable]) =>
+          members.has(dependency) && !(fixedOnly && breakable),
+      )
+      .map(([dependency]) => dependency)
+      .sort(compareIds);
+  if (!fixedOnly) {
+    for (const root of component) {
+      if (position.has(root)) continue;
+      const visited = new Set([root]);
+      const frames = [{ node: root, pending: dependencies(root).reverse() }];
+      while (frames.length) {
+        const frame = frames[frames.length - 1];
+        const dependency = frame.pending.pop();
+        if (dependency !== undefined) {
+          if (!visited.has(dependency) && !position.has(dependency)) {
+            visited.add(dependency);
+            frames.push({
+              node: dependency,
+              pending: dependencies(dependency).reverse(),
+            });
+          }
+          continue;
+        }
+        frames.pop();
+        position.set(frame.node, position.size);
+      }
+    }
+    return position;
+  }
+  const waiting = new Map<string, number>();
+  const dependants = new Map<string, string[]>();
+  for (const owner of component)
+    for (const dependency of dependencies(owner)) {
+      waiting.set(owner, (waiting.get(owner) ?? 0) + 1);
+      dependants.set(dependency, [
+        ...(dependants.get(dependency) ?? []),
+        owner,
+      ]);
+    }
+  const ready = component.filter((member) => !waiting.get(member));
+  while (ready.length) {
+    ready.sort(compareIds);
+    const member = ready.shift()!;
+    position.set(member, position.size);
+    for (const owner of dependants.get(member) ?? []) {
+      const count = waiting.get(owner)! - 1;
+      waiting.set(owner, count);
+      if (!count) ready.push(owner);
+    }
+  }
+  return position.size === component.length ? position : null;
+}
+
+/**
+ * The links an order requires dropping: each edge whose dependency comes after
+ * its owner. Returns null when one of them cannot be dropped.
+ */
+function droppedEdges(
+  component: string[],
+  members: Set<string>,
+  edges: Map<string, Map<string, boolean>>,
+  position: Map<string, number> | null,
+): Map<string, Set<string>> | null {
+  if (!position) return null;
+  const drops = new Map<string, Set<string>>();
+  for (const owner of component)
+    for (const [dependency, breakable] of edges.get(owner) ?? [])
+      if (
+        members.has(dependency) &&
+        position.get(dependency)! > position.get(owner)!
+      ) {
+        if (!breakable) return null;
+        drops.set(owner, new Set([...(drops.get(owner) ?? []), dependency]));
+      }
+  return drops;
+}
+
+const provisionalReason = (recordId: string) =>
+  `Record ${recordId} is published once without its links to records in a publication cycle.`;
 
 function sortedUnique(values: Iterable<string>): string[] {
   return [...new Set(values)].sort();
@@ -2003,6 +2217,7 @@ class Planning {
           );
       }
     }
+    this.breakPublicationCycles();
     for (const phase of [
       'tree',
       'create',
@@ -2038,6 +2253,119 @@ class Planning {
         const entry = this.store.getPlan('record', rank.id) as RecordPlan;
         entry.execution = { ...entry.execution, [`${phase}Order`]: rank.rank };
         this.store.putPlan(entry);
+      }
+    }
+  }
+
+  // DatoCMS refuses to publish a record that links to an unpublished record, so
+  // records that are new or unpublished in the destination and link to each
+  // other cannot be published one after another as they are. Each such cycle
+  // is broken by publishing some of its records first without their links to
+  // the rest of the cycle, publishing the rest, and then publishing the first
+  // ones again with those links restored (apply's republication pass). Only
+  // references held directly in top-level link/links fields can be dropped;
+  // links inside blocks or structured text, tree parents, and other ordering
+  // constraints are fixed, and a cycle made only of those is still reported.
+  breakPublicationCycles(): void {
+    // Planning reruns after each round of skips, so earlier breaks start over.
+    for (const row of this.store.database
+      .prepare(
+        "SELECT id FROM plan WHERE kind='record' AND json_extract(data,'$.execution.provisionalPublished') IS NOT NULL",
+      )
+      .all()) {
+      const entry = this.store.getPlan('record', String(row.id)) as RecordPlan;
+      const { provisionalPublished: _, ...execution } = entry.execution!;
+      entry.execution = execution;
+      this.store.putPlan(entry);
+      this.store.database
+        .prepare(
+          'DELETE FROM planner_temp_usage WHERE record_id=? AND reason=?',
+        )
+        .run(entry.id, provisionalReason(entry.id));
+    }
+    if (!this.graph.order('publish')) return;
+    // Only the unresolved part of the graph is loaded: records in a cycle and
+    // records waiting on one. An owner/dependency pair is breakable only when
+    // every edge between them comes from a published reference.
+    const edges = new Map<string, Map<string, boolean>>();
+    for (const row of this.store.database
+      .prepare(`SELECT g.owner_id,g.dependency_id,g.reason FROM planner_graph g
+      JOIN planner_nodes o ON o.phase=g.phase AND o.kind=g.owner_kind AND o.id=g.owner_id AND o.done=0
+      JOIN planner_nodes d ON d.phase=g.phase AND d.kind=g.dependency_kind AND d.id=g.dependency_id AND d.done=0
+      WHERE g.phase='publish' AND g.owner_kind='record' AND g.dependency_kind='record' AND g.owner_id<>g.dependency_id
+      ORDER BY g.owner_id,g.dependency_id`)
+      .iterate()) {
+      const owner = String(row.owner_id);
+      const dependency = String(row.dependency_id);
+      const dependencies = edges.get(owner) ?? new Map<string, boolean>();
+      edges.set(owner, dependencies);
+      dependencies.set(
+        dependency,
+        (dependencies.get(dependency) ?? true) && row.reason === 'publication',
+      );
+    }
+    for (const component of stronglyConnected(edges)) {
+      if (component.length < 2) continue;
+      const members = new Set(component);
+      // Prefer a depth-first order, which breaks each simple cycle at a single
+      // link. If that would drop a fixed edge, order by the fixed edges alone.
+      const drops =
+        droppedEdges(
+          component,
+          members,
+          edges,
+          cycleOrder(component, members, edges, false),
+        ) ??
+        droppedEdges(
+          component,
+          members,
+          edges,
+          cycleOrder(component, members, edges, true),
+        );
+      // A cycle of fixed edges cannot be broken here; it is reported below.
+      if (!drops) continue;
+      // Commit only if every dropped link can be omitted, so a cycle is either
+      // fully broken or left intact for the cycle diagnostic.
+      const provisional = new Map<string, JsonObject>();
+      for (const [owner, targets] of drops) {
+        const entry = this.store.getPlan('record', owner) as RecordPlan;
+        const desired = entry.desired!;
+        const fields = omitPublicationReferences(
+          desired,
+          desired.published!,
+          this.models.get(entry.modelId)!,
+          this.target,
+          targets,
+        );
+        if (!fields) break;
+        provisional.set(owner, fields);
+      }
+      if (provisional.size !== drops.size) continue;
+      for (const [owner, fields] of provisional) {
+        const entry = this.store.getPlan('record', owner) as RecordPlan;
+        const model = this.models.get(entry.modelId)!;
+        // Emptying a required link, or shrinking links below a minimum size,
+        // needs the same explicit temporary relaxation as other transitions.
+        for (const field of model.fields)
+          if (
+            hashJson(fields[field.apiKey] ?? null) !==
+            hashJson(entry.desired!.published![field.apiKey] ?? null)
+          )
+            for (const validator of fieldFailures(field, fields[field.apiKey]))
+              this.relaxation(
+                owner,
+                field.id,
+                validator,
+                provisionalReason(owner),
+              );
+        entry.execution = { ...entry.execution, provisionalPublished: fields };
+        this.store.putPlan(entry);
+        for (const target of drops.get(owner)!)
+          this.store.database
+            .prepare(
+              "DELETE FROM planner_graph WHERE phase='publish' AND owner_kind='record' AND owner_id=? AND dependency_kind='record' AND dependency_id=? AND reason='publication'",
+            )
+            .run(owner, target);
       }
     }
   }
