@@ -42,6 +42,8 @@ import type {
   RecordGuard,
   RecordPlan,
   RecordState,
+  RepairOptions,
+  RepairResult,
   Schedules,
   SchemaState,
   UploadPlan,
@@ -101,6 +103,43 @@ function futureSchedules(id: string, schedules: Schedules): void {
         `Record ${id} has a schedule that is no longer in the future.`,
       );
     }
+  }
+}
+
+function describeSchedules(schedules: Schedules): string {
+  return (
+    [
+      schedules.publication && `publication at ${schedules.publication.at}`,
+      schedules.unpublishing && `unpublishing at ${schedules.unpublishing.at}`,
+    ]
+      .filter(Boolean)
+      .join(' and ') || 'none'
+  );
+}
+
+/**
+ * A schedule that fires during apply changes content the run is about to
+ * verify, and a written record's schedule is only recreated after the writes.
+ * Refuse to start when any destination schedule, or any schedule the bundle
+ * recreates, falls due within the window.
+ */
+function assertScheduleWindow(context: Context, minutes: number): void {
+  const deadline = Date.now() + minutes * 60_000;
+  for (const row of context.store.database
+    .prepare(`SELECT id,at FROM (
+      SELECT id,json_extract(state_json,'$.schedules.publication.at') AS at FROM records WHERE side='live'
+      UNION ALL SELECT id,json_extract(state_json,'$.schedules.unpublishing.at') FROM records WHERE side='live'
+      UNION ALL SELECT id,json_extract(data,'$.desired.schedules.publication.at') FROM plan WHERE kind='record' AND action IN ('create','update')
+      UNION ALL SELECT id,json_extract(data,'$.desired.schedules.unpublishing.at') FROM plan WHERE kind='record' AND action IN ('create','update')
+    ) WHERE at IS NOT NULL ORDER BY id`)
+    .iterate()) {
+    const at = Date.parse(String(row.at));
+    if (Number.isFinite(at) && at > deadline) continue;
+    throw new ContentError(
+      'SCHEDULE_DUE_DURING_APPLY',
+      `Record ${row.id} has a schedule at ${row.at}, within the ${minutes}-minute schedule window. Apply after it has run, or lower --schedule-window.`,
+      { recordId: String(row.id), at: String(row.at), windowMinutes: minutes },
+    );
   }
 }
 
@@ -178,13 +217,15 @@ function* scheduledRecords(
   context: Context,
   restore: boolean,
 ): Generator<RecordPlan> {
+  // Only records this run writes have their schedules cancelled and then
+  // recreated. Unchanged records keep theirs: the preflight refuses to start
+  // when a schedule falls due within the schedule window, and final
+  // verification reports one that fires anyway.
   const schedulePath = restore
-    ? "CASE WHEN action='noop' THEN '$.guard.schedules' ELSE '$.desired.schedules' END"
+    ? "'$.desired.schedules'"
     : "'$.guard.schedules'";
   const rows = context.store.database.prepare(`SELECT data FROM plan WHERE kind='record'
-    AND action IN (${
-      restore ? "'create','update','noop'" : "'update','delete','noop'"
-    })
+    AND action IN (${restore ? "'create','update'" : "'update','delete'"})
     AND (json_extract(data,(${schedulePath}) || '.publication') IS NOT NULL OR json_extract(data,(${schedulePath}) || '.unpublishing') IS NOT NULL)
     ORDER BY model_id,id`);
   for (const row of rows.iterate()) {
@@ -1523,30 +1564,6 @@ function validateBundlePreflight(context: Context): void {
         );
       }
     }
-    if (
-      entry.kind === 'record' &&
-      entry.action === 'noop' &&
-      managedRecord(context, entry) &&
-      entry.guard &&
-      context.writesPlanned
-    ) {
-      futureSchedules(entry.id, entry.guard.schedules);
-      const record = live as RecordState;
-      if (
-        record.schedules.publication &&
-        scheduleNeedsValidity(context, record) &&
-        !record.validity.current &&
-        unsupportedRecordPayloadKey(
-          record.current,
-          record.modelId,
-          context.schema,
-        )
-      )
-        throw new ContentError(
-          'UNEXECUTABLE_EXISTING_SCHEDULE',
-          `Record ${entry.id} needs an SDK-unsafe content refresh to recreate its publication schedule.`,
-        );
-    }
   }
   for (const change of context.manifest.temporarySchemaChanges) {
     if (!reachableModels.has(change.modelId)) {
@@ -1608,28 +1625,8 @@ async function captureLive(
   });
 }
 
-function expectedFinal(
-  context: Context,
-  entry: PlanEntry,
-  schedules: boolean,
-): string | null {
+function expectedFinal(entry: PlanEntry, schedules: boolean): string | null {
   if (entry.action === 'delete') return null;
-  if (
-    entry.kind === 'record' &&
-    entry.action === 'noop' &&
-    managedRecord(context, entry) &&
-    !schedules
-  ) {
-    const original = context.store.database
-      .prepare('SELECT state_json FROM apply_original_records WHERE id=?')
-      .get(entry.id);
-    if (!original)
-      conflict('record', entry.id, 'unchanged baseline record is missing');
-    return recordHash({
-      ...(JSON.parse(original.state_json as string) as RecordState),
-      schedules: emptySchedules,
-    });
-  }
   if (entry.action === 'skip' || entry.action === 'noop')
     return entry.guard?.hash ?? null;
   if (!entry.desired)
@@ -1652,7 +1649,7 @@ function verifyFinal(context: Context, schedules: boolean): void {
         : entry.kind === 'upload'
           ? context.store.getUpload('live', entry.id)
           : context.store.getCollection('live', entry.id);
-    if ((state?.hash ?? null) !== expectedFinal(context, entry, schedules)) {
+    if ((state?.hash ?? null) !== expectedFinal(entry, schedules)) {
       conflict(
         entry.kind,
         entry.id,
@@ -1864,6 +1861,8 @@ export async function applyBundle(args: {
     context.log?.(`Verifying destination baseline in "${destinationId}".`);
     await captureLive(context, destinationId);
     validateBundlePreflight(context);
+    if (context.writesPlanned)
+      assertScheduleWindow(context, args.options.scheduleWindowMinutes ?? 120);
     preserveBaseline(context);
     let environmentId = destinationId;
     if (!args.options.inPlace) {
@@ -2045,21 +2044,18 @@ export async function applyBundle(args: {
       );
     // Recheck the complete reviewed and preserved namespace after writes.
     // This detects observable concurrent edits; it does not make apply atomic.
-    context.log?.('Verifying final content before restoring schedules.');
-    await captureLive(context, environmentId);
-    verifyFinal(context, !context.writesPlanned);
-    // An all-noop export still receives full independent verification, but
-    // touching its schedules would introduce unnecessary content writes when
-    // a stale validity stamp requires a refresh during schedule restoration.
+    // In place, check the written content before arming schedules on it. A
+    // fork that fails verification is deleted, so one final check suffices.
+    if (args.options.inPlace) {
+      context.log?.('Verifying final content before restoring schedules.');
+      await captureLive(context, environmentId);
+      verifyFinal(context, !context.writesPlanned);
+    }
+    // Schedules are recreated once every write is done and the original field
+    // settings are back, so DatoCMS validates them under the final schema.
     if (context.writesPlanned)
       for (const entry of scheduledRecords(context, true))
-        await restoreSchedules(
-          context,
-          entry.id,
-          entry.action === 'noop'
-            ? entry.guard!.schedules
-            : entry.desired!.schedules,
-        );
+        await restoreSchedules(context, entry.id, entry.desired!.schedules);
     // Schedules are writes too. Verify exact dates and all content again after
     // restoring them, using a second independently checked complete capture.
     context.log?.('Verifying final content and schedules.');
@@ -2128,14 +2124,29 @@ export async function applyBundle(args: {
         try {
           const live = await focusedRecord(context, original.id);
           if (!live) {
-            if (
-              original.schedules.publication ||
-              original.schedules.unpublishing
-            )
+            if (plan.action !== 'delete' && scheduled(original.schedules))
               throw new Error('record no longer exists');
             continue;
           }
           if (equal(live.schedules, original.schedules)) continue;
+          // Restore an original schedule only on the original content. A record
+          // this run created or already changed is left as it is and reported:
+          // re-arming the old schedule could publish content nobody scheduled.
+          if (!row.state_json)
+            throw new Error(
+              `was created by this run, so its schedules (${describeSchedules(
+                live.schedules,
+              )}) were left as they are`,
+            );
+          if (
+            recordHash({ ...live, schedules: original.schedules }) !==
+            recordHash(original as RecordState)
+          )
+            throw new Error(
+              `content was changed by this run or another editor, so its schedules were left as they are (original: ${describeSchedules(
+                original.schedules,
+              )})`,
+            );
           const expectedRow = store.database
             .prepare(
               'SELECT schedules_json,previous_schedules_json FROM apply_schedule_state WHERE id=?',
@@ -2227,5 +2238,221 @@ export async function applyBundle(args: {
     store.dispose();
     if (!complete && ownedFork && forkRequested && args.options.keepFailedFork)
       args.options.log?.(`Kept failed fork ${ownedFork}`);
+  }
+}
+
+const scheduled = (schedules: Schedules | undefined): boolean =>
+  !!(schedules?.publication || schedules?.unpublishing);
+
+/**
+ * Puts back what an interrupted or killed in-place apply left behind: the
+ * original field settings, and schedules that were cancelled but never
+ * recreated. Nothing is resumed, and only the bundle and the live environment
+ * are read. A record whose content is still the original gets its original
+ * schedules back, one whose content matches the bundle gets the bundle's
+ * schedules, and anything else is left as it is and reported.
+ */
+export async function repairBundle(args: {
+  rootClient: Client;
+  buildEnvironmentClient: (environmentId: string) => Client;
+  bundlePath: string;
+  options: RepairOptions;
+}): Promise<RepairResult> {
+  const store = new SnapshotStore();
+  const problems: string[] = [];
+  let problemCount = 0;
+  const problem = (message: string): void => {
+    problemCount++;
+    if (problems.length < 20) problems.push(message);
+  };
+  try {
+    const { signal, log } = args.options;
+    log?.('Validating content bundle and asset checksums.');
+    const manifest = await readBundle({
+      directory: args.bundlePath,
+      store,
+      signal,
+    });
+    const environmentId =
+      args.options.destinationEnvironmentId ??
+      manifest.destination.environmentId;
+    const client = args.buildEnvironmentClient(environmentId);
+    const [rootSite, environment] = await Promise.all([
+      args.rootClient.site.find(),
+      args.rootClient.environments.find(environmentId),
+    ]);
+    if (rootSite.id !== manifest.destination.siteId)
+      throw new ContentError(
+        'DESTINATION_MISMATCH',
+        'Destination project does not match the bundle.',
+      );
+    if (environment.meta.read_only_mode || environment.meta.status !== 'ready')
+      throw new ContentError(
+        'DESTINATION_UNAVAILABLE',
+        'Destination environment is not writable and ready.',
+      );
+    if (environment.meta.primary && !args.options.allowPrimary)
+      throw new ContentError(
+        'PRIMARY_REQUIRES_APPROVAL',
+        'Repairing primary requires --allow-primary.',
+      );
+    let restoredFields = 0;
+    let restoredSchedules = 0;
+    // Field settings first, so schedules are recreated under the original
+    // rules, as a completed apply would.
+    for (const change of manifest.temporarySchemaChanges) {
+      assertNotAborted(signal);
+      const live = await client.fields.find(change.fieldId);
+      const matches = (settings: typeof change.original) =>
+        equal(live.validators, settings.validators) &&
+        equal(live.default_value, settings.defaultValue);
+      if (matches(change.original)) continue;
+      if (!matches(change.temporary)) {
+        problem(
+          `Field ${change.fieldId}: settings were changed by someone else; left as they are`,
+        );
+        continue;
+      }
+      log?.(`Restoring field ${change.fieldId} settings.`);
+      await client.fields.update(change.fieldId, {
+        validators: change.original.validators,
+        default_value: change.original.defaultValue,
+      } as Parameters<Client['fields']['update']>[1]);
+      restoredFields++;
+    }
+    const schema = await fetchSchema(client, environmentId);
+    if (schema.siteId !== manifest.destination.siteId)
+      throw new ContentError(
+        'DESTINATION_MISMATCH',
+        'Destination project does not match the bundle.',
+      );
+    if (schema.hash !== manifest.schema.hash) {
+      problem('Schema differs from the bundle; schedules were not checked');
+    } else {
+      const context: Context = {
+        client,
+        store,
+        manifest,
+        schema,
+        bundlePath: args.bundlePath,
+        concurrency: 1,
+        mutations: 0,
+        writesPlanned: true,
+        signal,
+        log,
+      };
+      store.database.exec(
+        'CREATE TABLE apply_schedule_state(id TEXT PRIMARY KEY,schedules_json TEXT,touched INTEGER NOT NULL DEFAULT 0,previous_schedules_json TEXT)',
+      );
+      // Only records an apply cancels or recreates schedules for.
+      function* candidates(): Generator<string> {
+        for (const entry of store.planEntries('record')) {
+          if (entry.kind !== 'record' || !managedRecord(context, entry))
+            continue;
+          if (
+            (['update', 'delete'].includes(entry.action) &&
+              scheduled(entry.guard?.schedules)) ||
+            (['create', 'update'].includes(entry.action) &&
+              scheduled(entry.desired?.schedules))
+          )
+            yield entry.id;
+        }
+      }
+      for (const batch of batches(candidates())) {
+        assertNotAborted(signal);
+        const states = await readRecordBatch(client, batch, schema);
+        for (const id of batch) {
+          const entry = store.getPlan('record', id) as RecordPlan;
+          const live = states.find((state) => state.id === id);
+          try {
+            if (!live) {
+              if (
+                entry.action !== 'delete' &&
+                scheduled(entry.guard?.schedules)
+              )
+                problem(`Record ${id} no longer exists`);
+              continue;
+            }
+            const original =
+              entry.guard &&
+              recordHash({ ...live, schedules: entry.guard.schedules }) ===
+                entry.guard.hash;
+            const reviewed =
+              entry.desired &&
+              recordHash({ ...live, schedules: entry.desired.schedules }) ===
+                entry.desired.hash;
+            const wanted = original
+              ? entry.guard!.schedules
+              : reviewed
+                ? entry.desired!.schedules
+                : null;
+            if (!wanted) {
+              if (
+                equal(
+                  live.schedules,
+                  entry.guard?.schedules ?? emptySchedules,
+                ) ||
+                (entry.desired &&
+                  equal(live.schedules, entry.desired.schedules))
+              )
+                continue;
+              problem(
+                `Record ${id}: content matches neither the original nor the bundle, so its schedules were left as they are (original: ${describeSchedules(
+                  entry.guard?.schedules ?? emptySchedules,
+                )})`,
+              );
+              continue;
+            }
+            if (equal(live.schedules, wanted)) continue;
+            if (scheduled(live.schedules)) {
+              problem(
+                `Record ${id} has schedules (${describeSchedules(
+                  live.schedules,
+                )}) that differ from the expected ones (${describeSchedules(
+                  wanted,
+                )}); left as they are`,
+              );
+              continue;
+            }
+            if (
+              [wanted.publication, wanted.unpublishing].some(
+                (schedule) => schedule && Date.parse(schedule.at) <= Date.now(),
+              )
+            ) {
+              problem(
+                `Record ${id}: its schedule (${describeSchedules(
+                  wanted,
+                )}) has already passed; publish or unpublish it manually`,
+              );
+              continue;
+            }
+            log?.(`Restoring schedules of record ${id}.`);
+            store.putRecord('live', live);
+            store.database
+              .prepare(
+                'INSERT OR REPLACE INTO apply_schedule_state(id,schedules_json) VALUES(?,?)',
+              )
+              .run(id, JSON.stringify(live.schedules));
+            await restoreSchedules(context, id, wanted);
+            restoredSchedules++;
+          } catch (error) {
+            if (error instanceof ContentError && error.code === 'INTERRUPTED')
+              throw error;
+            problem(`Schedules ${id}: ${String(error)}`);
+          }
+        }
+      }
+    }
+    if (problemCount)
+      throw new ContentError(
+        'REPAIR_INCOMPLETE',
+        `Restored ${restoredSchedules} schedules and ${restoredFields} field settings. ${problemCount} ${
+          problemCount === 1 ? 'item needs' : 'items need'
+        } attention; showing ${problems.length}: ${problems.join('; ')}`,
+        { problemCount, problems, restoredSchedules, restoredFields },
+      );
+    return { environmentId, restoredSchedules, restoredFields };
+  } finally {
+    store.dispose();
   }
 }

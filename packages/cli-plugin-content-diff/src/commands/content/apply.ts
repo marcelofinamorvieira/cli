@@ -1,9 +1,13 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
-import { applyBundle } from '../../engine/apply';
+import { applyBundle, repairBundle } from '../../engine/apply';
 import { ContentError } from '../../engine/errors';
-import type { ApplyResult, BundleManifest } from '../../engine/types';
+import type {
+  ApplyResult,
+  BundleManifest,
+  RepairResult,
+} from '../../engine/types';
 import { ContentCommand, concurrency } from '../../utils/content-command';
 import { withInterruptHandling } from '../../utils/interruption';
 
@@ -13,6 +17,7 @@ export default class ContentApplyCommand extends ContentCommand {
   static examples = [
     '<%= config.bin %> <%= command.id %> ./content-bundle',
     '<%= config.bin %> <%= command.id %> ./content-bundle --in-place',
+    '<%= config.bin %> <%= command.id %> ./content-bundle --repair',
   ];
   static args = {
     BUNDLE: oclif.Args.string({
@@ -30,9 +35,23 @@ export default class ContentApplyCommand extends ContentCommand {
       default: false,
     }),
     'allow-primary': oclif.Flags.boolean({
-      description: 'Permit in-place writes to primary',
-      dependsOn: ['in-place'],
+      description: 'Permit in-place or repair writes to primary',
       default: false,
+    }),
+    repair: oclif.Flags.boolean({
+      description:
+        'Restore schedules and field settings left behind by an interrupted in-place apply',
+      exclusive: [
+        'in-place',
+        'keep-failed-fork',
+        'allow-temporary-schema-changes',
+      ],
+      default: false,
+    }),
+    'schedule-window': oclif.Flags.integer({
+      description:
+        'Refuse to start when a schedule falls due within this many minutes',
+      default: 120,
     }),
     'keep-failed-fork': oclif.Flags.boolean({
       description: 'Keep a fork created by this run after failure',
@@ -49,7 +68,7 @@ export default class ContentApplyCommand extends ContentCommand {
     }),
   };
 
-  async run(): Promise<ApplyResult> {
+  async run(): Promise<ApplyResult | RepairResult> {
     return withInterruptHandling(
       (signal) => this.runOperation(signal),
       () =>
@@ -59,15 +78,43 @@ export default class ContentApplyCommand extends ContentCommand {
     );
   }
 
-  private async runOperation(signal: AbortSignal): Promise<ApplyResult> {
+  private async runOperation(
+    signal: AbortSignal,
+  ): Promise<ApplyResult | RepairResult> {
     const { flags, args } = await this.parse(ContentApplyCommand);
     const maximum = concurrency(flags.concurrency);
-    if (flags['allow-primary'] && !flags['in-place'])
+    if (flags['allow-primary'] && !flags['in-place'] && !flags.repair)
       throw new ContentError(
         'INVALID_PRIMARY_AUTHORIZATION',
-        '--allow-primary requires --in-place.',
+        '--allow-primary requires --in-place or --repair.',
+      );
+    if (
+      !Number.isSafeInteger(flags['schedule-window']) ||
+      flags['schedule-window'] < 0
+    )
+      throw new ContentError(
+        'INVALID_SCHEDULE_WINDOW',
+        '--schedule-window must be a whole number of minutes, 0 or more.',
       );
     const endpoint = await this.endpoint();
+    if (flags.repair) {
+      const repaired = await repairBundle({
+        rootClient: endpoint.rootClient,
+        buildEnvironmentClient: endpoint.buildEnvironmentClient,
+        bundlePath: args.BUNDLE,
+        options: {
+          signal,
+          allowPrimary: flags['allow-primary'],
+          destinationEnvironmentId: flags.destination,
+          log: (message) => this.progress(message),
+        },
+      });
+      if (!this.jsonEnabled())
+        this.log(
+          `Repaired environment "${repaired.environmentId}": restored ${repaired.restoredSchedules} schedules and ${repaired.restoredFields} field settings.`,
+        );
+      return repaired;
+    }
     const result = await applyBundle({
       rootClient: endpoint.rootClient,
       buildEnvironmentClient: endpoint.buildEnvironmentClient,
@@ -80,6 +127,7 @@ export default class ContentApplyCommand extends ContentCommand {
         allowTemporarySchemaChanges: flags['allow-temporary-schema-changes'],
         destinationEnvironmentId: flags.destination,
         concurrency: maximum,
+        scheduleWindowMinutes: flags['schedule-window'],
         log: (message) => this.progress(message),
       },
     });

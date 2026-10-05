@@ -48,9 +48,14 @@ The public commands are `content:diff` and `content:apply`.
 17. Temporary validator/default changes require
     `--allow-temporary-schema-changes`. Restore original settings before
     success; attempt restoration on failure and report unsuccessful repair.
-18. Temporarily cancel existing managed destination schedules before content
-    writes. Recreate exact desired future schedules after verification. Never
-    invent new dates. Attempt original schedule restoration on in-place failure.
+18. Cancel existing schedules only on records the run writes, and recreate the
+    exact desired future schedules once writes are done and field settings are
+    restored. Leave every other schedule untouched, and refuse to start when a
+    schedule falls due within the schedule window. Never invent new dates. On
+    in-place failure, restore an original schedule only on original content;
+    report records the run created or changed. A separate repair mode restores
+    what a killed in-place run left behind, reading only the bundle and the
+    live environment.
 19. Remove temporary SQLite/staging state and incomplete generation outputs.
     Attempt removal of a failed fork created by this run, unless
     `--keep-failed-fork` was supplied. Never delete a pre-existing environment.

@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { CmaClient } from '@datocms/cli-utils';
 import { serializeRawItem } from '@datocms/rest-client-utils';
-import { applyBundle } from '../../src/engine/apply';
+import { applyBundle, repairBundle } from '../../src/engine/apply';
 import { stageBinary } from '../../src/engine/apply-binary';
 import { validateExecution } from '../../src/engine/apply-validation';
 import { batches, boundedWork } from '../../src/engine/apply-work';
@@ -1928,11 +1928,16 @@ describe('apply executor with the SDK resource contract', () => {
         bundlePath,
         options: { ...defaults, inPlace: true },
       }),
-      /changed during/,
+      // The editor's content is not the original, so the original schedule is
+      // not re-armed over it; the record is reported instead.
+      /changed during.*schedules were left as they are/,
     );
     const actual = mock.environments.get('destination')!.get(recordId)!;
     assert.equal(actual.current.title, 'concurrent editor');
-    assert.deepEqual(actual.schedules, baseline.schedules);
+    assert.deepEqual(actual.schedules, {
+      publication: null,
+      unpublishing: null,
+    });
     assert(!mock.events.some((event) => event.startsWith('update:')));
   });
 
@@ -2613,17 +2618,192 @@ describe('apply executor with the SDK resource contract', () => {
     assert.equal(mock.environments.size, 1);
   });
 
-  it('restores schedules and temporary field settings after an in-place interruption', async () => {
-    const baseline = state(
-      { title: 'old' },
+  it('restores original schedules after an in-place interruption only on original content', async () => {
+    for (const point of ['before content', 'after content']) {
+      const runDirectory = join(directory, point.replace(' ', '-'));
+      mkdirSync(runDirectory);
+      const baseline = state(
+        { title: 'old' },
+        {
+          schedules: {
+            publication: { at: '2099-01-01T00:00:00.000Z', selective: null },
+            unpublishing: null,
+          },
+        },
+      );
+      const mock = sdk([baseline]);
+      mock.requireField();
+      const changes: TemporarySchemaChange[] = [
+        {
+          fieldId: 'cccccccccccccccccccccc',
+          modelId,
+          original: { validators: { required: {} }, defaultValue: 'automatic' },
+          temporary: { validators: {}, defaultValue: null },
+          reasons: ['temporary test validation'],
+        },
+      ];
+      const bundlePath = await bundle(
+        runDirectory,
+        mock,
+        [plan(baseline, state({ title: 'new' }))],
+        [modelId],
+        changes,
+      );
+      const controller = new AbortController();
+      if (point === 'before content')
+        mock.afterNextScheduleCancellation(() => controller.abort());
+      else mock.afterNextUpdate(() => controller.abort());
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: {
+            ...defaults,
+            inPlace: true,
+            allowTemporarySchemaChanges: true,
+            signal: controller.signal,
+          },
+        }),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          (point === 'before content'
+            ? error.code === 'INTERRUPTED'
+            : error.code === 'APPLY_FAILED_REPAIR_INCOMPLETE' &&
+              /content was changed by this run/.test(error.message)),
+      );
+      assert.deepEqual(mock.fieldStates.get('destination'), {
+        validators: { required: {} },
+        defaultValue: 'automatic',
+      });
+      const record = mock.environments.get('destination')!.get(recordId)!;
+      if (point === 'before content') {
+        assert.equal(record.current.title, 'old');
+        assert.deepEqual(record.schedules, baseline.schedules);
+        assert(mock.events.includes(`schedule-publication:${recordId}`));
+      } else {
+        // The run already wrote new content: re-arming the original schedule
+        // would publish content nobody scheduled.
+        assert.equal(record.current.title, 'new');
+        assert.deepEqual(record.schedules, {
+          publication: null,
+          unpublishing: null,
+        });
+        assert(!mock.events.includes(`schedule-publication:${recordId}`));
+        assert.equal(
+          mock.events.filter((event) => event === 'field-settings').length,
+          2,
+        );
+      }
+    }
+  });
+
+  it('refuses to start when a schedule falls due within the schedule window', async () => {
+    const otherId = 'dddddddddddddddddddddd';
+    const soon = new Date(Date.now() + 30 * 60_000).toISOString();
+    const unchanged = state(
+      { title: 'scheduled' },
       {
+        id: otherId,
         schedules: {
-          publication: { at: '2099-01-01T00:00:00.000Z', selective: null },
+          publication: { at: soon, selective: null },
           unpublishing: null,
         },
       },
     );
-    const mock = sdk([baseline]);
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline, unchanged]);
+    const preserved = {
+      ...plan(unchanged, unchanged),
+      action: 'noop' as const,
+    };
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+      preserved,
+    ]);
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: defaults,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.code === 'SCHEDULE_DUE_DURING_APPLY' &&
+        error.details?.recordId === otherId,
+    );
+    assert.equal(mock.events.length, 0);
+    // With the window disabled the run proceeds, and the unchanged record's
+    // schedule is neither cancelled nor recreated.
+    const result = await applyBundle({
+      rootClient: mock.root,
+      buildEnvironmentClient: mock.client,
+      bundlePath,
+      options: { ...defaults, scheduleWindowMinutes: 0 },
+    });
+    assert.deepEqual(
+      mock.events.filter((event) => event.endsWith(`:${otherId}`)),
+      [],
+    );
+    assert.deepEqual(
+      mock.environments.get(result.environmentId)!.get(otherId)!.schedules,
+      unchanged.schedules,
+    );
+  });
+
+  it('verifies content before restoring schedules only when writing in place', async () => {
+    for (const inPlace of [false, true]) {
+      const runDirectory = join(directory, String(inPlace));
+      mkdirSync(runDirectory);
+      const baseline = state({ title: 'old' });
+      const mock = sdk([baseline]);
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, state({ title: 'new' })),
+      ]);
+      const logs: string[] = [];
+      await applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: { ...defaults, inPlace, log: (message) => logs.push(message) },
+      });
+      // A failed fork is deleted, so it needs only the final verification.
+      assert.equal(
+        logs.includes('Verifying final content before restoring schedules.'),
+        inPlace,
+      );
+      assert(logs.includes('Verifying final content and schedules.'));
+    }
+  });
+
+  it('repairs schedules and field settings left behind by a killed in-place run', async () => {
+    const otherId = 'dddddddddddddddddddddd';
+    const thirdId = 'ffffffffffffffffffffff';
+    const ids = [recordId, otherId, thirdId];
+    const original = (id: string) =>
+      state(
+        { title: 'old' },
+        {
+          id,
+          schedules: {
+            publication: { at: '2099-01-01T00:00:00.000Z', selective: null },
+            unpublishing: null,
+          },
+        },
+      );
+    const reviewed = (id: string) =>
+      state(
+        { title: 'new' },
+        {
+          id,
+          schedules: {
+            publication: { at: '2099-02-01T00:00:00.000Z', selective: null },
+            unpublishing: null,
+          },
+        },
+      );
+    const mock = sdk(ids.map(original));
     mock.requireField();
     const changes: TemporarySchemaChange[] = [
       {
@@ -2637,40 +2817,76 @@ describe('apply executor with the SDK resource contract', () => {
     const bundlePath = await bundle(
       directory,
       mock,
-      [plan(baseline, state({ title: 'new' }))],
+      ids.map((id) => plan(original(id), reviewed(id))),
       [modelId],
       changes,
     );
-    const controller = new AbortController();
-    mock.afterNextUpdate(() => controller.abort());
-    await assert.rejects(
-      applyBundle({
+    // A killed run: rules still relaxed, every schedule cancelled, one record
+    // already written, and one edited by someone else meanwhile.
+    mock.fieldStates.set('destination', { validators: {}, defaultValue: null });
+    const records = mock.environments.get('destination')!;
+    records.get(otherId)!.current = { title: 'new' };
+    records.get(thirdId)!.current = { title: 'someone else' };
+    for (const record of records.values()) {
+      record.schedules = { publication: null, unpublishing: null };
+      record.currentVersion = String(Number(record.currentVersion) + 1);
+      record.hash = recordHash(record);
+    }
+    const repair = () =>
+      repairBundle({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
         bundlePath,
-        options: {
-          ...defaults,
-          inPlace: true,
-          allowTemporarySchemaChanges: true,
-          signal: controller.signal,
-        },
-      }),
-      (error: unknown) =>
-        error instanceof ContentError && error.code === 'INTERRUPTED',
-    );
+        options: { allowPrimary: false },
+      });
+    await assert.rejects(repair(), (error: unknown) => {
+      assert(error instanceof ContentError);
+      assert.equal(error.code, 'REPAIR_INCOMPLETE');
+      assert.equal(error.details?.restoredFields, 1);
+      assert.equal(error.details?.restoredSchedules, 2);
+      assert.equal(error.details?.problemCount, 1);
+      assert.match(
+        error.message,
+        new RegExp(`${thirdId}: content matches neither`),
+      );
+      return true;
+    });
     assert.deepEqual(mock.fieldStates.get('destination'), {
       validators: { required: {} },
       defaultValue: 'automatic',
     });
+    // Original content gets its original schedule back, written content gets
+    // the bundle's, and the edited record is left for a person to decide.
     assert.deepEqual(
-      mock.environments.get('destination')!.get(recordId)!.schedules,
-      baseline.schedules,
+      records.get(recordId)!.schedules,
+      original(recordId).schedules,
     );
-    assert.equal(
-      mock.events.filter((event) => event === 'field-settings').length,
-      2,
+    assert.deepEqual(
+      records.get(otherId)!.schedules,
+      reviewed(otherId).schedules,
     );
-    assert(mock.events.includes(`schedule-publication:${recordId}`));
+    assert.deepEqual(records.get(thirdId)!.schedules, {
+      publication: null,
+      unpublishing: null,
+    });
+    // Running it again changes nothing and reports the same record.
+    const events = mock.events.length;
+    await assert.rejects(
+      repair(),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.restoredSchedules === 0 &&
+        error.details?.restoredFields === 0 &&
+        error.details?.problemCount === 1,
+    );
+    assert.equal(mock.events.length, events);
+    mock.setPrimary();
+    await assert.rejects(
+      repair(),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.code === 'PRIMARY_REQUIRES_APPROVAL',
+    );
   });
 
   it('rejects another root project before a fork or content mutation', async () => {
@@ -3024,7 +3240,7 @@ describe('apply executor with the SDK resource contract', () => {
     assert(!mock.events.some((event) => event.startsWith('fork:')));
   });
 
-  it('repairs schedules after a rejected request has already committed remotely', async () => {
+  it('keeps a committed bundle schedule after a rejected request on changed content', async () => {
     for (const created of [false, true]) {
       const runDirectory = join(directory, String(created));
       mkdirSync(runDirectory);
@@ -3063,16 +3279,18 @@ describe('apply executor with the SDK resource contract', () => {
           bundlePath,
           options: { ...defaults, inPlace: true },
         }),
-        /uncertain schedule outcome/,
+        /uncertain schedule outcome.*left as they are/,
       );
+      // The content is already the bundle's, so the committed schedule from
+      // the bundle stays and the record is reported.
       assert.deepEqual(
         mock.environments.get('destination')!.get(recordId)!.schedules,
-        baseline?.schedules ?? { publication: null, unpublishing: null },
+        desired.schedules,
       );
     }
   });
 
-  it('restores canceled schedules when the replacement request fails before committing', async () => {
+  it('leaves a cancelled schedule on changed content when the replacement request fails', async () => {
     const baseline = state(
       { title: 'old' },
       {
@@ -3102,12 +3320,16 @@ describe('apply executor with the SDK resource contract', () => {
         options: { ...defaults, inPlace: true },
       }),
       (error: unknown) =>
-        error instanceof Error &&
-        error.message === 'injected schedule failure before write',
+        error instanceof ContentError &&
+        error.code === 'APPLY_FAILED_REPAIR_INCOMPLETE' &&
+        error.message.startsWith('injected schedule failure before write') &&
+        /left as they are \(original: publication at 2099-01-01/.test(
+          error.message,
+        ),
     );
     assert.deepEqual(
       mock.environments.get('destination')!.get(recordId)!.schedules,
-      baseline.schedules,
+      { publication: null, unpublishing: null },
     );
   });
 
@@ -3284,7 +3506,7 @@ describe('apply executor with the SDK resource contract', () => {
     }
   });
 
-  it('leaves unsafe scheduled noops untouched in an all-noop bundle and rejects them before mixed writes', async () => {
+  it('never touches scheduled unchanged records, in all-noop or mixed bundles', async () => {
     for (const mixed of [false, true]) {
       const runDirectory = join(directory, String(mixed));
       mkdirSync(runDirectory);
@@ -3327,10 +3549,12 @@ describe('apply executor with the SDK resource contract', () => {
         bundlePath,
         options: { ...defaults, inPlace: true },
       });
-      if (mixed)
-        await assert.rejects(execution, /schedule.*SDK|SDK.*schedule/i);
-      else assert.equal((await execution).mutations, 0);
-      assert.deepEqual(mock.events, []);
+      const result = await execution;
+      if (!mixed) assert.equal(result.mutations, 0);
+      assert.deepEqual(
+        mock.events.filter((event) => event.endsWith(`:${recordId}`)),
+        [],
+      );
       assert.deepEqual(
         mock.environments.get('destination')!.get(recordId)!.current,
         unsafe.current,
@@ -3342,7 +3566,7 @@ describe('apply executor with the SDK resource contract', () => {
     }
   });
 
-  it('refuses an SDK-unsafe noop refresh and repair if validity changes after preflight', async () => {
+  it('leaves a scheduled unchanged record alone when its validity changes during apply', async () => {
     const unsafe = state(
       {
         title: {
@@ -3380,16 +3604,20 @@ describe('apply executor with the SDK resource contract', () => {
         .get('destination')!
         .get(recordId)!.validity.current = false;
     });
-    await assert.rejects(
-      applyBundle({
-        rootClient: mock.root,
-        buildEnvironmentClient: mock.client,
-        bundlePath,
-        options: { ...defaults, inPlace: true },
-      }),
-      /payload metadata __itemTypeId cannot round-trip/,
+    await applyBundle({
+      rootClient: mock.root,
+      buildEnvironmentClient: mock.client,
+      bundlePath,
+      options: { ...defaults, inPlace: true },
+    });
+    assert.deepEqual(
+      mock.events.filter((event) => event.endsWith(`:${recordId}`)),
+      [],
     );
-    assert(!mock.events.includes(`update:${recordId}`));
+    assert.deepEqual(
+      mock.environments.get('destination')!.get(recordId)!.schedules,
+      unsafe.schedules,
+    );
     assert.deepEqual(
       mock.environments.get('destination')!.get(recordId)!.current,
       unsafe.current,
@@ -4343,18 +4571,23 @@ describe('apply executor with the SDK resource contract', () => {
       ),
     );
     const mock = sdk(originals);
-    const changed = originals[0];
-    const bundlePath = await bundle(directory, mock, [
-      plan(changed, state({ title: 'new' }, { id: changed.id })),
-    ]);
-    mock.fail(changed.id);
+    // Only written records have their schedules cancelled. The first write
+    // fails, so every record still has its original content to restore onto.
+    const bundlePath = await bundle(
+      directory,
+      mock,
+      originals.map((original) =>
+        plan(original, state({ title: 'new' }, { id: original.id })),
+      ),
+    );
+    mock.fail(originals.map((original) => original.id).sort()[0]);
     mock.failAllPublicationCreates();
     await assert.rejects(
       applyBundle({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
         bundlePath,
-        options: { ...defaults, inPlace: true },
+        options: { ...defaults, inPlace: true, concurrency: 1 },
       }),
       (error: unknown) => {
         assert(error instanceof ContentError);

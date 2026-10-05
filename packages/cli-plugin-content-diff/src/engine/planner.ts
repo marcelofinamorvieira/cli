@@ -1001,59 +1001,17 @@ class Planning {
     return failures;
   }
 
+  // Only records the bundle writes have their schedules recreated; schedules on
+  // unchanged records are never touched, so they need no recreation proof.
   checkScheduledPublication(plan: RecordPlan, record: RecordState): void {
     const failures = this.scheduledFailures(record);
     if (!failures.length) return;
-    if (plan.action === 'noop') {
-      const fields = sortedUnique(
-        failures.map(
-          (failure) => `${failure.field.apiKey} (${failure.validator})`,
-        ),
-      ).join(', ');
-      throw new ContentError(
-        'UNEXECUTABLE_EXISTING_SCHEDULE',
-        `Managed unchanged record ${plan.id} has an existing enforced publication schedule whose selected values fail ${fields}. The CMA cannot reliably recreate this schedule under the restored validators.`,
-        { id: plan.id, scope: record.schedules.publication?.selective },
-      );
-    }
     this.unsafe(
       'record',
       plan.id,
       'INVALID_SCHEDULED_PUBLICATION',
       `Record ${plan.id} schedules publication of values with proven validator failures in the requested scope; its schedule cannot be recreated under the restored validators.`,
     );
-  }
-
-  checkNoopSchedules(): void {
-    // Run only after partial-skip closure and only when the final plan writes.
-    // A verification-only run leaves these existing schedules intact.
-    for (const plan of this.store.planEntries('record', 'noop')) {
-      if (
-        plan.kind !== 'record' ||
-        !this.selected.has(plan.modelId) ||
-        !plan.guard?.schedules.publication
-      )
-        continue;
-      const record = this.store.getRecord('target', plan.id)!;
-      this.checkScheduledPublication(plan, record);
-      const model = this.models.get(plan.modelId)!;
-      const stampRequired =
-        (model.saveInvalidDrafts ||
-          this.target.semantics.improved_validation_at_publishing === true) &&
-        !(model.saveInvalidDrafts && record.schedules.publication?.selective);
-      if (!stampRequired || record.validity.current) continue;
-      const key = unsupportedRecordPayloadKey(
-        record.current,
-        model.id,
-        this.target,
-      );
-      if (key)
-        throw new ContentError(
-          'UNEXECUTABLE_EXISTING_SCHEDULE',
-          `Managed unchanged record ${plan.id} needs a current-content validity refresh before its publication schedule can be restored, but native field metadata named ${key} cannot be rewritten safely by the CMA client.`,
-          { id: plan.id, reason: 'UNSUPPORTED_PAYLOAD_KEY', key },
-        );
-    }
   }
 
   localeStructure(plan: RecordPlan): void {
@@ -2513,13 +2471,6 @@ class Planning {
       .iterate())
       counts[row.kind as Kind][row.action as Action] = Number(row.count);
     const temporarySchemaChanges = this.temporaryChanges();
-    if (
-      temporarySchemaChanges.length ||
-      Object.values(counts).some(
-        (kind) => kind.create || kind.update || kind.delete,
-      )
-    )
-      this.checkNoopSchedules();
     // The bundle carries the destination schema: it includes retained models,
     // while all managed/source block schemas have been proven identical.
     return {

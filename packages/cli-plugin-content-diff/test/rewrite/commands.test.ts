@@ -208,6 +208,58 @@ describe('content command integration', () => {
     }
   });
 
+  it('routes --repair to the repair executor with its authorization', async () => {
+    const result = {
+      environmentId: 'destination',
+      restoredSchedules: 2,
+      restoredFields: 1,
+    };
+    replace(apply, 'applyBundle', async () => assert.fail('apply ran'));
+    replace(
+      apply,
+      'repairBundle',
+      async (args: Parameters<typeof apply.repairBundle>[0]) => {
+        assert.equal(args.bundlePath, './bundle');
+        const { signal, ...options } = args.options;
+        assert.ok(signal instanceof AbortSignal);
+        assert.deepEqual(
+          { ...options, log: undefined },
+          {
+            allowPrimary: true,
+            destinationEnvironmentId: 'main',
+            log: undefined,
+          },
+        );
+        return result;
+      },
+    );
+    const command = Object.assign(
+      Object.create(ContentApplyCommand.prototype),
+      {
+        parse: async () => ({
+          args: { BUNDLE: './bundle' },
+          flags: {
+            destination: 'main',
+            'in-place': false,
+            'allow-primary': true,
+            repair: true,
+            'schedule-window': 120,
+            'keep-failed-fork': false,
+            'allow-temporary-schema-changes': false,
+            concurrency: 4,
+          },
+        }),
+        endpoint: async () => ({
+          rootClient: {},
+          buildEnvironmentClient: () => ({}),
+        }),
+        progress: () => undefined,
+        jsonEnabled: () => true,
+      },
+    );
+    assert.deepEqual(await command.run(), result);
+  });
+
   it('passes explicit application authorization to the executor and returns its result', async () => {
     const result = { environmentId: 'isolated', mutations: 3 };
     replace(
@@ -227,6 +279,7 @@ describe('content command integration', () => {
             allowTemporarySchemaChanges: true,
             destinationEnvironmentId: 'target',
             concurrency: 2,
+            scheduleWindowMinutes: 45,
             log: undefined,
           },
         );
@@ -242,6 +295,8 @@ describe('content command integration', () => {
             destination: 'target',
             'in-place': false,
             'allow-primary': false,
+            repair: false,
+            'schedule-window': 45,
             'keep-failed-fork': true,
             'allow-temporary-schema-changes': true,
             concurrency: 2,
@@ -344,6 +399,8 @@ describe('content command integration', () => {
             flags: {
               'in-place': false,
               'allow-primary': false,
+              repair: false,
+              'schedule-window': 120,
               'keep-failed-fork': true,
               'allow-temporary-schema-changes': false,
               concurrency: 4,
@@ -582,8 +639,20 @@ describe('content command integration', () => {
           status: 2,
         },
         {
+          args: ['content:apply', './bundle', '--schedule-window=-5'],
+          message: /--schedule-window must be a whole number of minutes/,
+          code: 'INVALID_SCHEDULE_WINDOW',
+          status: 1,
+        },
+        {
+          args: ['content:apply', './bundle', '--repair', '--in-place'],
+          message:
+            /--in-place=true cannot also be provided when using --repair/,
+          status: 2,
+        },
+        {
           args: ['content:apply', './bundle', '--allow-primary'],
-          message: /--allow-primary requires --in-place\./,
+          message: /--allow-primary requires --in-place or --repair\./,
           code: 'INVALID_PRIMARY_AUTHORIZATION',
           status: 1,
         },

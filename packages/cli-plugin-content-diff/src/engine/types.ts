@@ -235,7 +235,20 @@ export interface ApplyOptions {
   allowTemporarySchemaChanges: boolean;
   destinationEnvironmentId?: string;
   concurrency?: number;
+  /** Refuse to start when a schedule falls due within this many minutes. */
+  scheduleWindowMinutes?: number;
   log?: (message: string) => void;
+}
+export interface RepairOptions {
+  signal?: AbortSignal;
+  allowPrimary: boolean;
+  destinationEnvironmentId?: string;
+  log?: (message: string) => void;
+}
+export interface RepairResult {
+  environmentId: string;
+  restoredSchedules: number;
+  restoredFields: number;
 }
 export interface ApplyResult {
   environmentId: string;

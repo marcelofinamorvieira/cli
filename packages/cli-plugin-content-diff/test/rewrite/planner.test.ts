@@ -1012,7 +1012,7 @@ describe('indexed rewrite planner', () => {
     );
   });
 
-  it('preserves invalid unchanged schedules without writes and diagnoses their recreation in mixed plans', async () => {
+  it('leaves invalid unchanged schedules alone, with or without other writes', async () => {
     const state = schema([
       model({
         saveInvalidDrafts: true,
@@ -1037,17 +1037,17 @@ describe('indexed rewrite planner', () => {
       options({ allowPartial: true, allowTemporarySchemaChanges: true }),
       (_store, metadata) => assert.equal(metadata.counts.record.noop, 1),
     );
-    await assert.rejects(
-      fixture(
-        [scheduled, record(B, { title: 'new content' })],
-        [scheduled],
-        state,
-        options({ allowPartial: true, allowTemporarySchemaChanges: true }),
-      ),
-      (error: unknown) =>
-        error instanceof ContentError &&
-        error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE' &&
-        error.message.includes('title (required)'),
+    // Apply never recreates schedules on unchanged records, so their
+    // validity cannot block an otherwise writable plan.
+    await fixture(
+      [scheduled, record(B, { title: 'new content' })],
+      [scheduled],
+      state,
+      options({ allowPartial: true, allowTemporarySchemaChanges: true }),
+      (_store, metadata) => {
+        assert.equal(metadata.counts.record.noop, 1);
+        assert.equal(metadata.counts.record.create, 1);
+      },
     );
     const legacy = schema([
       model({ fields: [field({ validators: { required: {} } })] }),
@@ -1061,7 +1061,7 @@ describe('indexed rewrite planner', () => {
     );
   });
 
-  it('diagnoses duplicate unique schedules before writes and preserves existing schedules without writes', async () => {
+  it('diagnoses duplicate unique schedules it writes and leaves existing ones alone', async () => {
     const state = schema([
       model({
         saveInvalidDrafts: true,
@@ -1104,17 +1104,15 @@ describe('indexed rewrite planner', () => {
           assert.equal(store.getPlan('record', B)?.action, 'create');
         },
       );
-      await assert.rejects(
-        fixture(
-          [scheduled, duplicate, record(C, { title: 'new content' })],
-          [scheduled, duplicate],
-          state,
-          options({ allowPartial: true }),
-        ),
-        (error: unknown) =>
-          error instanceof ContentError &&
-          error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE' &&
-          /unique/.test(error.message),
+      await fixture(
+        [scheduled, duplicate, record(C, { title: 'new content' })],
+        [scheduled, duplicate],
+        state,
+        options({ allowPartial: true }),
+        (store) => {
+          assert.equal(store.getPlan('record', A)?.action, 'noop');
+          assert.equal(store.getPlan('record', C)?.action, 'create');
+        },
       );
       await fixture(
         [scheduled, duplicate],
@@ -1163,7 +1161,7 @@ describe('indexed rewrite planner', () => {
     );
   });
 
-  it('diagnoses unsafe scheduled noop refreshes when any final plan kind writes', async () => {
+  it('plans writes around scheduled unchanged records that the SDK cannot rewrite', async () => {
     const state = schema([
       model({
         saveInvalidDrafts: true,
@@ -1219,22 +1217,16 @@ describe('indexed rewrite planner', () => {
             state,
             options({ allowPartial: true, uploads: 'all' }),
           );
-        if (write === 'none') await run();
-        else
-          await assert.rejects(
-            run(),
-            (error: unknown) =>
-              error instanceof ContentError &&
-              error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE' &&
-              error.details?.reason === 'UNSUPPORTED_PAYLOAD_KEY',
-          );
+        // The unchanged record is never rewritten, so it does not block writes.
+        const metadata = await run();
+        assert.equal(metadata.counts.record.noop, 1);
       } finally {
         store.dispose();
       }
     }
   });
 
-  it('uses destination validity and native schedule semantics for noop refresh safety', async () => {
+  it('never needs a refresh for schedules on unchanged records', async () => {
     const cases = [
       {
         sourceValid: false,
@@ -1243,7 +1235,6 @@ describe('indexed rewrite planner', () => {
         improved: false,
         selective: false,
         unpublishing: false,
-        rejects: false,
       },
       {
         sourceValid: true,
@@ -1252,7 +1243,6 @@ describe('indexed rewrite planner', () => {
         improved: false,
         selective: false,
         unpublishing: false,
-        rejects: true,
       },
       {
         sourceValid: false,
@@ -1261,7 +1251,6 @@ describe('indexed rewrite planner', () => {
         improved: false,
         selective: true,
         unpublishing: false,
-        rejects: false,
       },
       {
         sourceValid: false,
@@ -1270,7 +1259,6 @@ describe('indexed rewrite planner', () => {
         improved: false,
         selective: false,
         unpublishing: false,
-        rejects: false,
       },
       {
         sourceValid: false,
@@ -1279,7 +1267,6 @@ describe('indexed rewrite planner', () => {
         improved: true,
         selective: false,
         unpublishing: false,
-        rejects: true,
       },
       {
         sourceValid: false,
@@ -1288,7 +1275,6 @@ describe('indexed rewrite planner', () => {
         improved: false,
         selective: false,
         unpublishing: true,
-        rejects: false,
       },
     ];
     for (const entry of cases) {
@@ -1339,15 +1325,9 @@ describe('indexed rewrite planner', () => {
           validity: { current: entry.targetValid, published: null },
         });
         store.putRecord('source', record(B, { asset: null }));
-        const run = createPlan(store, state, state, options());
-        if (entry.rejects)
-          await assert.rejects(
-            run,
-            (error: unknown) =>
-              error instanceof ContentError &&
-              error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE',
-          );
-        else await run;
+        const metadata = await createPlan(store, state, state, options());
+        assert.equal(store.getPlan('record', A)?.action, 'noop');
+        assert.equal(metadata.counts.record.create, 1);
       } finally {
         store.dispose();
       }
@@ -1385,16 +1365,12 @@ describe('indexed rewrite planner', () => {
         assert.equal(store.getPlan('record', C)?.action, 'create');
       },
     );
-    await assert.rejects(
-      fixture(
-        source,
-        [source[0], target[1]],
-        state,
-        options({ allowPartial: true }),
-      ),
-      (error: unknown) =>
-        error instanceof ContentError &&
-        error.code === 'UNEXECUTABLE_EXISTING_SCHEDULE',
+    await fixture(
+      source,
+      [source[0], target[1]],
+      state,
+      options({ allowPartial: true }),
+      (store) => assert.equal(store.getPlan('record', A)?.action, 'noop'),
     );
     await fixture(
       source.slice(0, 2),
