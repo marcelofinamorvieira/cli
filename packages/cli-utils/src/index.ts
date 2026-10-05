@@ -12,5 +12,6 @@ export * from './credentials';
 export * from './dato-config-command';
 export * from './dato-profile-config-command';
 export * from './fuzzyScore';
+export type { MigrationExecutionContext } from './migration-execution-context';
 export * from './oauth';
 export * from './schema-info';

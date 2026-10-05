@@ -10,7 +10,7 @@ This is the DatoCMS CLI - a monorepo containing CLI tools for managing DatoCMS p
 - `@datocms/cli` (`packages/cli-legacy/`): Legacy scoped alias that just depends on `datocms`
 - `@datocms/cli-plugin-wordpress`: WordPress import functionality
 - `@datocms/cli-plugin-contentful`: Contentful import functionality
-- `@datocms/cli-plugin-content-diff`: Content bundles between environments or projects (`content:diff`, `content:apply`)
+- `@datocms/cli-plugin-content-diff`: Editable TypeScript content migrations between environments or projects (`content:diff`, `content:apply`, and managed `migrations:run`)
 - `@datocms/cli-utils`: Shared utilities and base commands
 
 ## Architecture
@@ -24,6 +24,7 @@ The packages live under `packages/` and are **npm workspaces**. **Turborepo** ru
 - Commands organized by topic: `environments`, `migrations`, `maintenance`, `profile`
 - Uses `environments-diff` utility for schema synchronization between environments
 - Migration system with timestamped files in `migrations/` directory
+- Managed migration context supplies fork ownership, cancellation, and tracking-model identity to content migrations
 
 **Plugin Architecture**:
 - WordPress and Contentful plugins extend base functionality
@@ -98,7 +99,10 @@ npm run prepack  # Build + generate oclif manifest
 
 ## Migration System
 
-The CLI includes a migration system (`packages/cli/migrations/`) for schema changes:
+The CLI includes a migration system (`packages/cli/src/commands/migrations/`) for timestamped scripts:
 - Timestamped migration files (format: `TIMESTAMP_description.ts`)
-- Use `datocms migrations:new` to create new migrations
-- Use `datocms migrations:run` to execute pending migrations
+- Use `datocms migrations:new` to create migrations; `--autogenerate` captures schema changes only
+- Use `datocms content:diff NAME` to generate editable content migrations containing actual CMA calls
+- Use `datocms migrations:run` to execute pending migrations, or `content:apply SCRIPT.ts` for the content-specific runner
+- Content migrations keep immutable baseline evidence and binaries in a sibling `.content` directory. TypeScript is authoritative; execution records its calls locally and rebuilds the guarded plan before remote content writes
+- Generated imports require the content plugin as a resolvable project dependency and a compatible native runner. Preserve the tracking-model projection, one-shot execution, and owned-fork cleanup contracts documented in the plugin README and `docs/rewrite-design.md`

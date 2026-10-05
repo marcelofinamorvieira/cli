@@ -17,6 +17,7 @@ import { stageBinary } from '../../src/engine/apply-binary';
 import { validateExecution } from '../../src/engine/apply-validation';
 import { batches, boundedWork } from '../../src/engine/apply-work';
 import { writeBundle } from '../../src/engine/bundle';
+import { captureSnapshot } from '../../src/engine/capture';
 import {
   canonicalCollection,
   canonicalFields,
@@ -27,6 +28,7 @@ import {
 } from '../../src/engine/codec';
 import * as environmentLock from '../../src/engine/environment-lock';
 import { ContentError } from '../../src/engine/errors';
+import { createPlan } from '../../src/engine/planner';
 import { fetchSchema } from '../../src/engine/schema';
 import { SnapshotStore } from '../../src/engine/store';
 import type {
@@ -1107,11 +1109,10 @@ function withCollections(
           (state) => state.parentId === parentId,
         );
         const position =
-          body.position ??
           (siblings.length
             ? Math.max(...siblings.map((state) => state.position))
             : 0) + 1;
-        // Native create accepts an explicit index without shifting peers.
+        // Native create ignores supplied position and appends without shifts.
         records.set(
           body.id,
           collectionState(body.id, position, parentId, body.label),
@@ -1638,7 +1639,7 @@ describe('apply executor with the SDK resource contract', () => {
     assert.deepEqual(mock.events, [`collection-update:${originals[0].id}`]);
   });
 
-  it('preserves untouched duplicate collection indexes while creating and deleting explicit positions', async () => {
+  it('rejects recreating an unachievable duplicate collection index before writes', async () => {
     const originals = [
       collectionState('a'.repeat(22), 1),
       collectionState('b'.repeat(22), 1),
@@ -1654,18 +1655,20 @@ describe('apply executor with the SDK resource contract', () => {
       collectionPlan(originals[2], relabeled),
       collectionPlan(null, created),
     ]);
-    const result = await applyBundle({
-      rootClient: mock.root,
-      buildEnvironmentClient: mock.client,
-      bundlePath,
-      options: defaults,
-    });
-    const actual = collections.states.get(result.environmentId)!;
-    assert(!actual.has(originals[0].id));
-    assert.equal(actual.get(originals[1].id)!.position, 1);
-    assert.equal(actual.get(created.id)!.position, 1);
-    assert.equal(actual.get(relabeled.id)!.position, 9);
-    assert.equal(actual.get(relabeled.id)!.label, 'Renamed');
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: { ...defaults, inPlace: true },
+      }),
+      /cannot retain its exact intended position/i,
+    );
+    assert.deepEqual(mock.events, []);
+    const actual = collections.states.get('destination')!;
+    for (const original of originals)
+      assert.deepEqual(actual.get(original.id), original);
+    assert(!actual.has(created.id));
     assert.deepEqual(collections.filteredReads, []);
   });
 
@@ -4996,5 +4999,287 @@ describe('apply executor with the SDK resource contract', () => {
       /final state differs/,
     );
     assert.equal(mock.environments.size, 1);
+  });
+});
+
+/** Actual prepared apply flow, with the target capture supplied by recording. */
+describe('prepared TypeScript snapshot reuse', () => {
+  async function fixture(
+    initial: RecordState[] = [state({ title: 'old', body: [] })],
+  ) {
+    const directory = mkdtempSync(join(tmpdir(), 'prepared-migration-'));
+    const mock = sdk(initial);
+    const folders = withCollections(mock, [
+      collectionState('ffffffffffffffffffffff', 1),
+    ]);
+    const nativeClient = mock.client;
+    const requests = { nestedModelScans: 0, versionScans: 0 };
+    let assetHook: (() => void) | undefined;
+    mock.client = (environmentId) => {
+      const client = nativeClient(environmentId);
+      const fields = client.fields.list.bind(client.fields);
+      client.fields.list = (async (
+        ...args: Parameters<Client['fields']['list']>
+      ) => [
+        ...(await fields(...args)),
+        {
+          id: 'nnnnnnnnnnnnnnnnnnnnnn',
+          api_key: 'body',
+          field_type: 'rich_text',
+          localized: false,
+          validators: { rich_text_blocks: { item_types: [] } },
+          default_value: null,
+        },
+      ]) as Client['fields']['list'];
+      const request = client.request.bind(client);
+      client.request = (async (input) => {
+        const query = input.queryParams as {
+          nested?: boolean;
+          filter?: { ids?: string };
+        };
+        if (input.url === '/items' && !query.filter?.ids) {
+          if (query.nested) requests.nestedModelScans++;
+          else requests.versionScans++;
+        }
+        return request(input);
+      }) as Client['request'];
+      const uploads = client.uploads.rawList.bind(client.uploads);
+      client.uploads.rawList = (async (
+        ...args: Parameters<Client['uploads']['rawList']>
+      ) => {
+        const hook = assetHook;
+        assetHook = undefined;
+        hook?.();
+        return uploads(...args);
+      }) as Client['uploads']['rawList'];
+      return client;
+    };
+    const client = mock.client('destination');
+    const schema = await fetchSchema(client, 'destination');
+    const store = new SnapshotStore(directory);
+    await captureSnapshot({
+      client,
+      environmentId: 'destination',
+      schema,
+      store,
+      side: 'target',
+      options: { modelIds: [modelId], uploads: 'all', concurrency: 2 },
+      verify: 'versions',
+    });
+    for (const record of store.iterateRecords('target')) {
+      const desired = clone(record);
+      if (record.id === recordId) desired.current.title = 'new';
+      desired.hash = recordHash(desired);
+      store.putRecord('source', desired);
+    }
+    for (const folder of store.iterateCollections('target'))
+      store.putCollection('source', folder);
+    const metadata = await createPlan(
+      store,
+      { ...schema, environmentId: 'source' },
+      schema,
+      {
+        modelIds: [modelId],
+        uploads: 'all',
+        includeDeletions: true,
+        allowPartial: false,
+        allowTemporarySchemaChanges: false,
+      },
+    );
+    requests.nestedModelScans = 0;
+    requests.versionScans = 0;
+    const snapshot = {
+      store,
+      environmentId: 'destination',
+      schemaHash: schema.hash,
+    };
+    const prepared = {
+      metadata,
+      entries: () => store.planEntries(),
+      snapshot,
+      release: () => store.dispose(),
+    };
+    return {
+      mock,
+      folders,
+      requests,
+      store,
+      snapshot,
+      assetHook(hook: () => void) {
+        assetHook = hook;
+      },
+      apply(options: Partial<ApplyOptions> = {}) {
+        return applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath: directory,
+          prepared,
+          options: { ...defaults, ...options },
+        });
+      },
+      dispose() {
+        store.dispose();
+        rmSync(directory, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it('applies a prepared plan without a second expanded model capture', async () => {
+    const test = await fixture();
+    try {
+      const result = await test.apply();
+      assert.equal(
+        test.mock.environments.get(result.environmentId)!.get(recordId)!.current
+          .title,
+        'new',
+      );
+      assert.equal(
+        test.mock.environments.get('destination')!.get(recordId)!.current.title,
+        'old',
+      );
+      assert.equal(test.requests.nestedModelScans, 0);
+      assert(test.requests.versionScans > 0);
+      assert(!existsSync(test.store.directory));
+    } finally {
+      test.dispose();
+    }
+  });
+
+  it('retains complete nested rereads when full verification is requested', async () => {
+    const test = await fixture();
+    try {
+      await test.apply({ verification: 'full' });
+      assert(test.requests.nestedModelScans >= 4);
+      assert(!existsSync(test.store.directory));
+    } finally {
+      test.dispose();
+    }
+  });
+
+  for (const change of ['version', 'timestamp', 'missing', 'extra'] as const) {
+    it(`refuses ${change} drift before applying a reused snapshot`, async () => {
+      const test = await fixture();
+      try {
+        const records = test.mock.environments.get('destination')!;
+        const record = records.get(recordId)!;
+        if (change === 'version') record.currentVersion = '2';
+        else if (change === 'timestamp')
+          record.createdAt = '2020-01-02T00:00:00.000Z';
+        else if (change === 'missing') records.delete(recordId);
+        else
+          records.set(
+            'eeeeeeeeeeeeeeeeeeeeee',
+            state(
+              { title: 'unexpected', body: [] },
+              { id: 'eeeeeeeeeeeeeeeeeeeeee' },
+            ),
+          );
+        await assert.rejects(
+          test.apply(),
+          (error: unknown) =>
+            error instanceof ContentError && error.code === 'APPLY_CONFLICT',
+        );
+        assertNothingWritten(test.mock.events);
+        assert(!existsSync(test.store.directory));
+      } finally {
+        test.dispose();
+      }
+    });
+  }
+
+  it('refuses a schedule scope change even when version and timestamp are unchanged', async () => {
+    const baseline = state(
+      { title: 'old', body: [] },
+      {
+        schedules: {
+          publication: {
+            at: '2099-01-01T00:00:00.000Z',
+            selective: { locales: ['en'], nonLocalized: false },
+          },
+          unpublishing: null,
+        },
+      },
+    );
+    const test = await fixture([baseline]);
+    try {
+      test.mock.environments.get('destination')!.get(recordId)!.schedules
+        .publication!.selective!.nonLocalized = true;
+      await assert.rejects(
+        test.apply(),
+        /scheduled content changed after recording/,
+      );
+      assertNothingWritten(test.mock.events);
+      assert(test.mock.focusedReads.some((ids) => ids.includes(recordId)));
+    } finally {
+      test.dispose();
+    }
+  });
+
+  it('refuses folder drift after recording without writing content', async () => {
+    const test = await fixture();
+    try {
+      const folder = test.folders.states
+        .get('destination')!
+        .get('ffffffffffffffffffffff')!;
+      folder.label = 'Concurrent folder edit';
+      folder.hash = canonicalCollection({
+        id: folder.id,
+        label: folder.label,
+        parent: null,
+        position: folder.position,
+      }).hash;
+      await assert.rejects(test.apply(), /assets changed after recording/);
+      assertNothingWritten(test.mock.events);
+    } finally {
+      test.dispose();
+    }
+  });
+
+  it('refuses a schema change during the lightweight baseline recheck', async () => {
+    const test = await fixture();
+    try {
+      test.assetHook(() => {
+        test.mock.fieldStates.get('destination')!.validators = { required: {} };
+      });
+      await assert.rejects(test.apply(), /schema changed after recording/);
+      assertNothingWritten(test.mock.events);
+    } finally {
+      test.dispose();
+    }
+  });
+
+  it('binds a reused snapshot to its exact environment and schema', async () => {
+    for (const change of ['environmentId', 'schemaHash'] as const) {
+      const test = await fixture();
+      try {
+        test.snapshot[change] = 'another-binding';
+        await assert.rejects(
+          test.apply(),
+          /Prepared snapshot belongs to another environment or schema/,
+        );
+        assert.deepEqual(test.mock.events, []);
+        assert(!existsSync(test.store.directory));
+      } finally {
+        test.dispose();
+      }
+    }
+  });
+
+  it('cleans the owned fork and source snapshot when the recheck is interrupted', async () => {
+    const test = await fixture();
+    const controller = new AbortController();
+    try {
+      test.assetHook(() => controller.abort());
+      await assert.rejects(
+        test.apply({ signal: controller.signal }),
+        (error: unknown) =>
+          error instanceof ContentError && error.code === 'INTERRUPTED',
+      );
+      assertNothingWritten(test.mock.events);
+      assert(!existsSync(test.store.directory));
+      assert.equal(test.mock.environments.size, 1);
+    } finally {
+      test.dispose();
+    }
   });
 });

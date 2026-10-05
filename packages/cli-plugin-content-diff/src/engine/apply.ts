@@ -45,13 +45,13 @@ import { SnapshotStore } from './store';
 import type {
   ApplyOptions,
   ApplyResult,
-  BundleManifest,
   Client,
   CollectionPlan,
   CollectionState,
   JsonObject,
   Kind,
   PlanEntry,
+  PlanMetadata,
   RecordGuard,
   RecordPlan,
   RecordState,
@@ -159,8 +159,9 @@ function assertScheduleWindow(context: Context, minutes: number): void {
 interface Context {
   client: Client;
   store: SnapshotStore;
-  manifest: BundleManifest;
+  manifest: PlanMetadata;
   schema: SchemaState;
+  schemaProjection?: (schema: SchemaState) => SchemaState;
   bundlePath: string;
   concurrency: number;
   mutations: number;
@@ -168,6 +169,8 @@ interface Context {
   /** The written environment is locked against other edits. */
   locked: boolean;
   verification: 'versions' | 'full';
+  /** Repair can restore settings/schedules, but must never save record content. */
+  repairOnly?: boolean;
   signal?: AbortSignal;
   log?: ApplyOptions['log'];
 }
@@ -606,6 +609,11 @@ async function updateRecord(
   body: JsonObject,
   guarded?: RecordState,
 ): Promise<RecordState> {
+  if (context.repairOnly)
+    throw new ContentError(
+      'REPAIR_CONTENT_WRITE_REQUIRED',
+      `Record ${entry.id} needs a new content version before its schedule can be restored; repair cannot write record content.`,
+    );
   const expected = context.store.getRecord('live', entry.id);
   if (
     expected &&
@@ -1138,7 +1146,7 @@ async function collectionOrderingBefore(
   await verifyCollectionSiblings(context, false);
 }
 
-async function writeCollection(
+export async function writeCollection(
   context: Context,
   desired: CollectionState,
 ): Promise<void> {
@@ -1146,11 +1154,6 @@ async function writeCollection(
   if (before?.hash === desired.hash) return;
   if (desired.parentId && !(await guardCollection(context, desired.parentId)))
     conflict('collection', desired.id, 'parent collection is missing');
-  // Creating at an explicit position does not renumber siblings. Updating at
-  // the same position can shift duplicate peers, so every actual update uses
-  // the native range prediction, including label-only writes.
-  if (before) await collectionOrderingBefore(context, before, desired);
-  await guardCollection(context, desired.id);
   const body = {
     label: desired.label,
     position: desired.position,
@@ -1158,10 +1161,63 @@ async function writeCollection(
       ? { id: desired.parentId, type: 'upload_collection' as const }
       : null,
   };
+  if (!before) {
+    // Native collection creation ignores a supplied position and appends.
+    // Prove that allowed intermediate before asking the guarded update path
+    // to move it to the intended index, including negative or sparse indexes.
+    const last = context.store.database
+      .prepare(
+        "SELECT state_json FROM collections WHERE side='live' AND parent_id IS ? ORDER BY position DESC,id LIMIT 1",
+      )
+      .get(desired.parentId);
+    const sibling = last
+      ? (JSON.parse(String(last.state_json)) as CollectionState)
+      : undefined;
+    const appended = {
+      ...desired,
+      position: (sibling?.position ?? 0) + 1,
+    };
+    if (!Number.isSafeInteger(appended.position))
+      throw new ContentError(
+        'UNEXECUTABLE_COLLECTION_ORDERING',
+        `Collection ${desired.id} cannot be appended within the supported integer position range.`,
+      );
+    appended.hash = collectionHash(appended);
+    // A sandbox cannot be frozen. Check the observed append boundary and the
+    // new identity immediately before creating; verify the response and then
+    // a fresh read before that intermediate can become a trusted baseline.
+    if (sibling) await guardCollection(context, sibling.id);
+    await guardCollection(context, desired.id);
+    assertNotAborted(context.signal);
+    const created = canonicalCollection(
+      await context.client.uploadCollections.create({
+        id: desired.id,
+        label: body.label,
+        parent: body.parent,
+      }),
+    );
+    context.mutations++;
+    if (created.hash !== appended.hash)
+      conflict(
+        'collection',
+        desired.id,
+        'created collection differs from its expected append state',
+      );
+    const verified = canonicalCollection(
+      await context.client.uploadCollections.find(desired.id),
+    );
+    if (verified.hash !== created.hash)
+      conflict('collection', desired.id, 'collection changed after creation');
+    context.store.putCollection('live', verified);
+    await writeCollection(context, desired);
+    return;
+  }
+  // Updating at the same position can shift duplicate peers, so every actual
+  // update uses the native range prediction, including label-only writes.
+  await collectionOrderingBefore(context, before, desired);
+  await guardCollection(context, desired.id);
   assertNotAborted(context.signal);
-  if (before) await context.client.uploadCollections.update(desired.id, body);
-  else
-    await context.client.uploadCollections.create({ id: desired.id, ...body });
+  await context.client.uploadCollections.update(desired.id, body);
   context.mutations++;
   const verified = canonicalCollection(
     await context.client.uploadCollections.find(desired.id),
@@ -1169,7 +1225,7 @@ async function writeCollection(
   if (verified.hash !== desired.hash)
     conflict('collection', desired.id, 'collection did not converge');
   context.store.putCollection('live', verified);
-  if (before) await verifyCollectionSiblings(context, true);
+  await verifyCollectionSiblings(context, true);
 }
 
 async function collection(
@@ -1634,6 +1690,7 @@ async function captureLive(
     store: context.store,
     side: 'live',
     options: {
+      schemaProjection: context.schemaProjection,
       modelIds: context.schema.models
         .filter((model) => !model.block)
         .map((model) => model.id),
@@ -1787,6 +1844,7 @@ function rewritesAssetUrls(context: Context): boolean {
 
 function captureOptions(context: Context) {
   return {
+    schemaProjection: context.schemaProjection,
     modelIds: context.schema.models
       .filter((model) => !model.block)
       .map((model) => model.id),
@@ -1863,6 +1921,111 @@ async function verifyAssets(context: Context, reason: string): Promise<void> {
       conflict('collection', 'assets', reason);
   } finally {
     assets.dispose();
+  }
+}
+
+/** Recheck a prepared destination capture without rereading every nested field. */
+async function verifyPreparedBaseline(
+  context: Context,
+  environmentId: string,
+): Promise<void> {
+  const scan = 'prepared-baseline';
+  const assertSchema = async () => {
+    const schema = await fetchSchema(
+      context.client,
+      environmentId,
+      context.schemaProjection,
+    );
+    if (
+      schema.siteId !== context.schema.siteId ||
+      schema.hash !== context.schema.hash
+    )
+      throw new ContentError(
+        'SCHEMA_CONFLICT',
+        'Destination schema changed after recording the migration.',
+      );
+  };
+  try {
+    // DatoCMS cannot persistently freeze a sandbox. A reused capture must be
+    // revalidated after recording/planning and acquiring any available lock;
+    // version matches are evidence of unchanged content, not an atomic snapshot.
+    await assertSchema();
+    await scanFingerprints({
+      client: context.client,
+      schema: context.schema,
+      store: context.store,
+      scan,
+      options: captureOptions(context),
+    });
+    let matched = 0;
+    for (const { id, fingerprint } of scannedFingerprints(
+      context.store,
+      scan,
+    )) {
+      assertNotAborted(context.signal);
+      const expected = context.store.getRecord('live', id);
+      if (!expected)
+        conflict('record', id, 'destination gained a record after recording');
+      if (stateFingerprint(expected) !== fingerprint)
+        conflict(
+          'record',
+          id,
+          'destination version or metadata changed after recording',
+        );
+      matched++;
+    }
+    const count = Number(
+      context.store.database
+        .prepare("SELECT COUNT(*) AS total FROM records WHERE side='live'")
+        .get()!.total,
+    );
+    if (matched !== count) {
+      const missing = context.store.database
+        .prepare(`SELECT id FROM records r WHERE side='live' AND NOT EXISTS
+        (SELECT 1 FROM scan_rows s WHERE s.scan=? AND s.slice='current' AND s.id=r.id) LIMIT 1`)
+        .get(scan);
+      conflict(
+        'record',
+        String(missing?.id ?? 'namespace'),
+        'destination lost a record after recording',
+      );
+    }
+    // Plain version listings expose schedule times but omit locale/field scope.
+    // Read every originally scheduled record again, even if its time is equal.
+    const scheduled = context.store.database.prepare(`SELECT id FROM records WHERE side='live' AND
+      (json_extract(state_json,'$.schedules.publication') IS NOT NULL OR
+       json_extract(state_json,'$.schedules.unpublishing') IS NOT NULL) ORDER BY id`);
+    const ids = (function* () {
+      for (const row of scheduled.iterate()) yield String(row.id);
+    })();
+    await boundedWork(
+      batches(ids),
+      context.concurrency,
+      async (batch) => {
+        const records = await readRecordBatch(
+          context.client,
+          batch,
+          context.schema,
+        );
+        for (const id of batch) {
+          assertNotAborted(context.signal);
+          const current = records.find((record) => record.id === id);
+          const expected = context.store.getRecord('live', id)!;
+          if (
+            !current ||
+            !guardsEqual(recordGuard(current), recordGuard(expected))
+          )
+            conflict('record', id, 'scheduled content changed after recording');
+        }
+      },
+      undefined,
+      context.signal,
+    );
+    await verifyAssets(context, 'destination assets changed after recording');
+    await assertSchema();
+    assertNotAborted(context.signal);
+  } finally {
+    clearScan(context.store, scan);
   }
 }
 
@@ -2054,6 +2217,17 @@ export async function applyBundle(args: {
   buildEnvironmentClient: (environmentId: string) => Client;
   bundlePath: string;
   options: ApplyOptions;
+  /** A freshly replanned TypeScript migration; no persisted execution progress. */
+  prepared?: {
+    metadata: PlanMetadata;
+    entries: () => Iterable<PlanEntry>;
+    snapshot?: {
+      store: SnapshotStore;
+      environmentId: string;
+      schemaHash: string;
+    };
+    release?: () => void;
+  };
 }): Promise<ApplyResult> {
   const store = new SnapshotStore();
   let ownedFork: string | undefined;
@@ -2064,6 +2238,7 @@ export async function applyBundle(args: {
   let forkLocked = false;
   let startedWrites = false;
   let complete = false;
+  let reusedSnapshot = false;
   const repairs: string[] = [];
   let repairFailureCount = 0;
   const recordRepairFailure = (message: string): void => {
@@ -2082,19 +2257,68 @@ export async function applyBundle(args: {
         'Apply concurrency must be a positive integer.',
       );
     }
-    args.options.log?.('Validating content bundle and asset checksums.');
-    const manifest = await readBundle({
-      directory: args.bundlePath,
-      store,
-      signal: args.options.signal,
-    });
-    assertNotAborted(args.options.signal);
+    args.options.log?.(
+      args.prepared
+        ? 'Validating the rebuilt migration plan.'
+        : 'Validating content bundle and asset checksums.',
+    );
+    const manifest: PlanMetadata = args.prepared
+      ? args.prepared.metadata
+      : await readBundle({
+          directory: args.bundlePath,
+          store,
+          signal: args.options.signal,
+        });
     const destinationId =
       args.options.destinationEnvironmentId ??
       manifest.destination.environmentId;
+    if (args.prepared) {
+      try {
+        store.transaction(() => {
+          for (const entry of args.prepared!.entries()) {
+            assertNotAborted(args.options.signal);
+            store.putPlan(entry);
+          }
+        });
+        const snapshot = args.prepared.snapshot;
+        if (
+          snapshot &&
+          (args.options.verification ?? 'versions') === 'versions'
+        ) {
+          if (
+            snapshot.environmentId !== destinationId ||
+            snapshot.schemaHash !== manifest.schema.hash
+          )
+            throw new ContentError(
+              'DESTINATION_MISMATCH',
+              'Prepared snapshot belongs to another environment or schema.',
+            );
+          // importSide closes the source database. Finish reading plan entries
+          // first, copy the original target side, and only then release it.
+          store.importSide(snapshot.store, 'target');
+          store.transaction(() => {
+            for (const table of [
+              'records',
+              'uploads',
+              'collections',
+              'refs',
+              'block_owners',
+              'unique_values',
+            ])
+              store.database.exec(
+                `UPDATE ${table} SET side='live' WHERE side='target'`,
+              );
+          });
+          reusedSnapshot = true;
+        }
+      } finally {
+        args.prepared.release?.();
+      }
+    }
+    assertNotAborted(args.options.signal);
     const targetClient = args.buildEnvironmentClient(destinationId);
     const [schema, rootSite] = await Promise.all([
-      fetchSchema(targetClient, destinationId),
+      fetchSchema(targetClient, destinationId, args.options.schemaProjection),
       args.rootClient.site.find(),
     ]);
     // Bind the project before even a fork request. Profiles can be configured
@@ -2153,6 +2377,7 @@ export async function applyBundle(args: {
       store,
       manifest,
       schema,
+      schemaProjection: args.options.schemaProjection,
       locked: destinationLocked,
       verification: args.options.verification ?? 'versions',
       bundlePath: args.bundlePath,
@@ -2210,7 +2435,8 @@ export async function applyBundle(args: {
         );
     }
     context.log?.(`Verifying destination baseline in "${destinationId}".`);
-    await captureLive(context, destinationId);
+    if (reusedSnapshot) await verifyPreparedBaseline(context, destinationId);
+    else await captureLive(context, destinationId);
     validateBundlePreflight(context);
     if (context.writesPlanned)
       assertScheduleWindow(context, args.options.scheduleWindowMinutes ?? 120);
@@ -2232,7 +2458,11 @@ export async function applyBundle(args: {
       context.client = args.buildEnvironmentClient(environmentId);
       forkLocked = await lockEnvironment(context.client, ownedFork);
       context.locked = forkLocked;
-      context.schema = await fetchSchema(context.client, environmentId);
+      context.schema = await fetchSchema(
+        context.client,
+        environmentId,
+        context.schemaProjection,
+      );
       await assertApplyAccess(
         context.client,
         context.schema,
@@ -2399,7 +2629,11 @@ export async function applyBundle(args: {
       await temporarySchema(context, true);
       changedSchema = false;
     }
-    const finalSchema = await fetchSchema(context.client, environmentId);
+    const finalSchema = await fetchSchema(
+      context.client,
+      environmentId,
+      context.schemaProjection,
+    );
     if (finalSchema.hash !== manifest.schema.hash)
       throw new ContentError(
         'SCHEMA_CONFLICT',
@@ -2663,6 +2897,11 @@ export async function repairBundle(args: {
   buildEnvironmentClient: (environmentId: string) => Client;
   bundlePath: string;
   options: RepairOptions;
+  prepared?: {
+    metadata: PlanMetadata;
+    entries: () => Iterable<PlanEntry>;
+    release?: () => void;
+  };
 }): Promise<RepairResult> {
   const store = new SnapshotStore();
   const problems: string[] = [];
@@ -2673,12 +2912,26 @@ export async function repairBundle(args: {
   };
   try {
     const { signal, log } = args.options;
-    log?.('Validating content bundle and asset checksums.');
-    const manifest = await readBundle({
-      directory: args.bundlePath,
-      store,
-      signal,
-    });
+    log?.(
+      args.prepared
+        ? 'Validating the reconstructed migration repair plan.'
+        : 'Validating content bundle and asset checksums.',
+    );
+    const manifest: PlanMetadata = args.prepared
+      ? args.prepared.metadata
+      : await readBundle({ directory: args.bundlePath, store, signal });
+    if (args.prepared) {
+      try {
+        store.transaction(() => {
+          for (const entry of args.prepared!.entries()) {
+            assertNotAborted(signal);
+            store.putPlan(entry);
+          }
+        });
+      } finally {
+        args.prepared.release?.();
+      }
+    }
     const environmentId =
       args.options.destinationEnvironmentId ??
       manifest.destination.environmentId;
@@ -2726,7 +2979,11 @@ export async function repairBundle(args: {
       } as Parameters<Client['fields']['update']>[1]);
       restoredFields++;
     }
-    const schema = await fetchSchema(client, environmentId);
+    const schema = await fetchSchema(
+      client,
+      environmentId,
+      args.options.schemaProjection,
+    );
     if (schema.siteId !== manifest.destination.siteId)
       throw new ContentError(
         'DESTINATION_MISMATCH',
@@ -2746,6 +3003,7 @@ export async function repairBundle(args: {
         writesPlanned: true,
         locked: false,
         verification: 'full',
+        repairOnly: true,
         signal,
         log,
       };

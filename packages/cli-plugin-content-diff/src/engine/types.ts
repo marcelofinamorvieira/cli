@@ -221,6 +221,8 @@ export interface BundleManifest extends PlanMetadata {
   chunks: BundleChunkIndex;
 }
 export interface CaptureOptions {
+  /** Exclude only explicitly verified migration-tracking metadata. */
+  schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
   modelIds: string[];
   uploads: 'referenced' | 'all';
@@ -228,6 +230,8 @@ export interface CaptureOptions {
   progress?: (message: string) => void;
 }
 export interface ApplyOptions {
+  /** Internal native migration integration; never serialized into artifacts. */
+  schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
   inPlace: boolean;
   allowPrimary: boolean;
@@ -247,6 +251,7 @@ export interface ApplyOptions {
   log?: (message: string) => void;
 }
 export interface RepairOptions {
+  schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
   allowPrimary: boolean;
   destinationEnvironmentId?: string;

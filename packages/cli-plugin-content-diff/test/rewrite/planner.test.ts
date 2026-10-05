@@ -3199,10 +3199,15 @@ describe('indexed rewrite planner', () => {
       });
   });
 
-  it('preserves legal collection duplicates for noops, explicit creates, deletes, and unaffected updates', async () => {
+  it('preserves legal collection duplicates for noops, appends, deletes, and unaffected updates', async () => {
     const peers = [collection(A), collection(B)];
     await collectionFixture(peers, peers);
-    await collectionFixture(peers, []);
+    await assert.rejects(
+      collectionFixture(peers, []),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.details?.reason === 'COLLECTION_ORDERING_CONFLICT',
+    );
     await collectionFixture([...peers, collection(C, null, 3)], peers);
     await collectionFixture([peers[0]], peers, { includeDeletions: true });
     await collectionFixture(

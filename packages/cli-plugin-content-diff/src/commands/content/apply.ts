@@ -1,34 +1,28 @@
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
-import { applyBundle, repairBundle } from '../../engine/apply';
 import { ContentError } from '../../engine/errors';
-import type {
-  ApplyResult,
-  BundleManifest,
-  RepairResult,
-} from '../../engine/types';
+import type { ApplyResult, RepairResult } from '../../engine/types';
+import { applyContentMigration, repairContentMigration } from '../../migration';
 import { ContentCommand, concurrency } from '../../utils/content-command';
 import { withInterruptHandling } from '../../utils/interruption';
 
 export default class ContentApplyCommand extends ContentCommand {
   static description =
-    'Apply a content bundle into a new isolated destination fork';
+    'Run a TypeScript content migration in a new isolated destination fork';
   static examples = [
-    '<%= config.bin %> <%= command.id %> ./content-bundle',
-    '<%= config.bin %> <%= command.id %> ./content-bundle --in-place',
-    '<%= config.bin %> <%= command.id %> ./content-bundle --repair',
+    '<%= config.bin %> <%= command.id %> ./migrations/content.ts',
+    '<%= config.bin %> <%= command.id %> ./migrations/content.ts --in-place',
+    '<%= config.bin %> <%= command.id %> ./migrations/content.ts --repair',
   ];
   static args = {
-    BUNDLE: oclif.Args.string({
-      description: 'Complete content bundle directory',
+    SCRIPT: oclif.Args.string({
+      description: 'TypeScript content migration entrypoint',
       required: true,
     }),
   };
   static flags = {
     destination: oclif.Flags.string({
       description:
-        'Apply against this destination environment ID instead of the bundle binding',
+        'Apply against this destination environment ID instead of the migration binding',
     }),
     'in-place': oclif.Flags.boolean({
       description: 'Write directly into the destination environment',
@@ -59,7 +53,7 @@ export default class ContentApplyCommand extends ContentCommand {
     }),
     'allow-temporary-schema-changes': oclif.Flags.boolean({
       description:
-        'Permit the exact temporary validator and default changes in the bundle',
+        'Permit supported temporary validator and default changes required by this migration',
       default: false,
     }),
     'fast-fork': oclif.Flags.boolean({
@@ -107,12 +101,17 @@ export default class ContentApplyCommand extends ContentCommand {
         'INVALID_SCHEDULE_WINDOW',
         '--schedule-window must be a whole number of minutes, 0 or more.',
       );
+    if (!args.SCRIPT.endsWith('.ts'))
+      throw new ContentError(
+        'INVALID_MIGRATION_PATH',
+        'Pass the generated .ts migration entrypoint to content:apply.',
+      );
     const endpoint = await this.endpoint();
     if (flags.repair) {
-      const repaired = await repairBundle({
+      const repaired = await repairContentMigration({
         rootClient: endpoint.rootClient,
         buildEnvironmentClient: endpoint.buildEnvironmentClient,
-        bundlePath: args.BUNDLE,
+        scriptPath: args.SCRIPT,
         options: {
           signal,
           allowPrimary: flags['allow-primary'],
@@ -126,10 +125,10 @@ export default class ContentApplyCommand extends ContentCommand {
         );
       return repaired;
     }
-    const result = await applyBundle({
+    const result = await applyContentMigration({
       rootClient: endpoint.rootClient,
       buildEnvironmentClient: endpoint.buildEnvironmentClient,
-      bundlePath: args.BUNDLE,
+      scriptPath: args.SCRIPT,
       options: {
         signal,
         inPlace: flags['in-place'],
@@ -145,30 +144,13 @@ export default class ContentApplyCommand extends ContentCommand {
       },
     });
     if (!this.jsonEnabled()) {
-      const partial = result.partial ? await partialSummary(args.BUNDLE) : '';
+      const partial = result.partial
+        ? ' from a partial migration; skipped entries were not applied'
+        : '';
       this.log(
         `Applied ${result.mutations} mutations in environment "${result.environmentId}"${partial}.`,
       );
     }
     return result;
-  }
-}
-
-/** Describes how many entries an applied partial bundle skipped. */
-async function partialSummary(bundlePath: string): Promise<string> {
-  try {
-    const { counts } = JSON.parse(
-      await readFile(join(bundlePath, 'manifest.json'), 'utf8'),
-    ) as BundleManifest;
-    const skipped = Object.values(counts).reduce(
-      (total, actions) => total + actions.skip,
-      0,
-    );
-    return ` from a partial bundle; ${skipped} skipped ${
-      skipped === 1 ? 'entry was' : 'entries were'
-    } not applied`;
-  } catch {
-    // The manifest was verified before any write; this summary is optional.
-    return ' from a partial bundle; its skipped entries were not applied';
   }
 }

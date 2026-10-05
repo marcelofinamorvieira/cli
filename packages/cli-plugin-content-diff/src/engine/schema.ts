@@ -40,6 +40,7 @@ export function schemaHash(
 export async function fetchSchema(
   client: Client,
   environmentId: string,
+  project?: (schema: SchemaState) => SchemaState,
 ): Promise<SchemaState> {
   const [site, models, workflows] = await Promise.all([
     client.site.find(),
@@ -138,7 +139,7 @@ export async function fetchSchema(
     hash: '',
   };
   schema.hash = schemaHash(schema);
-  return schema;
+  return project ? project(schema) : schema;
 }
 
 function rules(value: unknown): Record<string, unknown>[] {

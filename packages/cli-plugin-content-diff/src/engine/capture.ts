@@ -769,7 +769,11 @@ async function verifyByVersions(input: CaptureInput): Promise<void> {
   const assets = new SnapshotStore();
   try {
     input.options.progress?.('Checking capture consistency by version');
-    const schema = await fetchSchema(input.client, input.environmentId);
+    const schema = await fetchSchema(
+      input.client,
+      input.environmentId,
+      input.options.schemaProjection,
+    );
     assertNotAborted(signal);
     if (
       schema.hash !== input.schema.hash ||
@@ -801,7 +805,11 @@ async function verifyByVersions(input: CaptureInput): Promise<void> {
         `Record ${changed} changed during capture. Start a new generation after editing stops.`,
       );
     await captureAssets({ ...input, store: assets });
-    const after = await fetchSchema(input.client, input.environmentId);
+    const after = await fetchSchema(
+      input.client,
+      input.environmentId,
+      input.options.schemaProjection,
+    );
     assertNotAborted(signal);
     if (
       after.hash !== schema.hash ||
@@ -887,7 +895,11 @@ export async function captureSnapshot(input: CaptureInput): Promise<void> {
   try {
     input.options.progress?.('Checking capture consistency');
     assertNotAborted(signal);
-    const schema = await fetchSchema(input.client, input.environmentId);
+    const schema = await fetchSchema(
+      input.client,
+      input.environmentId,
+      input.options.schemaProjection,
+    );
     assertNotAborted(signal);
     if (
       schema.hash !== input.schema.hash ||
@@ -901,7 +913,11 @@ export async function captureSnapshot(input: CaptureInput): Promise<void> {
     assertNotAborted(signal);
     await captureOnce({ ...input, schema, store: verification });
     assertNotAborted(signal);
-    const after = await fetchSchema(input.client, input.environmentId);
+    const after = await fetchSchema(
+      input.client,
+      input.environmentId,
+      input.options.schemaProjection,
+    );
     assertNotAborted(signal);
     if (
       after.hash !== schema.hash ||

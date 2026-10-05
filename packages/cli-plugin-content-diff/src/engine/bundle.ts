@@ -119,7 +119,10 @@ function safeRelative(file: unknown): asserts file is string {
 }
 
 /** Reject every traversed symlink, including parent directories inside a bundle. */
-async function safeFile(directory: string, file: string): Promise<FileHandle> {
+export async function safeFile(
+  directory: string,
+  file: string,
+): Promise<FileHandle> {
   safeRelative(file);
   let current = directory;
   const parts = file.split('/');
@@ -137,7 +140,7 @@ async function safeFile(directory: string, file: string): Promise<FileHandle> {
   return open(current, constants.O_RDONLY | constants.O_NOFOLLOW);
 }
 
-async function readSmallFile(
+export async function readSmallFile(
   directory: string,
   file: string,
   maximum: number,
@@ -313,7 +316,7 @@ function validateChunk(
     invalid('Duplicate, unordered, or unsupported bundle chunk path.');
 }
 
-function validateSchedules(value: unknown): boolean {
+export function validateSchedules(value: unknown): boolean {
   if (!object(value)) return false;
   const publication = value.publication;
   if (
@@ -335,7 +338,7 @@ function validateSchedules(value: unknown): boolean {
   );
 }
 
-function validateState(value: unknown, entry: PlanEntry): boolean {
+export function validateState(value: unknown, entry: PlanEntry): boolean {
   if (!object(value) || value.id !== entry.id || !text(value.hash))
     return false;
   if (entry.kind === 'collection')
@@ -391,7 +394,7 @@ function validateState(value: unknown, entry: PlanEntry): boolean {
   );
 }
 
-function requiresBinary(entry: UploadPlan): boolean {
+export function requiresBinary(entry: UploadPlan): boolean {
   return (
     (entry.action === 'create' || entry.action === 'update') &&
     Boolean(entry.desired) &&
@@ -592,7 +595,7 @@ async function* transferred(
   }
 }
 
-async function fetchBinary(
+export async function fetchBinary(
   entry: UploadPlan,
   staging: string,
   fetchFn: typeof fetch,
@@ -929,7 +932,7 @@ export async function writeBundle({
   }
 }
 
-async function verifyBinary(
+export async function verifyBinary(
   directory: string,
   binary: BinaryFile,
   signal?: AbortSignal,
@@ -961,7 +964,7 @@ async function verifyBinary(
 }
 
 /** Read one JSON value at a time, with backpressure and a rolling checksum. */
-async function* jsonlValues(
+export async function* jsonlValues(
   directory: string,
   descriptor: Pick<BundleChunk, 'file' | 'bytes' | 'sha256'>,
   expectedRows: number,

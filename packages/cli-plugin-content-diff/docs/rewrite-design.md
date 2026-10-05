@@ -1,116 +1,86 @@
-# Content diff rewrite
+# TypeScript content migration design
 
-## Scope
+The public artifact is an editable TypeScript migration containing actual CMA calls. `content:diff` generates it; `content:apply` or a compatible native `migrations:run` executes it through the shared guarded content engine. Schema autogeneration remains schema-only.
 
-The public commands are `content:diff` and `content:apply`.
+## Artifact and authority
 
-## Agreed requirements
+A migration consists of a timestamped `.ts` entrypoint and a sibling `.content` directory. The TypeScript is authoritative for intended changes. Large scripts contain sequentially loaded `.ts` parts; small scripts contain their calls inline.
 
-1. Support small updates and full transfers in large projects.
-2. Use temporary disk-backed SQLite and bounded in-memory batches.
-3. Use Node's built-in SQLite; support Node 22.13+ on the 22.x line and newer
-   supported runtimes with unflagged SQLite. Do not add a native driver.
-4. Capture all selected records with fully expanded nested blocks, independently
-   for current and published versions. Later checks may rely on record versions:
-   records whose version is unchanged need not be reread, and records whose
-   version changed are reread in full and compared.
-5. Verify capture consistency. Abort when a consistent view cannot be obtained.
-6. Include full baseline/desired content only for changed records. Unchanged
-   records carry fingerprints and required dependency, ordering, schedule, and
-   preservation metadata. DatoCMS calculates validity flags asynchronously;
-   they are diagnostic metadata rather than writable intended content.
-7. Write a small manifest, a streamed checksummed chunk index, and deterministic,
-   byte-bounded JSONL chunks. Never
-   split an entry. Checksum every chunk and required asset binary. Do not create
-   a second human-readable report format.
-8. Reuse CMA client authentication, retries, endpoint serialization, and job
-   handling. Bound the plugin's page/work buffering; do not duplicate SDK retry
-   logic or queue every page before consuming it.
-9. Read records in nested batches of at most 30. Use indexed lookups and
-   iterative dependency/uniqueness algorithms.
-10. Generation and execution are one-shot. No checkpoints, resumable sessions,
-    saved progress, pause command, or recovery cursor. Temporary working state
-    is never accepted as input to another run.
-11. Apply into a new isolated destination fork by default. Permit `--in-place`;
-    primary also requires `--allow-primary`. Do not promote automatically.
-12. Validate the complete managed baseline before writes and the complete
-    intended result at the end. During writes retain focused dependency,
-    publication, deletion, ordering, preservation, and conflict checks.
-13. Explain concurrency checks in source comments: DatoCMS has no public
-    persistent sandbox freeze; maintenance mode applies only to primary and
-    does not create an immutable snapshot or a transaction.
-14. Use bounded parallelism only for independent writes. Respect dependency
-    order and serialize writes affecting the same ordered sibling group.
-15. Reject unsafe requested changes by default. `--allow-partial` permits only
-    proven isolated skips and their dependency closure. Global incompatibility,
-    unproven access, and execution conflicts remain fatal.
-16. Bundle binaries needed for upload creation/replacement during generation.
-    Preserve upload identities where the CMA permits; replacements must not
-    overwrite shared source/original-environment files.
-17. Temporary validator/default changes require
-    `--allow-temporary-schema-changes`. Restore original settings before
-    success; attempt restoration on failure and report unsuccessful repair.
-18. Cancel existing schedules only on records the run writes, and recreate the
-    exact desired future schedules once writes are done and field settings are
-    restored. Leave every other schedule untouched, and refuse to start when a
-    schedule falls due within the schedule window. Never invent new dates. On
-    in-place failure, restore an original schedule only on original content;
-    report records the run created or changed. A separate repair mode restores
-    what a killed in-place run left behind, reading only the bundle and the
-    live environment.
-19. Remove temporary SQLite/staging state and incomplete generation outputs.
-    Attempt removal of a failed fork created by this run, unless
-    `--keep-failed-fork` was supplied. Never delete a pre-existing environment.
-20. Keep completed bundles. They are content exports and must exclude credentials.
+The companion contains immutable baseline evidence: source/destination bindings, managed schema, tracking-model bindings, guards for every destination identity, original payloads for identities changed during generation, exact source validity evidence, and verified asset binaries. Checksummed JSONL files hold this evidence. There is no executable JSON mutation plan and no desired-state sidecar to override edited TypeScript.
 
-Large-scale acceptance is deferred: no fixed 1 GiB RAM acceptance target and no mandatory
-600k benchmark or live-scale gate. Ordinary correctness, compilation, lint,
-CLI, packaging, failure, and cleanup verification are required. Large-project
-readiness must not be presented as experimentally verified without evidence.
+Checksums detect corruption, incomplete copies, and accidental baseline edits. They do not authenticate a migration against someone who can replace both files and checksums. Scripts and companions contain project content and no client authentication credentials. Keep them together and preserve their filenames and relative paths.
 
-## Component boundaries
+Generated code uses `defineContentMigration` from the plugin's public `migration` entrypoint. It is trusted Node code, not a sandbox. Guards cover operations performed through its supplied recording client; arbitrary imports or independently constructed clients retain ordinary Node capabilities.
 
-- `engine/types`: the new schema, snapshot, guard, plan, and bundle contract.
-- `engine/store`: temporary SQLite tables and indexed streaming iterators.
-- `engine/codec`: canonical states, fingerprints, nested payload adaptation,
-  ownership and typed-reference traversal.
-- `engine/capture`: bounded CMA pagination, access/schema proofs, complete nested
-  capture, schedule reads, and capture consistency verification.
-- `engine/planner`: indexed comparisons, dependency order, uniqueness analysis,
-  safe skips, and explicit temporary schema-change plans.
-- `engine/bundle`: atomic bundle staging, size-bounded JSONL and binary streams,
-  integrity checks, safe relative paths, and cleanup.
-- `engine/apply`: project binding, fresh-fork lifecycle, preflight, bounded
-  ordered writes, scoped live checks, restoration, final verification, cleanup.
-- `commands/content`: profile/authentication and command output only.
+## Generation
 
-## Implementation and verification
+1. Resolve endpoint profiles, project/environment identities, and schemas. Exclude only the configured, validated native migration-tracking model; retain its exact identity or recorded absence.
+2. Capture complete managed namespaces into temporary SQLite, including fully expanded current and published blocks, schedules, assets, and folders. Selected models limit changes, not preservation or dependency proofs. Separate projects can be read concurrently; environments in one project share its API rate limit.
+3. Verify capture consistency. Pass the tracking-schema projection through all consistency rereads, not only the initial schema fetch.
+4. Build the indexed dependency, uniqueness, ordering, publication, and temporary-schema plan. Reject unsafe changes unless a proven isolated partial closure is authorized.
+5. Emit readable CMA calls and original asset files into staged output. Publish a complete script/companion pair only after the baseline and binaries are complete; reject existing paths.
 
-Focused correctness tests cover this contract.
-Use bounded local/mock cases for nested content, lifecycle, dependencies,
-integrity, CLI routing, uncertain outcomes, and cleanup. Do not call live CMA
-projects without explicit authorization or run deferred large-scale acceptance
-experiments.
+`content:diff [NAME]` uses native `{unix_timestamp}_{camelCaseName}.ts` naming. The name defaults to `contentMigration`. `--output` accepts an exact `.ts` path or directory. Without it, use the destination profile's configured migration directory relative to the configuration file, or `./migrations`.
 
-### Shared interfaces
+The default TypeScript part target is 1 MiB. Never split a CMA operation. One large operation can occupy its own part, within the source-file ceiling. A small diff remains a short script even when its full-namespace guards are large.
 
-The initial common contract is `engine/types.ts`; coordinate changes there.
-`SnapshotStore` exposes a public `database: DatabaseSync` for indexed planner
-queries, plus record/upload/collection insertion, retrieval and streaming
-iterators by `Side`. It owns `records`, `uploads`, `collections`, `refs`,
-`block_owners`, `unique_values`, `plan`, and `edges` tables. Plan rows are keyed by
-`(kind,id)` and yield deterministic `(kind,model_id,id)` order. Its lifecycle is
-`new SnapshotStore(directory?)`, `close()`, and `dispose()` (remove owned files).
+## Execution and edits
 
-- `createPlan(store, sourceSchema, targetSchema, options): Promise<PlanMetadata>`
-- `writeBundle({ store, metadata, outputPath, chunkBytes?, fetchFn? }): Promise<string>`
-- `readBundle({ directory, store }): Promise<BundleManifest>`
-- `fetchSchema(client, environmentId): Promise<SchemaState>`
-- `captureSnapshot({ client, environmentId, schema, store, side, options, verify? }): Promise<void>`
-- `readRecordBatch(client, ids, schema): Promise<RecordState[]>`
-- `applyBundle({ rootClient, buildEnvironmentClient, bundlePath, options }): Promise<ApplyResult>`
+1. Load the trusted TypeScript definition and verify its companion metadata and asset checksums.
+2. Verify destination project/schema binding and primary authorization. Capture the current destination and compare every managed identity with the immutable baseline, including content outside the selected models.
+3. Invoke the script with a recording CMA facade inside a temporary SQLite transaction. Supported calls mutate a local intended namespace initialized from the destination; they do not discover intent by submitting remote writes. Unmentioned records and omitted update fields remain preserved. Creates require explicit portable IDs. Unsupported operations and attempts to leave the selected model scope fail closed.
+4. Resolve validity for every intended current/published slice. Exact captured source evidence can be reused only when record ID, slice, and field hash match. Unknown edited values use native non-mutating validation endpoints. Refuse validation that depends on future/new references, changed assets, structural failures, or defaults that would substitute different values. Do not invent validity. Unchanged generated cycles retain their exact source evidence.
+5. Rebuild the plan from the executed TypeScript, including dependencies, publication cycles, ordering, deletions, temporary rules, and binary bindings. Generation-time choices are not an executable desired-state override. The generation deletion flag controls emitted calls; explicit supported deletes in edited TypeScript become intended deletions when replanned.
+6. Pass the fresh plan to the guarded executor. Verify the destination/fork, perform dependency-ordered writes with focused guards, restore schedules and temporary settings, then verify the complete intended namespace.
 
-`codec` supplies stable JSON/hash functions, `recordGuard`, `canonicalRecord`,
-`recordPayloadFields`, and `inspectRecord` (typed refs and block ownership).
-Snapshot and plan states never include credentials. Any unsupported executable
-state must be diagnosed during planning, not silently approximated at apply.
+The public `applyContentMigration` and `repairContentMigration` take the script path, root client, environment-client factory, and explicit execution options. They share the original executor through an internal prepared-plan adapter. Internal JSON plan rows are temporary derived state, not saved execution progress or public input.
+
+DatoCMS has no persistent public sandbox write freeze. Maintenance mode applies only to primary and does not provide a transaction. Keep the comments explaining this beside capture, prewrite, and schedule-restoration checks. Competing writers must be stopped; observed-conflict checks cannot remove the race between a read and its following write.
+
+`versions` verification uses current versions and published-version timestamps to avoid redundant reads. Full verification rereads complete records. Managed schema changes and plugin-controlled upload rewrites receive additional checks, but external in-place rewrites can evade version-only comparison. Full reads strengthen verification without freezing the environment.
+
+## Native migration integration
+
+The normal runner provides managed execution context version 1: its chosen environment, original source environment, primary authorization, signal, logging, root client, client factory, and migration-tracking ownership. The generated default export activates managed cleanup before preflight and verifies that its supplied client targets that environment. Missing or incompatible context is refused.
+
+The native runner owns its fork. The content runtime writes within it and never creates a second fork or promotes it. Completion uses the ordinary migration receipt system; a receipt records a completed script and is not an interrupted-run checkpoint. Failure cleanup also covers failure to save the receipt after content execution.
+
+Tracking-model projection requires canonical schema and exact identity. If the model was absent at generation, only a matching model explicitly created by this native run may be introduced. Unrelated models or unknown ownership are not silently excluded. Prior pending migrations that change content/schema invalidate the captured baseline.
+
+The plugin runtime must resolve as a project dependency from the generated script. A separately installed CLI plugin does not guarantee that import resolution. Use matching CLI/plugin builds; normal schema-only migrations retain their existing behavior.
+
+## Memory, lifecycle, and repair
+
+Use Node's built-in SQLite on Node 22.13+ or Node 24+, bounded record batches of at most 30, streaming metadata, indexed lookups, and iterative graph algorithms. Reuse the CMA client's authentication, retry, serialization, and async-job handling. Parallelize independent work only; serialize dependent writes and writes affecting the same ordered sibling group.
+
+A fresh CommonJS wrapper without `require.cache` entries did not prove bounded memory: local measurements found retained compiled code across large parts. Large generated parts therefore run in disposable workers. Each worker forwards awaited CMA-shaped calls to the parent's recorder, with at most one handler active, and is terminated after the part completes. The small primary module is loaded once. Worker isolation controls compilation lifetime; it is not a security boundary.
+
+Generation and execution are one-shot. No pause/resume, checkpoints, persisted temporary database, or recovery cursor is accepted. Remove owned SQLite and staging files on completion or failure. Keep complete scripts and companions. Cooperative signals drain submitted work and perform cleanup; forced process termination cannot.
+
+Default application owns a fresh fork and removes it after failure unless explicitly retained. `--in-place` is an explicit override; primary also requires `--allow-primary`. Never delete a pre-existing environment or automatically promote a fork.
+
+Cancel schedules only for written records. Recreate their exact intended future dates after writes and temporary settings are restored. Preserve other schedules. Refuse schedules within the configured window before starting. On in-place failure, restore an original schedule only when the record still contains original content; report ambiguous or already-changed records.
+
+Repair uses the same script and immutable companion without saved run progress. Reconstruct original changed identities from stored originals; guard-only identities must still match their original guards. Replay the script locally and derive a fresh repair plan. Restore only eligible schedules and exactly recognized temporary field settings; never rewrite record content or save a new version merely to refresh validity. Report incomplete or ambiguous recovery.
+
+Repair must refuse missing original evidence, unrelated schema changes, unknown native tracking ownership, expired/ambiguous schedules, and edited validity that cannot be verified while changed field rules remain. Editing a previously unchanged identity can make later repair unreconstructable because its original payload was never saved. Retain the exact script used by the failed run.
+
+## Component boundaries and verification
+
+| Component | Responsibility |
+| --- | --- |
+| `engine/store`, `types`, `codec` | Temporary storage, canonical states, guards, nested payloads, and typed references. |
+| `engine/capture`, `schema` | Complete bounded captures, permissions/schema proofs, and consistency checks. |
+| `engine/planner*` | Dependency order, uniqueness, publication cycles, ordering, safe skips, and temporary rules. |
+| `engine/migration-artifact` | TypeScript emission, immutable baseline storage, binaries, integrity, and atomic staging. |
+| `engine/migration-intent`, `migration-validity` | Recording facade, local simulation, exact evidence, and native validation of unknown edits. |
+| `engine/migration-loader` | Trusted TypeScript loading, source locations, disposable parts, and recording IPC. |
+| `engine/migration-schema` | Explicit native tracking-model identity and schema projection. |
+| `engine/migration-repair` | Original-namespace reconstruction and fresh repair planning. |
+| `engine/apply*` | Guarded fork/in-place execution, restoration, verification, and cleanup. |
+| `migration` | Public generated-script runtime and native-runner integration. |
+| `commands/content` | Profiles, flags, naming, interruptions, and terminal/JSON output. |
+
+Tests must execute real generated TypeScript, edit its payloads, and show that replanning follows those edits. Include inline and worker parts, unchanged namespace preservation, source-evidence cycles, unsupported edits, corrupted companions, project/primary guards, native receipts/context, repair refusals, interruption, cleanup, and package resolution. Retain meaningful failures while investigating them.
+
+Report scale evidence precisely. Parser/worker retention tests, synthetic planning, incremental live applies, and full live transfers prove different things. Do not infer 600,000-record TypeScript transfer throughput or production readiness from a small incremental apply. Live writes require explicit authorization and remain confined to the authorized projects and environments.

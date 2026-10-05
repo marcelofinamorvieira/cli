@@ -1,8 +1,8 @@
 {
   "name": "@datocms/cli-plugin-content-diff",
   "version": "4.2.1",
-  "description": "Compare DatoCMS environments and apply reviewable content bundles",
-  "keywords": ["datocms", "cli", "content", "diff", "bundle"],
+  "description": "Generate and execute guarded TypeScript content migrations",
+  "keywords": ["datocms", "cli", "content", "diff", "migration", "typescript"],
   "engines": {
     "node": "^22.13.0 || >=24.0.0"
   },
@@ -35,7 +35,9 @@
   "dependencies": {
     "@datocms/cli-utils": "^4.2.0",
     "@oclif/core": "^4",
-    "tslib": "^2.8.1"
+    "tslib": "^2.8.1",
+    "typescript": "5.7.2",
+    "lodash": "^4.17.21"
   },
   "devDependencies": {
     "@datocms/cma-client": "^6.1.0",
@@ -43,7 +45,6 @@
     "@datocms/rest-client-utils": "^6.1.0",
     "mocha": "^12.0.2",
     "oclif": "^4",
-    "typescript": "5.7.2",
     "ts-node": "^10.2.1"
   },
   "oclif": {
@@ -51,8 +52,19 @@
     "repositoryPrefix": "<%- repo %>/blob/@datocms/cli-plugin-content-diff@<%- version %>/packages/cli-plugin-content-diff/<%- commandPath %>",
     "topics": {
       "content": {
-        "description": "Compare environments and apply content bundles"
+        "description": "Generate and run TypeScript content migrations"
       }
     }
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./migration": {
+      "types": "./lib/migration.d.ts",
+      "default": "./lib/migration.js"
+    },
+    "./package.json": "./package.json"
   }
 }

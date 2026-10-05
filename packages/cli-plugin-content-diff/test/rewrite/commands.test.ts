@@ -1,17 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { CmaClient } from '@datocms/cli-utils';
 import { afterEach, describe, it } from 'mocha';
 import ContentApplyCommand from '../../src/commands/content/apply';
 import ContentDiffCommand from '../../src/commands/content/diff';
-import * as apply from '../../src/engine/apply';
-import * as bundle from '../../src/engine/bundle';
 import * as capture from '../../src/engine/capture';
 import { ContentError } from '../../src/engine/errors';
+import * as artifact from '../../src/engine/migration-artifact';
+import { MAX_MIGRATION_CHUNK_BYTES } from '../../src/engine/migration-limits';
 import * as planner from '../../src/engine/planner';
 import * as schema from '../../src/engine/schema';
 import type { SnapshotStore } from '../../src/engine/store';
@@ -20,6 +20,7 @@ import type {
   RecordState,
   SchemaState,
 } from '../../src/engine/types';
+import * as apply from '../../src/migration';
 import {
   concurrency,
   environmentId,
@@ -118,6 +119,13 @@ describe('content command integration', () => {
         working = args.store;
         assert.deepEqual(args.options.modelIds, ['article-id', 'page-id']);
         assert.equal(args.options.uploads, 'all');
+        assert.ok(args.options.schemaProjection);
+        assert.deepEqual(
+          args.options
+            .schemaProjection(schemaState())
+            .models.map((model) => model.id),
+          ['article-id', 'page-id', 'block-id'],
+        );
         captures.push(args.side);
       },
     );
@@ -154,11 +162,19 @@ describe('content command integration', () => {
       },
     );
     replace(
-      bundle,
-      'writeBundle',
-      async (args: Parameters<typeof bundle.writeBundle>[0]) => {
+      artifact,
+      'writeMigration',
+      async (args: Parameters<typeof artifact.writeMigration>[0]) => {
         assert.equal(args.store, working);
         assert.equal(existsSync(args.store.filename), true);
+        assert.deepEqual(args.sourceTracking, {
+          apiKey: 'schema_migration',
+          model: null,
+        });
+        assert.deepEqual(args.destinationTracking, {
+          apiKey: 'schema_migration',
+          model: null,
+        });
         return args.outputPath;
       },
     );
@@ -182,7 +198,7 @@ describe('content command integration', () => {
             flags: {
               source: 'source',
               destination: 'primary',
-              output: join(directory, 'bundle'),
+              output: join(directory, 'migrations'),
               'item-types': 'article',
               uploads: 'referenced',
               concurrency: 4,
@@ -199,14 +215,222 @@ describe('content command integration', () => {
       );
       const result = await command.run();
       assert.equal(result.destinationEnvironmentId, 'target');
+      assert.match(result.scriptPath, /\d+_contentMigration\.ts$/);
+      assert.equal('bundlePath' in result, false);
       assert.deepEqual(captures, ['source', 'target']);
       assert.ok(working);
       assert.equal(existsSync(working.directory), false);
-      replace(bundle, 'writeBundle', async () => {
+      replace(artifact, 'writeMigration', async () => {
         throw new Error('download failed');
       });
       await assert.rejects(command.run(), /download failed/);
       assert.equal(existsSync(working.directory), false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('names TypeScript files like native migrations and uses the destination profile directory', async () => {
+    const directory = await realpath(
+      await mkdtemp(join(tmpdir(), 'content-command-path-')),
+    );
+    const previousDirectory = process.cwd();
+    const timestamp = 1_700_000_000;
+    replace(Date, 'now', () => timestamp * 1000);
+    const nested = join(directory, 'config');
+    await mkdir(nested);
+    const cases = [
+      {
+        output: join(directory, 'explicit.ts'),
+        profiles: undefined,
+        selected: undefined,
+        path: join(directory, 'explicit.ts'),
+      },
+      {
+        output: directory,
+        profiles: undefined,
+        selected: undefined,
+        path: join(directory, `${timestamp}_syncFaqContent.ts`),
+      },
+      {
+        output: undefined,
+        profiles: undefined,
+        selected: undefined,
+        path: join(directory, 'migrations', `${timestamp}_syncFaqContent.ts`),
+      },
+      {
+        output: undefined,
+        profiles: undefined,
+        selected: { migrations: { directory: '../single-profile' } },
+        path: join(
+          directory,
+          'single-profile',
+          `${timestamp}_syncFaqContent.ts`,
+        ),
+      },
+      {
+        output: undefined,
+        profiles: {
+          source: { migrations: { directory: '../wrong-source' } },
+          destination: { migrations: { directory: '../destination-profile' } },
+        },
+        selected: undefined,
+        path: join(
+          directory,
+          'destination-profile',
+          `${timestamp}_syncFaqContent.ts`,
+        ),
+      },
+    ];
+    try {
+      process.chdir(directory);
+      for (const entry of cases) {
+        await mkdir(resolve(entry.path, '..'), { recursive: true });
+        await writeFile(entry.path, 'existing');
+        const command = Object.assign(
+          Object.create(ContentDiffCommand.prototype),
+          {
+            parse: async () => ({
+              args: { NAME: 'sync FAQ content' },
+              flags: {
+                source: 'source',
+                output: entry.output,
+                concurrency: 4,
+                'chunk-bytes': 1024,
+                ...(entry.profiles
+                  ? {
+                      'source-profile': 'source',
+                      'destination-profile': 'destination',
+                    }
+                  : {}),
+              },
+            }),
+            datoConfigPath: join(nested, 'datocms.config.json'),
+            datoConfig: entry.profiles
+              ? { profiles: entry.profiles }
+              : undefined,
+            datoProfileConfig: entry.selected,
+            endpoint: async () =>
+              assert.fail('existing output must fail before authentication'),
+            progress: () => undefined,
+            jsonEnabled: () => true,
+          },
+        );
+        await assert.rejects(command.run(), (error: ContentError) => {
+          assert.equal(error.code, 'MIGRATION_EXISTS');
+          assert.equal(
+            error.message,
+            `Migration output already exists: ${entry.path}`,
+          );
+          return true;
+        });
+      }
+    } finally {
+      process.chdir(previousDirectory);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('projects each configured migration tracking model from capture and planning', async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), 'content-command-tracking-'),
+    );
+    const raw = (environment: string) => {
+      const result = schemaState(environment);
+      result.models.push({
+        ...result.models[0],
+        id: `${environment}-tracking`,
+        apiKey: `${environment}_migration`,
+        draftMode: false,
+        fields: [
+          {
+            id: `${environment}-name`,
+            apiKey: 'name',
+            type: 'string',
+            localized: false,
+            validators: { required: {} },
+            defaultValue: null,
+          },
+        ],
+      });
+      return result;
+    };
+    replace(
+      schema,
+      'fetchSchema',
+      async (_client: unknown, environment: string) => raw(environment),
+    );
+    const captured: string[] = [];
+    replace(
+      capture,
+      'captureSnapshot',
+      async (options: Parameters<typeof capture.captureSnapshot>[0]) => {
+        captured.push(options.side);
+        assert.deepEqual(
+          options.schema.models.map((model) => model.id),
+          ['article-id', 'page-id', 'block-id'],
+        );
+        const projected = options.options.schemaProjection!(
+          raw(options.environmentId),
+        );
+        assert.deepEqual(projected, options.schema);
+        assert.deepEqual(options.options.modelIds, ['article-id', 'page-id']);
+      },
+    );
+    replace(
+      planner,
+      'createPlan',
+      async (
+        _store: unknown,
+        source: SchemaState,
+        destination: SchemaState,
+      ) => {
+        assert.equal(source.models.length, 3);
+        assert.equal(destination.models.length, 3);
+        throw new Error('projection verified');
+      },
+    );
+    const endpoints = Object.fromEntries(
+      ['source', 'destination'].map((environment) => [
+        environment,
+        {
+          rootClient: {
+            environments: {
+              list: async () => [{ id: environment, meta: { primary: true } }],
+            },
+          },
+          buildEnvironmentClient: () => ({}),
+        },
+      ]),
+    );
+    const command = Object.assign(Object.create(ContentDiffCommand.prototype), {
+      datoConfig: {
+        profiles: {
+          source: { migrations: { modelApiKey: 'source_migration' } },
+          destination: { migrations: { modelApiKey: 'destination_migration' } },
+        },
+      },
+      parse: async () => ({
+        args: { NAME: 'content' },
+        flags: {
+          source: 'source',
+          destination: 'destination',
+          output: join(directory, 'migration.ts'),
+          'source-profile': 'source',
+          'destination-profile': 'destination',
+          'item-types': 'all',
+          uploads: 'referenced',
+          concurrency: 4,
+          'chunk-bytes': 1024,
+        },
+      }),
+      endpoint: async (profile: string) => endpoints[profile],
+      progress: () => undefined,
+      jsonEnabled: () => true,
+    });
+    try {
+      await assert.rejects(command.run(), /projection verified/);
+      assert.deepEqual(captured.sort(), ['source', 'target']);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -297,7 +521,7 @@ describe('content command integration', () => {
               destination: 'target',
               'source-profile': 'source-profile',
               'destination-profile': 'destination-profile',
-              output: join(directory, 'bundle'),
+              output: join(directory, 'migrations'),
               'item-types': 'all',
               uploads: 'referenced',
               concurrency: 4,
@@ -333,12 +557,14 @@ describe('content command integration', () => {
       restoredSchedules: 2,
       restoredFields: 1,
     };
-    replace(apply, 'applyBundle', async () => assert.fail('apply ran'));
+    replace(apply, 'applyContentMigration', async () =>
+      assert.fail('apply ran'),
+    );
     replace(
       apply,
-      'repairBundle',
-      async (args: Parameters<typeof apply.repairBundle>[0]) => {
-        assert.equal(args.bundlePath, './bundle');
+      'repairContentMigration',
+      async (args: Parameters<typeof apply.repairContentMigration>[0]) => {
+        assert.equal(args.scriptPath, './migration.ts');
         const { signal, ...options } = args.options;
         assert.ok(signal instanceof AbortSignal);
         assert.deepEqual(
@@ -356,7 +582,7 @@ describe('content command integration', () => {
       Object.create(ContentApplyCommand.prototype),
       {
         parse: async () => ({
-          args: { BUNDLE: './bundle' },
+          args: { SCRIPT: './migration.ts' },
           flags: {
             destination: 'main',
             'in-place': false,
@@ -383,9 +609,9 @@ describe('content command integration', () => {
     const result = { environmentId: 'isolated', mutations: 3 };
     replace(
       apply,
-      'applyBundle',
-      async (args: Parameters<typeof apply.applyBundle>[0]) => {
-        assert.equal(args.bundlePath, './bundle');
+      'applyContentMigration',
+      async (args: Parameters<typeof apply.applyContentMigration>[0]) => {
+        assert.equal(args.scriptPath, './migration.ts');
         const { signal, ...options } = args.options;
         assert.ok(signal instanceof AbortSignal);
         assert.equal(signal.aborted, false);
@@ -411,7 +637,7 @@ describe('content command integration', () => {
       Object.create(ContentApplyCommand.prototype),
       {
         parse: async () => ({
-          args: { BUNDLE: './bundle' },
+          args: { SCRIPT: './migration.ts' },
           flags: {
             destination: 'target',
             'in-place': false,
@@ -477,26 +703,9 @@ describe('content command integration', () => {
     ]);
   });
 
-  it('reports a partial bundle and a kept fork in human-readable output', async () => {
+  it('reports a partial migration and a kept fork in human-readable output', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'content-command-apply-'));
     try {
-      const counts = (skip: number) => ({
-        create: 0,
-        update: 1,
-        delete: 0,
-        noop: 0,
-        skip,
-      });
-      await writeFile(
-        join(directory, 'manifest.json'),
-        JSON.stringify({
-          counts: {
-            record: counts(2),
-            upload: counts(1),
-            collection: counts(0),
-          },
-        }),
-      );
       let outcome: unknown = {
         environmentId: 'isolated',
         mutations: 3,
@@ -504,8 +713,8 @@ describe('content command integration', () => {
       };
       replace(
         apply,
-        'applyBundle',
-        async (args: Parameters<typeof apply.applyBundle>[0]) => {
+        'applyContentMigration',
+        async (args: Parameters<typeof apply.applyContentMigration>[0]) => {
           if (outcome instanceof Error) {
             args.options.log?.('Kept failed fork content-apply-kept');
             throw outcome;
@@ -515,10 +724,10 @@ describe('content command integration', () => {
       );
       const logged: string[] = [];
       const progress: string[] = [];
-      const command = (bundlePath: string) =>
+      const command = (scriptPath: string) =>
         Object.assign(Object.create(ContentApplyCommand.prototype), {
           parse: async () => ({
-            args: { BUNDLE: bundlePath },
+            args: { SCRIPT: scriptPath },
             flags: {
               'in-place': false,
               'allow-primary': false,
@@ -537,17 +746,20 @@ describe('content command integration', () => {
           logToStderr: (message: string) => progress.push(message),
           jsonEnabled: () => false,
         });
-      await command(directory).run();
-      await command(join(directory, 'missing')).run();
+      await command(join(directory, 'migration.ts')).run();
+      await command(join(directory, 'missing.ts')).run();
       outcome = { environmentId: 'isolated', mutations: 3, partial: false };
-      await command(directory).run();
+      await command(join(directory, 'migration.ts')).run();
       assert.deepEqual(logged, [
-        'Applied 3 mutations in environment "isolated" from a partial bundle; 3 skipped entries were not applied.',
-        'Applied 3 mutations in environment "isolated" from a partial bundle; its skipped entries were not applied.',
+        'Applied 3 mutations in environment "isolated" from a partial migration; skipped entries were not applied.',
+        'Applied 3 mutations in environment "isolated" from a partial migration; skipped entries were not applied.',
         'Applied 3 mutations in environment "isolated".',
       ]);
       outcome = new ContentError('APPLY_FAILED', 'Injected failure.');
-      await assert.rejects(command(directory).run(), /Injected failure/);
+      await assert.rejects(
+        command(join(directory, 'migration.ts')).run(),
+        /Injected failure/,
+      );
       assert.deepEqual(progress, ['Kept failed fork content-apply-kept']);
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -656,7 +868,7 @@ describe('content command integration', () => {
           parse: async () => ({
             flags: {
               source: 'source',
-              output: './bundle',
+              output: './migration.ts',
               'api-token': 'placeholder-token',
               ...flags,
             },
@@ -746,8 +958,34 @@ describe('content command integration', () => {
         },
         {
           args: ['content:diff', '--source=a', '--output=b', '--chunk-bytes=0'],
-          message: /--chunk-bytes must be a positive safe integer\./,
+          message: /--chunk-bytes must be an integer from 1 to 16776192 bytes/,
           code: 'INVALID_CHUNK_SIZE',
+          status: 1,
+        },
+        ...[MAX_MIGRATION_CHUNK_BYTES + 1, 32 * 1024 * 1024].map(
+          (chunkBytes) => ({
+            args: [
+              'content:diff',
+              '--source=a',
+              '--output=b',
+              `--chunk-bytes=${chunkBytes}`,
+            ],
+            message:
+              /--chunk-bytes must be an integer from 1 to 16776192 bytes/,
+            code: 'INVALID_CHUNK_SIZE',
+            status: 1,
+          }),
+        ),
+        {
+          args: ['content:diff', '!!!', '--source=a', '--output=b'],
+          message: /migration name must contain letters or numbers/,
+          code: 'INVALID_MIGRATION_NAME',
+          status: 1,
+        },
+        {
+          args: ['content:diff', '--source=a', '--output=legacy.js'],
+          message: /output must be a \.ts file or a directory/,
+          code: 'INVALID_MIGRATION_PATH',
           status: 1,
         },
         {
@@ -762,21 +1000,27 @@ describe('content command integration', () => {
           status: 2,
         },
         {
-          args: ['content:apply', './bundle', '--schedule-window=-5'],
+          args: ['content:apply', './migration.ts', '--schedule-window=-5'],
           message: /--schedule-window must be a whole number of minutes/,
           code: 'INVALID_SCHEDULE_WINDOW',
           status: 1,
         },
         {
-          args: ['content:apply', './bundle', '--repair', '--in-place'],
+          args: ['content:apply', './migration.ts', '--repair', '--in-place'],
           message:
             /--in-place=true cannot also be provided when using --repair/,
           status: 2,
         },
         {
-          args: ['content:apply', './bundle', '--allow-primary'],
+          args: ['content:apply', './migration.ts', '--allow-primary'],
           message: /--allow-primary requires --in-place or --repair\./,
           code: 'INVALID_PRIMARY_AUTHORIZATION',
+          status: 1,
+        },
+        {
+          args: ['content:apply', './legacy-bundle'],
+          message: /Pass the generated \.ts migration entrypoint/,
+          code: 'INVALID_MIGRATION_PATH',
           status: 1,
         },
       ];

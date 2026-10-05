@@ -4,8 +4,8 @@ import { ContentError } from './errors';
 export function assertNotAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
   if (
-    signal.reason instanceof ContentError &&
-    signal.reason.code === 'INTERRUPTED'
+    signal.reason instanceof Error &&
+    Reflect.get(signal.reason, 'code') === 'INTERRUPTED'
   )
     throw signal.reason;
   throw new ContentError('INTERRUPTED', 'Content operation was interrupted.');

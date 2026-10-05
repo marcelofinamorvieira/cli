@@ -1,7 +1,7 @@
 import { lstat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
-import { writeBundle } from '../../engine/bundle';
+import { camelCase } from 'lodash';
 import { assertNotAborted } from '../../engine/cancellation';
 import { captureSnapshot } from '../../engine/capture';
 import {
@@ -9,6 +9,15 @@ import {
   unlockEnvironment,
 } from '../../engine/environment-lock';
 import { ContentError } from '../../engine/errors';
+import { writeMigration } from '../../engine/migration-artifact';
+import {
+  DEFAULT_MIGRATION_CHUNK_BYTES,
+  MAX_MIGRATION_CHUNK_BYTES,
+} from '../../engine/migration-limits';
+import {
+  prepareMigrationSchema,
+  projectMigrationSchema,
+} from '../../engine/migration-schema';
 import { createPlan } from '../../engine/planner';
 import {
   assertApplyAccess,
@@ -26,7 +35,7 @@ import {
 import { withInterruptHandling } from '../../utils/interruption';
 
 export type ContentDiffCommandResult = {
-  bundlePath: string;
+  scriptPath: string;
   sourceEnvironmentId: string;
   destinationEnvironmentId: string;
   counts: PlanCounts;
@@ -34,11 +43,17 @@ export type ContentDiffCommandResult = {
 
 export default class ContentDiffCommand extends ContentCommand {
   static description =
-    'Compare DatoCMS environments and export a complete content bundle';
+    'Compare DatoCMS environments and generate an editable TypeScript content migration';
   static examples = [
-    '<%= config.bin %> <%= command.id %> --source=staging --destination=primary --output=./content-bundle',
-    '<%= config.bin %> <%= command.id %> --source=main --destination=main --source-profile=source --destination-profile=target --output=./content-bundle',
+    '<%= config.bin %> <%= command.id %> syncContent --source=staging --destination=primary',
+    '<%= config.bin %> <%= command.id %> --source=main --destination=main --source-profile=source --destination-profile=target --output=./migrations/content.ts',
   ];
+  static args = {
+    NAME: oclif.Args.string({
+      description: 'Migration name used for a timestamped TypeScript filename',
+      default: 'contentMigration',
+    }),
+  };
   static flags = {
     source: oclif.Flags.string({
       description: 'Source environment ID, or "primary"',
@@ -49,8 +64,8 @@ export default class ContentDiffCommand extends ContentCommand {
       default: 'primary',
     }),
     output: oclif.Flags.string({
-      description: 'New directory for the complete content bundle',
-      required: true,
+      description:
+        'TypeScript file or migration directory (defaults to the destination profile migration directory)',
     }),
     'source-profile': oclif.Flags.string({
       description: 'Configured source project profile',
@@ -101,8 +116,9 @@ export default class ContentDiffCommand extends ContentCommand {
       default: 8,
     }),
     'chunk-bytes': oclif.Flags.integer({
-      description: 'Target JSONL chunk size; a single entry is never split',
-      default: 4 * 1024 * 1024,
+      description:
+        'Target TypeScript part size; a single operation is never split',
+      default: DEFAULT_MIGRATION_CHUNK_BYTES,
     }),
   };
 
@@ -119,19 +135,57 @@ export default class ContentDiffCommand extends ContentCommand {
   private async runOperation(
     signal: AbortSignal,
   ): Promise<ContentDiffCommandResult> {
-    const { flags } = await this.parse(ContentDiffCommand);
+    const { flags, args } = await this.parse(ContentDiffCommand);
     const maximum = concurrency(flags.concurrency);
-    if (!Number.isSafeInteger(flags['chunk-bytes']) || flags['chunk-bytes'] < 1)
+    if (
+      !Number.isSafeInteger(flags['chunk-bytes']) ||
+      flags['chunk-bytes'] < 1 ||
+      flags['chunk-bytes'] > MAX_MIGRATION_CHUNK_BYTES
+    )
       throw new ContentError(
         'INVALID_CHUNK_SIZE',
-        '--chunk-bytes must be a positive safe integer.',
+        `--chunk-bytes must be an integer from 1 to ${MAX_MIGRATION_CHUNK_BYTES} bytes (16 MiB minus 1 KiB).`,
       );
-    const outputPath = resolve(flags.output);
+    const sourceProfile = flags['source-profile']
+      ? this.datoConfig?.profiles[flags['source-profile']]
+      : this.datoProfileConfig;
+    const destinationProfile = flags['destination-profile']
+      ? this.datoConfig?.profiles[flags['destination-profile']]
+      : this.datoProfileConfig;
+    const migrationName = camelCase(args?.NAME ?? 'contentMigration');
+    if (!migrationName)
+      throw new ContentError(
+        'INVALID_MIGRATION_NAME',
+        'The migration name must contain letters or numbers.',
+      );
+    const defaultDirectory = destinationProfile?.migrations?.directory
+      ? resolve(
+          dirname(this.datoConfigPath ?? resolve('datocms.config.json')),
+          destinationProfile.migrations.directory,
+        )
+      : resolve('./migrations');
+    const requestedOutput = flags.output
+      ? resolve(flags.output)
+      : defaultDirectory;
+    if (
+      flags.output &&
+      ['.js', '.mjs', '.cjs', '.mts', '.cts'].includes(extname(flags.output))
+    )
+      throw new ContentError(
+        'INVALID_MIGRATION_PATH',
+        'Content migration output must be a .ts file or a directory.',
+      );
+    const outputPath = flags.output?.endsWith('.ts')
+      ? requestedOutput
+      : join(
+          requestedOutput,
+          `${Math.floor(Date.now() / 1000)}_${migrationName}.ts`,
+        );
     try {
       await lstat(outputPath);
       throw new ContentError(
-        'BUNDLE_EXISTS',
-        `Bundle output already exists: ${outputPath}`,
+        'MIGRATION_EXISTS',
+        `Migration output already exists: ${outputPath}`,
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -161,10 +215,20 @@ export default class ContentDiffCommand extends ContentCommand {
     const destinationClient = destination.buildEnvironmentClient(
       destinationEnvironmentId,
     );
-    const [sourceSchema, destinationSchema] = await Promise.all([
+    const [sourceRawSchema, destinationRawSchema] = await Promise.all([
       fetchSchema(sourceClient, sourceEnvironmentId),
       fetchSchema(destinationClient, destinationEnvironmentId),
     ]);
+    const { schema: sourceSchema, tracking: sourceTracking } =
+      prepareMigrationSchema(
+        sourceRawSchema,
+        sourceProfile?.migrations?.modelApiKey,
+      );
+    const { schema: destinationSchema, tracking: destinationTracking } =
+      prepareMigrationSchema(
+        destinationRawSchema,
+        destinationProfile?.migrations?.modelApiKey,
+      );
     if (
       sourceSchema.siteId === destinationSchema.siteId &&
       sourceEnvironmentId === destinationEnvironmentId
@@ -224,6 +288,11 @@ export default class ContentDiffCommand extends ContentCommand {
               ? 'versions'
               : true,
           options: {
+            schemaProjection: (rawSchema) =>
+              projectMigrationSchema(
+                rawSchema,
+                side === 'source' ? sourceTracking : destinationTracking,
+              ),
             signal: captureSignal,
             modelIds: schema.models
               .filter((model) => !model.block)
@@ -301,23 +370,27 @@ export default class ContentDiffCommand extends ContentCommand {
       );
       if (metadata.temporarySchemaChanges.length)
         await assertSchemaEditAccess(destinationClient);
-      this.progress('Writing content bundle and required asset binaries.');
-      const bundlePath = await writeBundle({
+      this.progress(
+        'Writing TypeScript content migration and required asset binaries.',
+      );
+      const scriptPath = await writeMigration({
         signal,
         store,
         metadata,
         outputPath,
+        sourceTracking,
+        destinationTracking,
         chunkBytes: flags['chunk-bytes'],
         concurrency: maximum,
       });
       const result = {
-        bundlePath,
+        scriptPath,
         sourceEnvironmentId,
         destinationEnvironmentId,
         counts: metadata.counts,
       };
       if (!this.jsonEnabled()) {
-        this.log(`Content bundle: ${bundlePath}`);
+        this.log(`TypeScript content migration: ${scriptPath}`);
         for (const kind of ['record', 'upload', 'collection'] as const)
           this.log(
             `${kind}: ${Object.entries(metadata.counts[kind])

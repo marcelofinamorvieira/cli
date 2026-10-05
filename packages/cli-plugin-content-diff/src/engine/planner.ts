@@ -2648,7 +2648,8 @@ export function* collectionTransitionIssues({
     return;
   // Collections allow gaps and duplicate positions. Simulate the executor's
   // exact native shifts and two reconciliation passes instead of assuming a
-  // dense or unique order. A collection CREATE/DELETE does not shift peers.
+  // dense or unique order. Native CREATE appends without shifting peers; the
+  // executor then moves it to the intended index. DELETE does not shift peers.
   store.database.exec(`
       CREATE TEMP TABLE IF NOT EXISTS planner_collection_live(id TEXT PRIMARY KEY,parent_id TEXT,position INTEGER NOT NULL,label TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS planner_collection_live_siblings ON planner_collection_live(parent_id,position,id);
@@ -2751,6 +2752,9 @@ export function* collectionTransitionIssues({
   const write = store.database.prepare(
     'INSERT OR REPLACE INTO planner_collection_live VALUES(?,?,?,?)',
   );
+  const appendPosition = store.database.prepare(
+    'SELECT COALESCE(MAX(position),0)+1 AS position FROM planner_collection_live WHERE parent_id IS ?',
+  );
   const range = store.database.prepare(
     'UPDATE planner_collection_live SET position=position+? WHERE parent_id IS ? AND id<>? AND position BETWEEN ? AND ?',
   );
@@ -2811,6 +2815,18 @@ export function* collectionTransitionIssues({
         message: `Collection ${state.id} requests a sibling label still owned by collection ${duplicate.id} during the planned transition.`,
         dependencyId: String(duplicate.id),
       };
+    if (!previous) {
+      const position = Number(appendPosition.get(state.parentId)?.position);
+      if (!Number.isSafeInteger(position))
+        return {
+          id: state.id,
+          parentId: state.parentId,
+          code: 'COLLECTION_ORDERING_CONFLICT',
+          message: `Collection ${state.id} cannot be appended within the supported integer position range.`,
+        };
+      write.run(state.id, state.parentId, position, state.label);
+      return move(state);
+    }
     if (previous) {
       const position = Number(previous.position);
       if (previous.parent_id === state.parentId)
