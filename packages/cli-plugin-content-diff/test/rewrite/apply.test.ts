@@ -2841,6 +2841,35 @@ describe('apply executor with the SDK resource contract', () => {
     }
   });
 
+  it('reports a fork that DatoCMS removed while creating it as failed', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    const find = mock.root.environments.find.bind(mock.root.environments);
+    const missing = await find('missing-environment').catch(
+      (error: unknown) => error,
+    );
+    Reflect.set(mock.root.environments, 'find', async (id: string) => {
+      if (id === 'destination') return find(id);
+      // The fork's background job failed, and DatoCMS deleted it.
+      if (mock.events.some((event) => event.startsWith('fork:'))) throw missing;
+      return find(id);
+    });
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: defaults,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'FORK_FAILED',
+    );
+    assert(!mock.events.some((event) => /^(create|update):/.test(event)));
+  });
+
   it('accepts a new version with unchanged content and rejects changed content', async () => {
     const otherId = 'dddddddddddddddddddddd';
     for (const content of [false, true]) {
@@ -4036,14 +4065,24 @@ describe('apply executor with the SDK resource contract', () => {
           [],
           async () => new Response(bytes),
         );
+        const logs: string[] = [];
         const execution = applyBundle({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
           bundlePath,
-          options: { ...defaults, inPlace: true },
+          options: {
+            ...defaults,
+            inPlace: true,
+            log: (message) => logs.push(message),
+          },
         });
         if (fail) await assert.rejects(execution, /injected upload failure/);
-        else await execution;
+        else {
+          await execution;
+          // A replaced file makes DatoCMS rewrite its URL in other records'
+          // text without new versions, so the final check rereads in full.
+          assert(logs.includes('Checking capture consistency'));
+        }
       }
       assert.equal(staged.length, 2);
       assert.deepEqual(retained, []);

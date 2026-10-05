@@ -1772,6 +1772,19 @@ async function temporarySchema(
   }
 }
 
+/**
+ * Replacing or renaming an upload makes DatoCMS rewrite its URL inside text
+ * fields of other records in place, without a new record version. Such runs
+ * need a full final reread.
+ */
+function rewritesAssetUrls(context: Context): boolean {
+  return !!context.store.database
+    .prepare(
+      "SELECT 1 FROM plan WHERE kind='upload' AND action='update' AND (json_extract(data,'$.binary') IS NOT NULL OR json_extract(data,'$.desired.url') IS NOT json_extract(data,'$.baseline.url') OR json_extract(data,'$.desired.filename') IS NOT json_extract(data,'$.baseline.filename')) LIMIT 1",
+    )
+    .get();
+}
+
 function captureOptions(context: Context) {
   return {
     modelIds: context.schema.models
@@ -1784,17 +1797,37 @@ function captureOptions(context: Context) {
   };
 }
 
-/** Waits until DatoCMS has finished creating a fork requested without waiting. */
+// A fork whose background job died can stay "creating" indefinitely.
+const FORK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Waits until DatoCMS has finished creating a fork requested without waiting.
+ * DatoCMS deletes a fork that fails, so a missing fork means it failed.
+ */
 async function waitForFork(
   rootClient: Client,
   id: string,
   log?: ApplyOptions['log'],
   signal?: AbortSignal,
+  timeout = FORK_TIMEOUT_MS,
 ) {
+  const deadline = Date.now() + timeout;
   for (let wait = 1000; ; wait = Math.min(wait * 2, 10_000)) {
     assertNotAborted(signal);
-    const fork = await rootClient.environments.find(id);
+    const fork = await findMaybe(() => rootClient.environments.find(id));
+    if (!fork)
+      throw new ContentError(
+        'FORK_FAILED',
+        `DatoCMS could not create fork "${id}" and removed it.`,
+      );
     if (fork.meta.status === 'ready') return fork;
+    if (Date.now() >= deadline)
+      throw new ContentError(
+        'FORK_TIMEOUT',
+        `Fork "${id}" was still being created after ${Math.round(
+          timeout / 60_000,
+        )} minutes.`,
+      );
     if (fork.meta.status !== 'creating')
       throw new ContentError(
         'FORK_VERIFY_FAILED',
@@ -2376,6 +2409,8 @@ export async function applyBundle(args: {
     // This detects observable concurrent edits; it does not make apply atomic.
     // In place, check the written content before arming schedules on it. A
     // fork that fails verification is deleted, so one final check suffices.
+    if (context.verification === 'versions' && rewritesAssetUrls(context))
+      context.verification = 'full';
     if (args.options.inPlace && !context.locked) {
       context.log?.('Verifying final content before restoring schedules.');
       if (context.verification === 'versions')
@@ -2520,9 +2555,21 @@ export async function applyBundle(args: {
       try {
         // A fork requested without waiting may still be copying; it can only
         // be deleted once DatoCMS has finished creating it.
-        await waitForFork(args.rootClient, ownedFork, args.options.log).catch(
-          () => undefined,
+        const settled = await waitForFork(
+          args.rootClient,
+          ownedFork,
+          args.options.log,
+          undefined,
+          30 * 60 * 1000,
+        ).catch((error: unknown) =>
+          error instanceof ContentError && error.code === 'FORK_TIMEOUT'
+            ? error
+            : undefined,
         );
+        if (settled instanceof ContentError)
+          throw new Error(
+            'the fork was still being created; delete it once DatoCMS finishes',
+          );
         const fork = await findMaybe(() =>
           args.rootClient.environments.find(ownedFork!),
         );

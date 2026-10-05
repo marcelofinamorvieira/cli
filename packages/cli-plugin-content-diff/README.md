@@ -69,7 +69,7 @@ Apply verifies the manifest, JSONL chunks, asset binaries, destination project b
 | `--keep-failed-fork` | Keep a fork created by this run if execution fails. |
 | `--schedule-window=120` | Refuse to start when any schedule falls due within this many minutes; `0` disables the check. |
 | `--repair` | Restore what an interrupted in-place apply left behind, instead of applying. See below. |
-| `--fast-fork` | Create the fork with DatoCMS's fast fork, which is much quicker but blocks writes to the destination while it copies, and may be refused while someone is editing. |
+| `--fast-fork` | Create the fork with DatoCMS's fast fork, which is much quicker but makes the destination read-only while it copies: editors and API clients get `ENVIRONMENT_IN_READ_ONLY_MODE`, and a scheduled publication that falls due meanwhile is skipped. It is refused while someone has a record open for editing. |
 | `--verification=versions` | How the fork baseline, consistency and final checks read records; see [Verification](#verification). |
 | `--allow-temporary-schema-changes` | Permit the exact temporary validator/default changes recorded in the bundle. |
 | `--concurrency=8` | Bound independent requests to a value from 1 to 16. Dependent writes retain their required order. |
@@ -83,6 +83,8 @@ DatoCMS provides no public persistent sandbox write freeze. Maintenance mode app
 ### Verification
 
 Every check compares the full content of records that are created, changed or deleted. For all other records, `--verification=versions` (the default) relies on DatoCMS versions: every save creates a new record version, and every publication change moves the published version's update time. A record whose version is unchanged is therefore not read again; a record whose version changed is read in full and compared, so a new version without new content still passes. This applies to the consistency check after a capture, to the fork baseline (forks keep record versions), and to apply's final verification. `--verification=full` rereads every record in each check instead, which takes as long as a full capture each time.
+
+A few DatoCMS operations change records in place without a new version: deleting or unpublishing a record that others link to removes those links, renaming or replacing an upload rewrites its URL in text fields, and schema changes migrate stored values. Schema changes are caught by comparing the schema before and after, and removed links leave references that generation refuses. When a bundle replaces or renames uploads, apply's final check rereads every record. An upload renamed by someone else while a capture runs can still go unnoticed with `--verification=versions`, which is one more reason to run with competing writes stopped; use `--verification=full` when that is not possible.
 
 ## Bundle format and lifecycle
 
@@ -103,6 +105,7 @@ Both commands support `--json` and the standard CLI logging flags. Authenticatio
 - References stored inside JSON or text fields, such as IDs saved by plugin field editors or asset URLs in Markdown, are not tracked as dependencies. `--uploads=referenced` does not bundle the assets they point to, and `--include-deletions` can delete records they point to.
 - Apply refuses to start when a schedule falls due within `--schedule-window` minutes (120 by default), so a busy editorial project may need to pick a quiet slot or a smaller window. Records the bundle writes have their schedules cancelled for the duration of the writes.
 - Apply never promotes the fork, and edits made in the destination after the fork was created are not in it.
+- A fork carries its own copy of every scheduled publication and unpublishing, and DatoCMS runs them in every environment. An unpromoted fork therefore publishes on schedule by itself, and each scheduled publication, in any environment, fires the project's build triggers. After a promotion, the previous primary's schedules keep running too.
 - Apply's writes are ordinary content edits, so they trigger the webhooks configured for those events in the environment being written, and a large bundle can send many events.
 - Working data lives in a `content-diff-*` directory inside the operating system's temporary directory (`TMPDIR` on macOS and Linux) and can be large: roughly a copy of the content of both environments, plus a staged copy of each asset file while apply uploads it.
 
