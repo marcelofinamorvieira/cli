@@ -1106,7 +1106,9 @@ class Planning {
     fields: JsonObject,
     slice: 'current' | 'published',
   ): void {
-    const known = new Set([
+    // Rules checked locally; their actual failures are relaxed narrowly by the
+    // proven-failure pass in basicSafety.
+    const checked = new Set([
       'required',
       'length',
       'size',
@@ -1114,23 +1116,45 @@ class Planning {
       'enum',
       'unique',
     ]);
-    for (const value of aggregateFields(
-      fields,
-      this.models.get(plan.modelId)!,
-      this.target,
-    )) {
-      if (Object.keys(value.field.validators).some((key) => !known.has(key)))
-        this.unsafe(
-          'record',
-          plan.id,
-          'UNPROVEN_VALIDATION_FAILURE',
-          `Record ${plan.id} has a reported invalid ${slice} slice with unsupported validators; exact executable validator changes cannot be proven locally.`,
-        );
-    }
+    // Allowed-model rules on link and block fields. DatoCMS requires them, so
+    // they cannot be removed, and they are almost never why a record is
+    // invalid; if one is, the write fails during apply.
+    const required = new Set([
+      'item_item_type',
+      'items_item_type',
+      'rich_text_blocks',
+      'single_block_blocks',
+      'structured_text_blocks',
+      'structured_text_links',
+    ]);
+    const aggregate = [
+      ...aggregateFields(fields, this.models.get(plan.modelId)!, this.target),
+    ];
+    if (
+      !aggregate.some(({ field }) =>
+        Object.keys(field.validators).some(
+          (key) => !checked.has(key) && !required.has(key),
+        ),
+      )
+    )
+      return;
+    // DatoCMS reports this version invalid, and some of its rules cannot be
+    // checked here. Recreate it the way it came to exist: lift the rules on
+    // the fields it uses for the write, then restore them. Unique stays, as
+    // restoring it can be refused and its transitions are planned separately.
+    for (const { field } of aggregate)
+      for (const validator of Object.keys(field.validators))
+        if (validator !== 'unique' && !required.has(validator))
+          this.relaxation(
+            plan.id,
+            field.id,
+            validator,
+            `Record ${plan.id} has an invalid ${slice} version whose failing rule cannot be identified locally, so the rules on its fields are lifted while it is written.`,
+          );
     // Flags are asynchronously computed CMA metadata, not transplantable
-    // content. A stale false flag with no actual proven failures is not an
-    // instruction to make the new version invalid. The common all-slice pass
-    // diagnoses and narrowly relaxes its actual known value failures.
+    // content. A stale false flag with only checked rules is not an
+    // instruction to make the new version invalid; the proven-failure pass
+    // relaxes exactly what fails.
   }
 
   dependencies(): void {

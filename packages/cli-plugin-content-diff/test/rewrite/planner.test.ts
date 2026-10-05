@@ -1462,6 +1462,142 @@ describe('indexed rewrite planner', () => {
     );
   });
 
+  it('relaxes only the failing rule of an invalid record with link fields', async () => {
+    const state = schema([
+      model({
+        fields: [
+          field({ validators: { required: {} } }),
+          field({
+            id: LINK,
+            apiKey: 'author',
+            type: 'link',
+            validators: { item_item_type: { item_types: [MODEL] } },
+          }),
+        ],
+      }),
+    ]);
+    const author = record(
+      B,
+      { title: 'author', author: null },
+      {
+        published: { title: 'author', author: null },
+        validity: { current: true, published: true },
+      },
+    );
+    const invalid = record(
+      A,
+      { title: null, author: B },
+      {
+        published: { title: null, author: B },
+        validity: { current: false, published: false },
+      },
+    );
+    await assert.rejects(
+      fixture([invalid, author], [author], state, options()),
+      (error: unknown) =>
+        unsafe(error) &&
+        (error as ContentError).details?.reason ===
+          'TEMPORARY_SCHEMA_CHANGE_REQUIRED',
+    );
+    await fixture(
+      [invalid, author],
+      [author],
+      state,
+      options({ allowTemporarySchemaChanges: true }),
+      (_store, metadata) => {
+        assert.equal(metadata.counts.record.create, 1);
+        assert.deepEqual(
+          metadata.temporarySchemaChanges.map((change) => [
+            change.fieldId,
+            change.temporary.validators,
+          ]),
+          [[TITLE, {}]],
+        );
+      },
+    );
+  });
+
+  it('lifts every removable rule when an invalid record has rules it cannot check', async () => {
+    const EMAIL = id('email');
+    const state = schema([
+      model({
+        fields: [
+          field({ validators: { required: {}, unique: {} } }),
+          field({
+            id: EMAIL,
+            apiKey: 'email',
+            validators: { format: { predefined_pattern: 'email' } },
+          }),
+          field({
+            id: LINK,
+            apiKey: 'author',
+            type: 'link',
+            validators: {
+              required: {},
+              item_item_type: { item_types: [MODEL] },
+            },
+          }),
+        ],
+      }),
+    ]);
+    const authorFields = { title: 'author', email: null, author: B };
+    const author = record(B, authorFields, {
+      published: authorFields,
+      validity: { current: true, published: true },
+    });
+    const fields = { title: 'a', email: 'not an email', author: B };
+    const invalid = record(A, fields, {
+      published: fields,
+      validity: { current: false, published: false },
+    });
+    await assert.rejects(
+      fixture([invalid, author], [author], state, options()),
+      (error: unknown) =>
+        unsafe(error) &&
+        (error as ContentError).details?.reason ===
+          'TEMPORARY_SCHEMA_CHANGE_REQUIRED',
+    );
+    await fixture(
+      [invalid, author],
+      [author],
+      state,
+      options({ allowTemporarySchemaChanges: true }),
+      (_store, metadata) => {
+        assert.equal(metadata.counts.record.create, 1);
+        // Unique and the allowed-model rule stay; everything else is lifted.
+        assert.deepEqual(
+          metadata.temporarySchemaChanges.map((change) => [
+            change.fieldId,
+            change.temporary.validators,
+          ]),
+          [
+            [TITLE, { unique: {} }],
+            [EMAIL, {}],
+            [LINK, { item_item_type: { item_types: [MODEL] } }],
+          ].sort(([left], [right]) => (String(left) < String(right) ? -1 : 1)),
+        );
+      },
+    );
+  });
+
+  it('ignores a stale invalid flag when every rule is checked and passes', async () => {
+    const state = schema([
+      model({ fields: [field({ validators: { required: {} } })] }),
+    ]);
+    const stale = record(
+      A,
+      { title: 'present' },
+      {
+        published: { title: 'present' },
+        validity: { current: false, published: false },
+      },
+    );
+    await fixture([stale], [], state, options(), (_store, metadata) => {
+      assert.equal(metadata.counts.record.create, 1);
+      assert.deepEqual(metadata.temporarySchemaChanges, []);
+    });
+  });
+
   it('publishes link cycles among new records in two steps', async () => {
     const state = schema([
       model({ fields: [field({ id: LINK, apiKey: 'link', type: 'link' })] }),
