@@ -83,6 +83,10 @@ function model(
     fields,
   };
 }
+/** A model with a block field, so capture reads it in nested 30-record pages. */
+function pagedModel(): ModelSchema {
+  return model(MODEL, [field('title'), field('blocks', 'rich_text')]);
+}
 function state(models = [model()]): SchemaState {
   return {
     siteId: 'site',
@@ -699,20 +703,29 @@ describe('expanded capture and native payload codec', () => {
   it('captures 30-record nested pages with backpressure and the complete unselected namespace', async () => {
     const other = model(identity('other'));
     const records = Array.from({ length: 125 }, (_, index) =>
-      rawRecord(identity(`r${index}`), { title: `record ${index}` }),
+      rawRecord(identity(`r${index}`), {
+        title: `record ${index}`,
+        blocks: [],
+      }),
     );
     records.push(
       rawRecord(identity('outside'), { title: 'outside' }, false, other.id),
     );
-    const fixture = mockClient([model(), other], records);
+    const fixture = mockClient([pagedModel(), other], records);
     const original = fixture.mock.items.rawList;
     let active = 0;
     let maximum = 0;
     fixture.mock.items.rawList = async (args) => {
       active++;
       maximum = Math.max(maximum, active);
-      assert.equal(args.nested, true);
-      assert.equal(args.page.limit, 30);
+      // Only models with block fields need expanded 30-record pages.
+      if (args.filter.type === MODEL) {
+        assert.equal(args.nested, true);
+        assert.equal(args.page.limit, 30);
+      } else {
+        assert.equal(args.nested, false);
+        assert.equal(args.page.limit, 500);
+      }
       try {
         await new Promise<void>((resolve) => setImmediate(resolve));
         return await original(args);
@@ -1059,11 +1072,11 @@ describe('expanded capture and native payload codec', () => {
       const records = Array.from({ length: 31 }, (_, index) =>
         rawRecord(
           identity(`r${index}`),
-          { title: 'record' },
+          { title: 'record', blocks: [] },
           scenario === 'publication',
         ),
       );
-      const fixture = mockClient([model()], records);
+      const fixture = mockClient([pagedModel()], records);
       const original = fixture.mock.items.rawList;
       fixture.mock.items.rawList = async (args) => {
         const body = await original(args);
@@ -1148,7 +1161,7 @@ describe('expanded capture and native payload codec', () => {
     }
   });
 
-  it('rolls back a bounded record batch when a nested dependency cannot be indexed', async () => {
+  it('stores captured records without building the indexes the planner rebuilds', async () => {
     const models = [
       model(MODEL, [field('blocks', 'rich_text')]),
       model(BLOCK, [field('related', 'link')], true),
@@ -1167,27 +1180,19 @@ describe('expanded capture and native payload codec', () => {
     const fixture = mockClient(models, records);
     const store = new SnapshotStore();
     try {
-      // Failure after the record and reference writes must not leave a partial
-      // record or dependency index in the temporary snapshot.
-      store.database.exec(`
-        CREATE TRIGGER reject_block_owner BEFORE INSERT ON block_owners
-        BEGIN SELECT RAISE(ABORT, 'block index unavailable'); END;
-      `);
       const schema = await fetchSchema(fixture.client, 'source');
-      await assert.rejects(
-        captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          options: { modelIds: [MODEL], uploads: 'all' },
-          verify: false,
-        }),
-        /block index unavailable/,
-      );
-      assert.equal([...store.records('source')].length, 0);
+      await captureSnapshot({
+        client: fixture.client,
+        environmentId: 'source',
+        schema,
+        store,
+        side: 'source',
+        options: { modelIds: [MODEL], uploads: 'all' },
+        verify: false,
+      });
+      assert.equal([...store.records('source')].length, 31);
       assert.equal([...store.references('source')].length, 0);
+      assert.equal([...store.blockOwners('source')].length, 0);
       assert.equal(
         store.database
           .prepare('SELECT COUNT(*) AS count FROM capture_raw')
@@ -1201,9 +1206,9 @@ describe('expanded capture and native payload codec', () => {
 
   it('drains active capture pages on cancellation without starting queued requests', async () => {
     const fixture = mockClient(
-      [model()],
+      [pagedModel()],
       Array.from({ length: 125 }, (_, index) =>
-        rawRecord(identity(`abort-${index}`)),
+        rawRecord(identity(`abort-${index}`), { title: 'record', blocks: [] }),
       ),
     );
     const controller = new AbortController();
@@ -1411,6 +1416,54 @@ describe('expanded capture and native payload codec', () => {
       readRecordBatch(fixture.client, [RECORD], schema),
       errorCode('INVALID_RESPONSE'),
     );
+  });
+
+  it('checks consistency by version, rereading only records with a new version', async () => {
+    for (const edit of ['none', 'version', 'content'] as const) {
+      const records = Array.from({ length: 3 }, (_, index) =>
+        rawRecord(identity(`v${index}`), { title: `record ${index}` }),
+      );
+      const fixture = mockClient([model()], records);
+      const original = fixture.mock.items.rawList;
+      let calls = 0;
+      let focused = 0;
+      fixture.mock.items.rawList = async (args) => {
+        if (args.filter.ids) focused++;
+        // The record is saved after the first pass read it, before the
+        // version listing that follows: a new version, and maybe new content.
+        else if (
+          args.filter.type === MODEL &&
+          ++calls === 3 &&
+          edit !== 'none'
+        ) {
+          const meta = records[0].meta as Record<string, unknown>;
+          meta.current_version = 'v2';
+          if (edit === 'content')
+            (records[0].attributes as JsonObject).title = 'edited';
+        }
+        return original(args);
+      };
+      const store = new SnapshotStore();
+      try {
+        const schema = await fetchSchema(fixture.client, 'source');
+        const capture = captureSnapshot({
+          client: fixture.client,
+          environmentId: 'source',
+          schema,
+          store,
+          side: 'source',
+          options: { modelIds: [MODEL], uploads: 'referenced' },
+          verify: 'versions',
+        });
+        if (edit === 'content')
+          await assert.rejects(capture, errorCode('CAPTURE_DRIFT'));
+        else await capture;
+        // Only the record with a new version is read again in full.
+        assert.equal(focused, edit === 'none' ? 0 : 2);
+      } finally {
+        store.dispose();
+      }
+    }
   });
 
   it('reads schedule details for a whole capture concurrently, not per 30-record batch', async () => {

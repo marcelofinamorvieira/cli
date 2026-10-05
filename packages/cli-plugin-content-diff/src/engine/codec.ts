@@ -403,6 +403,89 @@ export function recordGuard(record: RecordState): RecordGuard {
   };
 }
 
+/**
+ * Version metadata that identifies a record's content without reading it:
+ * every CMA edit creates a new current version, and every publication change
+ * moves the published version's update time. Schedules are compared by time,
+ * which is all a plain listing exposes.
+ */
+function versionFingerprint(fields: {
+  modelId: string;
+  currentVersion: string | null;
+  publishedUpdatedAt: string | null;
+  published: boolean;
+  createdAt: string;
+  firstPublishedAt: string | null;
+  parentId: string | null;
+  position: number | null;
+  stage: string | null;
+  publicationAt: string | null;
+  unpublishingAt: string | null;
+}): string {
+  return hashJson(fields);
+}
+
+/** The version fingerprint of a fully read record. */
+export function stateFingerprint(record: RecordState): string {
+  return versionFingerprint({
+    modelId: record.modelId,
+    currentVersion: record.currentVersion,
+    publishedUpdatedAt: record.publishedUpdatedAt,
+    published: record.published !== null,
+    createdAt: record.createdAt,
+    firstPublishedAt: record.firstPublishedAt,
+    parentId: record.parentId,
+    position: record.position,
+    stage: record.stage,
+    publicationAt: record.schedules.publication?.at ?? null,
+    unpublishingAt: record.schedules.unpublishing?.at ?? null,
+  });
+}
+
+/**
+ * The version fingerprint of a record from a plain listing of its current
+ * version and, when published, its published version. Values are normalized
+ * exactly as canonicalRecord and the schedule reader normalize them.
+ */
+export function listingFingerprint(
+  current: unknown,
+  published: unknown | null,
+): string {
+  if (!object(current) || !object(current.meta))
+    throw new ContentError('INVALID_RESPONSE', 'Record has no metadata.');
+  const meta = current.meta;
+  const attributes = object(current.attributes) ? current.attributes : current;
+  const pub = published === null ? null : jsonObject(published);
+  const scheduled = (value: unknown, label: string) =>
+    value === null || value === undefined ? null : timestamp(value, label);
+  return versionFingerprint({
+    modelId: blockModelId(current),
+    currentVersion: nullableString(meta.current_version),
+    publishedUpdatedAt:
+      pub && object(pub.meta) ? nullableString(pub.meta.updated_at) : null,
+    published: pub !== null,
+    createdAt: timestamp(meta.created_at, 'creation timestamp'),
+    firstPublishedAt: scheduled(
+      meta.first_published_at,
+      'first publication timestamp',
+    ),
+    parentId: nullableString(attributes.parent_id),
+    position:
+      typeof attributes.position === 'number'
+        ? Number(attributes.position)
+        : null,
+    stage: nullableString(meta.stage),
+    publicationAt: scheduled(
+      meta.publication_scheduled_at,
+      'publication marker',
+    ),
+    unpublishingAt: scheduled(
+      meta.unpublishing_scheduled_at,
+      'unpublishing marker',
+    ),
+  });
+}
+
 export function canonicalRecord(
   current: unknown,
   published: unknown | null,

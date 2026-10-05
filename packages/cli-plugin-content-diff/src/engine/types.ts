@@ -237,6 +237,13 @@ export interface ApplyOptions {
   concurrency?: number;
   /** Refuse to start when a schedule falls due within this many minutes. */
   scheduleWindowMinutes?: number;
+  /** Use DatoCMS's fast fork, which blocks destination writes while it copies. */
+  fastFork?: boolean;
+  /**
+   * 'versions' (the default) skips rereading records whose version did not
+   * change; 'full' rereads every record in each check.
+   */
+  verification?: 'versions' | 'full';
   log?: (message: string) => void;
 }
 export interface RepairOptions {

@@ -303,6 +303,20 @@ function plan(
   };
 }
 
+/**
+ * Nothing was written. A fork requested at the start of the run, so that it
+ * copies while the destination is checked, must have been removed again.
+ */
+function assertNothingWritten(events: string[]): void {
+  const forks = events
+    .filter((event) => event.startsWith('fork:'))
+    .map((event) => event.slice('fork:'.length));
+  assert.deepEqual(
+    events,
+    forks.flatMap((id) => [`fork:${id}`, `delete-fork:${id}`]),
+  );
+}
+
 function sdk(initial: RecordState[] = []) {
   const events: string[] = [];
   const focusedReads: string[][] = [];
@@ -495,7 +509,11 @@ function sdk(initial: RecordState[] = []) {
                 ? record.published.title !== ''
                 : null;
               if (changePreservedContent && record.id !== recordId) {
+                // Every content edit in DatoCMS creates a new version.
                 record.current.title = 'concurrent content edit';
+                record.currentVersion = String(
+                  Number(record.currentVersion) + 1,
+                );
                 record.hash = recordHash(record);
               }
             }
@@ -1442,7 +1460,7 @@ describe('apply executor with the SDK resource contract', () => {
       });
       if (drift) {
         await assert.rejects(execution, /bundled baseline/);
-        assert.deepEqual(mock.events, []);
+        assertNothingWritten(mock.events);
       } else {
         const result = await execution;
         assert.deepEqual(
@@ -1651,7 +1669,7 @@ describe('apply executor with the SDK resource contract', () => {
     assert.deepEqual(collections.filteredReads, []);
   });
 
-  it('rejects imported final and transient collection label conflicts before a fork or write', async () => {
+  it('rejects imported final and transient collection label conflicts before any write', async () => {
     for (const outcome of [
       'create-conflict',
       'transient-conflict',
@@ -1727,7 +1745,7 @@ describe('apply executor with the SDK resource contract', () => {
             error instanceof ContentError &&
             error.code === 'COLLECTION_LABEL_CONFLICT',
         );
-        assert.deepEqual(mock.events, []);
+        assertNothingWritten(mock.events);
       }
     }
   });
@@ -1752,7 +1770,7 @@ describe('apply executor with the SDK resource contract', () => {
         error instanceof ContentError &&
         error.code === 'COLLECTION_ORDERING_CONFLICT',
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('rejects imported missing, deleted and cyclic collection parents before any writes', async () => {
@@ -1789,7 +1807,7 @@ describe('apply executor with the SDK resource contract', () => {
         (error) =>
           error instanceof ContentError && error.code.startsWith('COLLECTION_'),
       );
-      assert.deepEqual(mock.events, []);
+      assertNothingWritten(mock.events);
     }
   });
 
@@ -2412,7 +2430,8 @@ describe('apply executor with the SDK resource contract', () => {
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
         bundlePath,
-        options: defaults,
+        // The full mode reruns the preflight on the fork as well.
+        options: { ...defaults, verification: 'full' },
       });
       assert(
         observed.length >= 5,
@@ -2559,7 +2578,7 @@ describe('apply executor with the SDK resource contract', () => {
       (error: unknown) =>
         error instanceof ContentError && error.code === 'INTERRUPTED',
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('removes a fork whose submitted creation finishes after interruption', async () => {
@@ -2718,23 +2737,143 @@ describe('apply executor with the SDK resource contract', () => {
         },
       },
     );
-    const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
-    const logs: string[] = [];
-    await applyBundle({
-      rootClient: mock.root,
-      buildEnvironmentClient: mock.client,
-      bundlePath,
-      options: { ...defaults, log: (message) => logs.push(message) },
-    });
-    // Was 30 reads and 3 double-checked captures: the second write pass, the
-    // repeated guards and the fork baseline's second read are gone.
-    assert.equal(mock.focusedReads.length, 18);
-    assert.equal(
-      logs.filter((message) => message === 'Checking capture consistency')
-        .length,
-      2,
-    );
+    for (const verification of ['versions', 'full'] as const) {
+      const runDirectory = join(directory, verification);
+      mkdirSync(runDirectory);
+      const mock = sdk([baseline]);
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, desired),
+      ]);
+      const logs: string[] = [];
+      await applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: {
+          ...defaults,
+          verification,
+          log: (message) => logs.push(message),
+        },
+      });
+      const count = (message: string) =>
+        logs.filter((logged) => logged === message).length;
+      if (verification === 'versions') {
+        // One full read of the destination; the consistency check, the fork
+        // baseline and the final check list versions instead, and only the
+        // written record is read again in full.
+        assert.equal(count('Reading page (current)'), 1);
+        assert.equal(count('Listing page versions (current)'), 3);
+        assert.equal(mock.focusedReads.length, 20);
+      } else {
+        // Was 30 focused reads and 3 double reads: the second write pass, the
+        // repeated guards and the fork baseline's second read are gone.
+        assert.equal(count('Reading page (current)'), 5);
+        assert.equal(count('Checking capture consistency'), 2);
+        assert.equal(mock.focusedReads.length, 18);
+      }
+    }
+  });
+
+  it('starts the fork before checking the destination and waits until it is ready', async () => {
+    for (const fastFork of [false, true]) {
+      const runDirectory = join(directory, String(fastFork));
+      mkdirSync(runDirectory);
+      const baseline = state({ title: 'old' });
+      const mock = sdk([baseline]);
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, state({ title: 'new' })),
+      ]);
+      const order: string[] = [];
+      const fork = mock.root.environments.fork.bind(mock.root.environments);
+      const find = mock.root.environments.find.bind(mock.root.environments);
+      let checks = 0;
+      Reflect.set(
+        mock.root.environments,
+        'fork',
+        async (id: string, body: { id: string }, query: JsonObject) => {
+          order.push('fork');
+          assert.deepEqual(
+            query,
+            fastFork
+              ? { immediate_return: true, fast: true }
+              : { immediate_return: true },
+          );
+          return fork(id, body);
+        },
+      );
+      // DatoCMS reports the fork as creating for a while.
+      Reflect.set(mock.root.environments, 'find', async (id: string) => {
+        const environment = await find(id);
+        if (id === 'destination') return environment;
+        return ++checks < 2
+          ? {
+              ...environment,
+              meta: {
+                ...environment.meta,
+                status: 'creating',
+                fork_completion_percentage: 50,
+              },
+            }
+          : environment;
+      });
+      const logs: string[] = [];
+      const result = await applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: {
+          ...defaults,
+          fastFork,
+          log: (message) => {
+            logs.push(message);
+            if (message.startsWith('Verifying destination baseline'))
+              order.push('destination check');
+          },
+        },
+      });
+      assert.deepEqual(order, ['fork', 'destination check']);
+      assert(logs.some((message) => message.includes('(50%)')));
+      assert.equal(
+        mock.environments.get(result.environmentId)!.get(recordId)!.current
+          .title,
+        'new',
+      );
+    }
+  });
+
+  it('accepts a new version with unchanged content and rejects changed content', async () => {
+    const otherId = 'dddddddddddddddddddddd';
+    for (const content of [false, true]) {
+      const runDirectory = join(directory, String(content));
+      mkdirSync(runDirectory);
+      const baseline = state({ title: 'old' });
+      const untouched = state({ title: 'untouched' }, { id: otherId });
+      const mock = sdk([baseline, untouched]);
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, state({ title: 'new' })),
+        { ...plan(untouched, untouched), action: 'noop' as const },
+      ]);
+      // Something saves the untouched record during the run: a new version,
+      // with or without new content.
+      mock.afterNextUpdate(() => {
+        for (const records of mock.environments.values()) {
+          const record = records.get(otherId);
+          if (!record) continue;
+          if (content) record.current.title = 'edited elsewhere';
+          record.currentVersion = String(Number(record.currentVersion) + 1);
+          record.hash = recordHash(record);
+        }
+      });
+      const run = applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: defaults,
+      });
+      if (content)
+        await assert.rejects(run, /final state differs|namespace changed/);
+      else await run;
+    }
   });
 
   it('skips other-writer checks while the written environment is locked', async () => {
@@ -2815,7 +2954,7 @@ describe('apply executor with the SDK resource contract', () => {
         error.code === 'SCHEDULE_DUE_DURING_APPLY' &&
         error.details?.recordId === otherId,
     );
-    assert.equal(mock.events.length, 0);
+    assertNothingWritten(mock.events);
     // With the window disabled the run proceeds, and the unchanged record's
     // schedule is neither cancelled nor recreated.
     const result = await applyBundle({
@@ -2856,11 +2995,12 @@ describe('apply executor with the SDK resource contract', () => {
         inPlace,
       );
       assert(logs.includes('Verifying final content and schedules.'));
-      // Destination and final checks read twice; the fork baseline once.
+      // The destination is read in full once; every later check lists
+      // versions: twice in place (before and after schedules), and for the
+      // fork baseline and the final check in fork mode.
       assert.equal(
-        logs.filter((message) => message === 'Checking capture consistency')
-          .length,
-        inPlace ? 3 : 2,
+        logs.filter((message) => message === 'Reading page (current)').length,
+        1,
       );
     }
   });
@@ -2993,10 +3133,10 @@ describe('apply executor with the SDK resource contract', () => {
       }),
       /project or schema/,
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
-  it('rejects stale full-content baselines before creating a fork', async () => {
+  it('rejects stale full-content baselines before any content write', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
     const bundlePath = await bundle(directory, mock, [
@@ -3014,7 +3154,7 @@ describe('apply executor with the SDK resource contract', () => {
       }),
       /bundled baseline/,
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('requires explicit primary authorization for in-place mutation', async () => {
@@ -3033,7 +3173,7 @@ describe('apply executor with the SDK resource contract', () => {
       }),
       /allow-primary/,
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('rejects a destination that is read-only or not ready before any mutation', async () => {
@@ -3066,7 +3206,7 @@ describe('apply executor with the SDK resource contract', () => {
           error instanceof ContentError &&
           error.code === 'DESTINATION_UNAVAILABLE',
       );
-      assert.deepEqual(mock.events, []);
+      assertNothingWritten(mock.events);
     }
   });
 
@@ -3099,7 +3239,7 @@ describe('apply executor with the SDK resource contract', () => {
         error instanceof ContentError &&
         error.code === 'TEMPORARY_SCHEMA_CHANGES_REQUIRED',
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
     assert.deepEqual(mock.fieldStates.get('destination'), change.original);
   });
 
@@ -3123,7 +3263,7 @@ describe('apply executor with the SDK resource contract', () => {
       (error: unknown) =>
         error instanceof ContentError && error.code === 'DESTINATION_MISMATCH',
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('rejects and removes a fork whose schema or content differs from the verified destination', async () => {
@@ -3250,7 +3390,7 @@ describe('apply executor with the SDK resource contract', () => {
       }),
       /no longer in the future/,
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('cancels managed schedules before writes and restores exact requested dates and scopes', async () => {
@@ -4044,7 +4184,7 @@ describe('apply executor with the SDK resource contract', () => {
     assert.equal(written.get(q.id)!.position, 1);
   });
 
-  it('rejects a newly added destination identity before any fork', async () => {
+  it('rejects a newly added destination identity before any content write', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
     const bundlePath = await bundle(directory, mock, [
@@ -4068,7 +4208,7 @@ describe('apply executor with the SDK resource contract', () => {
       }),
       /gained an identity/,
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('rejects imported writes that need an existing published-only block ID before any mutation', async () => {
@@ -4117,7 +4257,7 @@ describe('apply executor with the SDK resource contract', () => {
           error instanceof ContentError &&
           /block.*current|published.only/i.test(error.message),
       );
-      assert.deepEqual(mock.events, []);
+      assertNothingWritten(mock.events);
     }
   });
 
@@ -4274,7 +4414,7 @@ describe('apply executor with the SDK resource contract', () => {
     );
   });
 
-  it('rejects imported unsafe INTEGER payloads before a fork or content write', async () => {
+  it('rejects imported unsafe INTEGER payloads before any content write', async () => {
     for (const slice of ['current', 'published']) {
       const runDirectory = join(directory, slice);
       mkdirSync(runDirectory);
@@ -4312,7 +4452,7 @@ describe('apply executor with the SDK resource contract', () => {
           error instanceof ContentError &&
           error.code === 'UNSUPPORTED_INTEGER_PRECISION',
       );
-      assert.deepEqual(mock.events, []);
+      assertNothingWritten(mock.events);
     }
   });
 
@@ -4333,7 +4473,7 @@ describe('apply executor with the SDK resource contract', () => {
       }),
       /undeferred field/,
     );
-    assert.deepEqual(mock.events, []);
+    assertNothingWritten(mock.events);
   });
 
   it('rejects SDK-lossy imported record payloads while permitting preservation-only records', async () => {

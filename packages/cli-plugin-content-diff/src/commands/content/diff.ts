@@ -90,9 +90,15 @@ export default class ContentDiffCommand extends ContentCommand {
       description: 'Plan supported temporary validator and default changes',
       default: false,
     }),
+    verification: oclif.Flags.custom<'versions' | 'full'>({
+      description:
+        'Skip rereading records whose version did not change ("versions"), or reread every record in each check ("full")',
+      options: ['versions', 'full'],
+      default: 'versions',
+    })(),
     concurrency: oclif.Flags.integer({
       description: 'Maximum concurrent independent requests (1–16)',
-      default: 4,
+      default: 8,
     }),
     'chunk-bytes': oclif.Flags.integer({
       description: 'Target JSONL chunk size; a single entry is never split',
@@ -212,7 +218,11 @@ export default class ContentDiffCommand extends ContentCommand {
           store: target,
           side,
           // A locked environment cannot change while it is read.
-          verify: !locked,
+          verify: locked
+            ? false
+            : flags.verification === 'versions'
+              ? 'versions'
+              : true,
           options: {
             signal: captureSignal,
             modelIds: schema.models
@@ -298,6 +308,7 @@ export default class ContentDiffCommand extends ContentCommand {
         metadata,
         outputPath,
         chunkBytes: flags['chunk-bytes'],
+        concurrency: maximum,
       });
       const result = {
         bundlePath,

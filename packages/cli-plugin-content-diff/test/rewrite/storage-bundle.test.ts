@@ -1137,7 +1137,9 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
       outputPath: output,
       signal: controller.signal,
       fetchFn: (async (_url, init) => {
-        assert.equal(init?.signal, controller.signal);
+        // The request signal combines the caller's with the idle timeout.
+        assert.ok(init?.signal instanceof AbortSignal);
+        assert.equal(init.signal.aborted, false);
         ready();
         return new Promise<Response>((_resolve, reject) => {
           init!.signal!.addEventListener(
@@ -1269,6 +1271,72 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
     const saved = imported.getPlan('upload', 'one')!;
     assert(saved.kind === 'upload' && saved.binary);
     assert.deepEqual(await readFile(join(output, saved.binary.file)), bytes);
+  });
+
+  it('downloads asset files concurrently and writes the plan in order', async () => {
+    const source = store();
+    const entries = ['a', 'b', 'c'].map((id) =>
+      uploadCreate(id, Buffer.from(`asset ${id}`)),
+    );
+    for (const entry of entries) source.putPlan(entry);
+    let active = 0;
+    let maximum = 0;
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata(entries),
+      outputPath: join(directory, 'bundle'),
+      concurrency: 2,
+      fetchFn: (async (url: URL) => {
+        active++;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        active--;
+        return new Response(Buffer.from(`asset ${url.pathname.slice(1)}`));
+      }) as typeof fetch,
+    });
+    assert.equal(maximum, 2);
+    const imported = store();
+    await readBundle({ directory: output, store: imported });
+    for (const id of ['a', 'b', 'c']) {
+      const saved = imported.getPlan('upload', id)!;
+      assert(saved.kind === 'upload' && saved.binary);
+      assert.deepEqual(
+        await readFile(join(output, saved.binary.file)),
+        Buffer.from(`asset ${id}`),
+      );
+    }
+  });
+
+  it('retries an asset download that stalls without sending bytes', async () => {
+    const source = store();
+    const bytes = Buffer.from('stalled asset');
+    const entry = uploadCreate('one', bytes);
+    source.putPlan(entry);
+    let requests = 0;
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata([entry]),
+      outputPath: join(directory, 'bundle'),
+      idleTimeout: 20,
+      retryWait: async () => undefined,
+      fetchFn: (async (_url: URL, init?: RequestInit) => {
+        if (++requests === 1)
+          // Never answers; only the idle timeout ends this request.
+          return new Promise<Response>((_resolve, reject) => {
+            init!.signal!.addEventListener(
+              'abort',
+              () => reject(new Error('stalled')),
+              { once: true },
+            );
+          });
+        return new Response(bytes);
+      }) as typeof fetch,
+    });
+    assert.equal(requests, 2);
+    const imported = store();
+    await readBundle({ directory: output, store: imported });
+    const saved = imported.getPlan('upload', 'one')!;
+    assert(saved.kind === 'upload' && saved.binary);
   });
 
   it('restarts an asset download from an empty file after a network or stream failure', async () => {

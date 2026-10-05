@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import {
   lstat,
@@ -12,6 +12,7 @@ import {
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setImmediate, setTimeout } from 'node:timers/promises';
+import { boundedWork } from './apply-work';
 import { assertNotAborted } from './cancellation';
 import {
   assertMetadataIntegerPrecision,
@@ -43,6 +44,8 @@ const CHUNK_INDEX_FILE = 'chunks.jsonl';
 const MAX_INDEX_LINE_BYTES = 1024;
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 const DOWNLOAD_ATTEMPTS = 4;
+// A download that receives nothing for this long is retried as transient.
+const DOWNLOAD_IDLE_MS = 60_000;
 const DOWNLOAD_RETRY_MS = 1000;
 const MAX_DOWNLOAD_RETRY_MS = 30_000;
 const KINDS = ['collection', 'record', 'upload'] as const;
@@ -594,6 +597,7 @@ async function fetchBinary(
   staging: string,
   fetchFn: typeof fetch,
   retryWait: RetryWait,
+  idleTimeout: number,
   signal?: AbortSignal,
 ): Promise<BinaryFile> {
   assertNotAborted(signal);
@@ -615,13 +619,21 @@ async function fetchBinary(
   url.searchParams.set('dl', desired.filename);
   url.searchParams.set('skip-default-optimizations', 'true');
   url.searchParams.set('svg-sanitize', 'false');
-  const temporary = join(staging, 'binaries', '.download');
+  // Downloads run concurrently, so each writes its own temporary file.
+  const temporary = join(staging, 'binaries', `.download-${randomUUID()}`);
   let download: Omit<BinaryFile, 'file'> | undefined;
   // Asset GETs bypass the CMA client's retries. Integrity failures and other
   // client errors are final; a retry restarts with an empty file and hashes.
   for (let attempt = 1; !download; attempt++) {
     try {
-      download = await transferBinary(entry, url, temporary, fetchFn, signal);
+      download = await transferBinary(
+        entry,
+        url,
+        temporary,
+        fetchFn,
+        idleTimeout,
+        signal,
+      );
     } catch (error) {
       if (!(error instanceof TransientDownloadError)) throw error;
       await rm(temporary, { force: true });
@@ -661,14 +673,28 @@ async function transferBinary(
   url: URL,
   temporary: string,
   fetchFn: typeof fetch,
+  idleTimeout: number,
   signal?: AbortSignal,
 ): Promise<Omit<BinaryFile, 'file'>> {
   assertNotAborted(signal);
   const desired = entry.desired!;
+  // A stalled connection is abandoned after idleTimeout without any bytes and
+  // retried like a dropped one; the caller's own signal still cancels.
+  const idle = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const touch = () => {
+    clearTimeout(timer);
+    timer = globalThis.setTimeout(() => idle.abort(), idleTimeout);
+  };
+  const requestSignal = signal
+    ? AbortSignal.any([signal, idle.signal])
+    : idle.signal;
+  touch();
   let response: Response;
   try {
-    response = await fetchFn(url, { signal });
+    response = await fetchFn(url, { signal: requestSignal });
   } catch (error) {
+    clearTimeout(timer);
     assertNotAborted(signal);
     throw new TransientDownloadError(error);
   }
@@ -689,6 +715,7 @@ async function transferBinary(
     }
     handle = await open(temporary, 'wx', 0o600);
     for await (const chunk of transferred(response.body)) {
+      touch();
       assertNotAborted(signal);
       const buffer = Buffer.from(chunk);
       bytes += buffer.length;
@@ -709,6 +736,7 @@ async function transferBinary(
     assertNotAborted(signal);
     throw error;
   } finally {
+    clearTimeout(timer);
     await handle?.close();
   }
   return { sha256: hash.digest('hex'), md5: md5.digest('hex'), bytes };
@@ -722,6 +750,8 @@ export async function writeBundle({
   fetchFn = fetch,
   retryWait = (milliseconds, signal) =>
     setTimeout(milliseconds, undefined, { signal }),
+  concurrency = 4,
+  idleTimeout = DOWNLOAD_IDLE_MS,
   signal,
 }: {
   store: SnapshotStore;
@@ -730,6 +760,8 @@ export async function writeBundle({
   chunkBytes?: number;
   fetchFn?: typeof fetch;
   retryWait?: RetryWait;
+  concurrency?: number;
+  idleTimeout?: number;
   signal?: AbortSignal;
 }): Promise<string> {
   assertNotAborted(signal);
@@ -794,18 +826,40 @@ export async function writeBundle({
       chunks.count++;
       current = undefined;
     };
+    // Asset files are independent downloads. Fetch them concurrently first;
+    // the plan is then written in its deterministic order.
+    const pending: UploadPlan[] = [];
+    for (const original of store.planEntries('upload')) {
+      const entry = compactEntry(original);
+      if (entry.kind === 'upload' && requiresBinary(entry)) pending.push(entry);
+    }
+    const binaries = new Map<string, BinaryFile>();
+    await boundedWork(
+      pending,
+      concurrency,
+      async (entry) => {
+        validateEntry(entry, false);
+        binaries.set(
+          entry.id,
+          await fetchBinary(
+            entry,
+            staging,
+            fetchFn,
+            retryWait,
+            idleTimeout,
+            signal,
+          ),
+        );
+      },
+      undefined,
+      signal,
+    );
     for (const original of store.planEntries()) {
       assertNotAborted(signal);
       const entry = compactEntry(original);
       validateEntry(entry, false);
       if (entry.kind === 'upload' && requiresBinary(entry))
-        entry.binary = await fetchBinary(
-          entry,
-          staging,
-          fetchFn,
-          retryWait,
-          signal,
-        );
+        entry.binary = binaries.get(entry.id);
       validateEntry(entry, true);
       const line = Buffer.from(`${stableJson(entry)}\n`);
       if (current && current.descriptor.bytes + line.length > chunkBytes)

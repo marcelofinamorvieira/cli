@@ -26,7 +26,8 @@ datocms content:diff \
 | `--include-deletions` | Off | Plan safe destination-only deletions within the selected scope. |
 | `--allow-partial` | Off | Permit only proven isolated skips and their dependency closure. |
 | `--allow-temporary-schema-changes` | Off | Plan supported temporary validator/default changes. |
-| `--concurrency=4` | `4` | Bound independent requests to a value from 1 to 16. |
+| `--verification=versions` | `versions` | How capture consistency is checked; see [Verification](#verification). |
+| `--concurrency=8` | `8` | Bound independent requests to a value from 1 to 16. |
 | `--chunk-bytes=4194304` | `4194304` | Set the target JSONL chunk size. One oversized entry occupies its own chunk. |
 
 Unsafe requested changes fail generation by default. Partial mode does not bypass incompatible schemas, incomplete access proofs, or execution conflicts. Legacy/nonportable identifiers and unsupported lifecycle states are diagnosed during planning. DatoCMS computes validity flags asynchronously; the plugin preserves content and publication state, while the restored schema determines final validity. Copying an invalid record requires `--allow-temporary-schema-changes`. When the failing rule can be identified (required, length, size, number range, enum), only that rule is relaxed during apply; otherwise every rule on the record's fields is lifted while it is written, except `unique` and the allowed-model rules of link and block fields, and all are restored afterwards.
@@ -53,13 +54,13 @@ datocms content:diff \
 
 ## Review and apply
 
-Review `manifest.json` and the `plan/*.jsonl` entries before applying. Changed entries contain complete baseline and desired states. Unchanged entries contain fingerprints and the metadata needed to preserve dependencies, publication, ordering, and schedules. Required new/replacement upload binaries are downloaded and checked during generation; transient download failures are retried a few times before generation fails.
+Review `manifest.json` and the `plan/*.jsonl` entries before applying. Changed entries contain complete baseline and desired states. Unchanged entries contain fingerprints and the metadata needed to preserve dependencies, publication, ordering, and schedules. Required new/replacement upload binaries are downloaded and checked during generation; files download in parallel, and a download that fails transiently or stalls for a minute is retried a few times before generation fails.
 
 ```sh
 datocms content:apply ./content-bundle --profile=target-project
 ```
 
-Apply verifies the manifest, JSONL chunks, asset binaries, destination project binding, schema, and complete baseline before content writes. By default it creates a new isolated destination fork and reports the resulting environment ID. It never promotes the fork automatically. `--destination=ENVIRONMENT_ID` selects an alternative destination only if it satisfies the bundle's full baseline and binding checks.
+Apply verifies the manifest, JSONL chunks, asset binaries, destination project binding, schema, and complete baseline before content writes. By default it creates a new isolated destination fork and reports the resulting environment ID. The fork is requested before the destination is checked, so DatoCMS copies it in the meantime; if the check fails, the fork is deleted again. It never promotes the fork automatically. `--destination=ENVIRONMENT_ID` selects an alternative destination only if it satisfies the bundle's full baseline and binding checks.
 
 | Flag | Behavior |
 | --- | --- |
@@ -68,14 +69,20 @@ Apply verifies the manifest, JSONL chunks, asset binaries, destination project b
 | `--keep-failed-fork` | Keep a fork created by this run if execution fails. |
 | `--schedule-window=120` | Refuse to start when any schedule falls due within this many minutes; `0` disables the check. |
 | `--repair` | Restore what an interrupted in-place apply left behind, instead of applying. See below. |
+| `--fast-fork` | Create the fork with DatoCMS's fast fork, which is much quicker but blocks writes to the destination while it copies, and may be refused while someone is editing. |
+| `--verification=versions` | How the fork baseline, consistency and final checks read records; see [Verification](#verification). |
 | `--allow-temporary-schema-changes` | Permit the exact temporary validator/default changes recorded in the bundle. |
-| `--concurrency=4` | Bound independent requests to a value from 1 to 16. Dependent writes retain their required order. |
+| `--concurrency=8` | Bound independent requests to a value from 1 to 16. Dependent writes retain their required order. |
 
 Schedules are only touched on records the bundle writes: their existing schedules are cancelled before the writes, and the bundle's exact future schedules are recreated once all writes are done and temporary field settings are restored. Schedules on every other record are left alone. Because a schedule that fires during apply would change content mid-run, apply refuses to start when any schedule in the destination, or any schedule it recreates, falls due within `--schedule-window` minutes. Temporary field settings are restored before success. When an in-place run fails, temporary settings are restored, and each cancelled schedule is restored only if its record still has its original content; a record the run created or already changed keeps its current schedules and is listed in the error. Failed forks created by the run are removed unless explicitly retained. Pre-existing environments are never deleted.
 
 If an in-place run is killed before it can clean up, run `datocms content:apply ./content-bundle --repair` (with `--destination` and `--allow-primary` as needed). It reads only the bundle and the live environment: it restores temporary field settings, gives records that still have their original content their original schedules back, gives records that already have the bundle's content the bundle's schedules, and lists any record it cannot decide on, or whose schedule has already passed. Repair never changes content and can be run again safely.
 
 DatoCMS provides no public persistent sandbox write freeze. Maintenance mode applies only to primary and does not create an immutable snapshot or transaction. Capture validation, live guards during execution, and full final verification detect observed conflicts, but another writer can still change data between a check and its following write. Run generation and application while competing writes are stopped.
+
+### Verification
+
+Every check compares the full content of records that are created, changed or deleted. For all other records, `--verification=versions` (the default) relies on DatoCMS versions: every save creates a new record version, and every publication change moves the published version's update time. A record whose version is unchanged is therefore not read again; a record whose version changed is read in full and compared, so a new version without new content still passes. This applies to the consistency check after a capture, to the fork baseline (forks keep record versions), and to apply's final verification. `--verification=full` rereads every record in each check instead, which takes as long as a full capture each time.
 
 ## Bundle format and lifecycle
 

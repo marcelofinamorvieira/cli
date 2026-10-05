@@ -62,9 +62,20 @@ export default class ContentApplyCommand extends ContentCommand {
         'Permit the exact temporary validator and default changes in the bundle',
       default: false,
     }),
+    'fast-fork': oclif.Flags.boolean({
+      description:
+        'Create the fork with a fast fork, which blocks writes to the destination while it copies',
+      default: false,
+    }),
+    verification: oclif.Flags.custom<'versions' | 'full'>({
+      description:
+        'Skip rereading records whose version did not change ("versions"), or reread every record in each check ("full")',
+      options: ['versions', 'full'],
+      default: 'versions',
+    })(),
     concurrency: oclif.Flags.integer({
       description: 'Maximum concurrent independent requests (1–16)',
-      default: 4,
+      default: 8,
     }),
   };
 
@@ -128,6 +139,8 @@ export default class ContentApplyCommand extends ContentCommand {
         destinationEnvironmentId: flags.destination,
         concurrency: maximum,
         scheduleWindowMinutes: flags['schedule-window'],
+        fastFork: flags['fast-fork'],
+        verification: flags.verification,
         log: (message) => this.progress(message),
       },
     });

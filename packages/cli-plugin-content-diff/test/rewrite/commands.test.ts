@@ -399,6 +399,8 @@ describe('content command integration', () => {
             destinationEnvironmentId: 'target',
             concurrency: 2,
             scheduleWindowMinutes: 45,
+            fastFork: true,
+            verification: 'full',
             log: undefined,
           },
         );
@@ -416,6 +418,8 @@ describe('content command integration', () => {
             'allow-primary': false,
             repair: false,
             'schedule-window': 45,
+            'fast-fork': true,
+            verification: 'full',
             'keep-failed-fork': true,
             'allow-temporary-schema-changes': true,
             concurrency: 2,

@@ -11,7 +11,9 @@ The public commands are `content:diff` and `content:apply`.
 3. Use Node's built-in SQLite; support Node 22.13+ on the 22.x line and newer
    supported runtimes with unflagged SQLite. Do not add a native driver.
 4. Capture all selected records with fully expanded nested blocks, independently
-   for current and published versions. Do not use metadata-only shortcuts.
+   for current and published versions. Later checks may rely on record versions:
+   records whose version is unchanged need not be reread, and records whose
+   version changed are reread in full and compared.
 5. Verify capture consistency. Abort when a consistent view cannot be obtained.
 6. Include full baseline/desired content only for changed records. Unchanged
    records carry fingerprints and required dependency, ordering, schedule, and

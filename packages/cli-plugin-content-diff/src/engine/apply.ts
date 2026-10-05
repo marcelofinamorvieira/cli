@@ -1,12 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { stageBinary } from './apply-binary';
 import { validateExecution } from './apply-validation';
 import { batches, boundedWork } from './apply-work';
 import { readBundle } from './bundle';
 import { assertNotAborted } from './cancellation';
-import { captureSnapshot, readRecordBatch } from './capture';
+import {
+  assetDigest,
+  captureAssets,
+  captureSnapshot,
+  clearScan,
+  contentDifferences,
+  fingerprintDifferences,
+  readRecordBatch,
+  scanFingerprints,
+  scannedFingerprints,
+} from './capture';
 import {
   canonicalCollection,
   canonicalFields,
@@ -19,6 +30,7 @@ import {
   recordGuard,
   recordHash,
   recordPayloadFields,
+  stateFingerprint,
   unsupportedRecordPayloadKey,
 } from './codec';
 import { lockEnvironment, unlockEnvironment } from './environment-lock';
@@ -155,6 +167,7 @@ interface Context {
   writesPlanned: boolean;
   /** The written environment is locked against other edits. */
   locked: boolean;
+  verification: 'versions' | 'full';
   signal?: AbortSignal;
   log?: ApplyOptions['log'];
 }
@@ -1629,9 +1642,14 @@ async function captureLive(
       signal: context.signal,
       progress: context.log,
     },
-    // The second consistency read only detects other writers; a locked
-    // environment has none.
-    verify: verify && !context.locked,
+    // The consistency check only detects other writers; a locked environment
+    // has none. By version, it rereads only records whose version changed.
+    verify:
+      verify && !context.locked
+        ? context.verification === 'versions'
+          ? 'versions'
+          : true
+        : false,
   });
 }
 
@@ -1650,9 +1668,14 @@ function expectedFinal(entry: PlanEntry, schedules: boolean): string | null {
   return entry.desired.hash;
 }
 
-function verifyFinal(context: Context, schedules: boolean): void {
+function verifyFinal(
+  context: Context,
+  schedules: boolean,
+  kinds: Kind[] = ['record', 'upload', 'collection'],
+): void {
   for (const entry of context.store.iteratePlan()) {
     assertNotAborted(context.signal);
+    if (!kinds.includes(entry.kind)) continue;
     const state =
       entry.kind === 'record'
         ? context.store.getRecord('live', entry.id)
@@ -1688,6 +1711,7 @@ function verifyFinal(context: Context, schedules: boolean): void {
     ['upload', 'uploads'],
     ['collection', 'collections'],
   ] as const) {
+    if (!kinds.includes(kind)) continue;
     const changed = context.store.database
       .prepare(
         `SELECT live.id FROM ${table} live LEFT JOIN plan p ON p.kind=? AND p.id=live.id
@@ -1745,6 +1769,250 @@ async function temporarySchema(
         `Field ${change.fieldId} settings did not converge.`,
       );
     }
+  }
+}
+
+function captureOptions(context: Context) {
+  return {
+    modelIds: context.schema.models
+      .filter((model) => !model.block)
+      .map((model) => model.id),
+    uploads: 'all' as const,
+    concurrency: context.concurrency,
+    signal: context.signal,
+    progress: context.log,
+  };
+}
+
+/** Waits until DatoCMS has finished creating a fork requested without waiting. */
+async function waitForFork(
+  rootClient: Client,
+  id: string,
+  log?: ApplyOptions['log'],
+  signal?: AbortSignal,
+) {
+  for (let wait = 1000; ; wait = Math.min(wait * 2, 10_000)) {
+    assertNotAborted(signal);
+    const fork = await rootClient.environments.find(id);
+    if (fork.meta.status === 'ready') return fork;
+    if (fork.meta.status !== 'creating')
+      throw new ContentError(
+        'FORK_VERIFY_FAILED',
+        `Fork "${id}" ended in status ${fork.meta.status}.`,
+      );
+    log?.(
+      `Waiting for fork "${id}" (${
+        fork.meta.fork_completion_percentage ?? 0
+      }%).`,
+    );
+    try {
+      await delay(wait, undefined, signal ? { signal } : undefined);
+    } finally {
+      assertNotAborted(signal);
+    }
+  }
+}
+
+/** Reads uploads and collections again and compares them with the live side. */
+async function verifyAssets(context: Context, reason: string): Promise<void> {
+  const assets = new SnapshotStore();
+  try {
+    await captureAssets({
+      client: context.client,
+      store: assets,
+      side: 'live',
+      options: captureOptions(context),
+    });
+    if (
+      (await assetDigest(context.store, 'live', context.signal)) !==
+      (await assetDigest(assets, 'live', context.signal))
+    )
+      conflict('collection', 'assets', reason);
+  } finally {
+    assets.dispose();
+  }
+}
+
+/**
+ * The fork baseline without rereading every record. A fork keeps each record's
+ * version, so records whose listed version matches the destination capture
+ * hold the same content; any other record is read in full and compared, and
+ * replaces the destination's state as the fork's live baseline.
+ */
+async function verifyForkByVersions(context: Context): Promise<void> {
+  const scan = 'fork-baseline';
+  try {
+    await scanFingerprints({
+      client: context.client,
+      schema: context.schema,
+      store: context.store,
+      scan,
+      options: captureOptions(context),
+    });
+    const { changed, missing, extra } = fingerprintDifferences(
+      context.store,
+      'live',
+      scan,
+    );
+    const differing =
+      missing ??
+      extra ??
+      (await contentDifferences(
+        context.client,
+        context.schema,
+        changed,
+        (id) => context.store.getRecord('live', id),
+        captureOptions(context),
+        (state) => context.store.putRecord('live', state),
+      ));
+    if (differing)
+      conflict(
+        'record',
+        differing,
+        'fork differs from the destination baseline',
+      );
+    await verifyAssets(context, 'fork assets differ from the destination');
+  } finally {
+    clearScan(context.store, scan);
+  }
+}
+
+/**
+ * Final verification without rereading untouched records. Records the run
+ * wrote are read in full and compared with the bundle. Every other record must
+ * still have its baseline version, or else its full content must still equal
+ * the baseline; no record may appear or disappear unexpectedly. Uploads and
+ * collections are reread in full.
+ */
+async function verifyFinalByVersions(
+  context: Context,
+  schedules: boolean,
+): Promise<void> {
+  const scan = 'final';
+  const store = context.store;
+  try {
+    await scanFingerprints({
+      client: context.client,
+      schema: context.schema,
+      store,
+      scan,
+      options: captureOptions(context),
+    });
+    const written = store.database
+      .prepare(
+        "SELECT id FROM plan WHERE kind='record' AND action IN ('create','update') ORDER BY id",
+      )
+      .all()
+      .map((row) => String(row.id));
+    for (const batch of batches(written)) {
+      assertNotAborted(context.signal);
+      const states = await readRecordBatch(
+        context.client,
+        batch,
+        context.schema,
+      );
+      for (const id of batch) {
+        const state = states.find((candidate) => candidate.id === id);
+        if (!state) conflict('record', id, 'missing after writes');
+        store.putRecord('live', state);
+      }
+    }
+    const original = store.database.prepare(
+      'SELECT state_json FROM apply_original_records WHERE id=?',
+    );
+    const originalState = (id: string) => {
+      const row = original.get(id);
+      return row
+        ? (JSON.parse(String(row.state_json)) as RecordState)
+        : undefined;
+    };
+    const changed: string[] = [];
+    let listed = 0;
+    for (const { id, fingerprint } of scannedFingerprints(store, scan)) {
+      assertNotAborted(context.signal);
+      listed++;
+      const entry = store.getPlan('record', id) as RecordPlan | undefined;
+      if (entry && (entry.action === 'create' || entry.action === 'update')) {
+        if (stateFingerprint(store.getRecord('live', id)!) !== fingerprint)
+          conflict('record', id, 'changed during final verification');
+        continue;
+      }
+      if (entry?.action === 'delete')
+        conflict('record', id, 'record remained after deletion');
+      const baseline = originalState(id);
+      if (!baseline || (entry?.action === 'skip' && !entry.guard))
+        conflict(
+          'record',
+          id,
+          'destination namespace gained an identity since bundle generation',
+        );
+      if (stateFingerprint(baseline) !== fingerprint) changed.push(id);
+    }
+    const expected = Number(
+      store.database
+        .prepare(
+          "SELECT (SELECT COUNT(*) FROM apply_original_records) - (SELECT COUNT(*) FROM plan WHERE kind='record' AND action='delete') + (SELECT COUNT(*) FROM plan WHERE kind='record' AND action='create') AS count",
+        )
+        .get()?.count ?? 0,
+    );
+    if (listed !== expected) {
+      const absent = store.database
+        .prepare(
+          `SELECT o.id FROM apply_original_records o LEFT JOIN plan p ON p.kind='record' AND p.id=o.id
+           WHERE (p.action IS NULL OR p.action<>'delete') AND NOT EXISTS(SELECT 1 FROM scan_rows s WHERE s.scan=? AND s.slice='current' AND s.id=o.id) LIMIT 1`,
+        )
+        .get(scan);
+      conflict(
+        'record',
+        String(absent?.id ?? 'unknown'),
+        'record disappeared from the destination',
+      );
+    }
+    // A new version need not mean new content, as when renumbered siblings are
+    // restored to their positions; compare such records in full.
+    const differing = await contentDifferences(
+      context.client,
+      context.schema,
+      changed,
+      originalState,
+      captureOptions(context),
+      (state) => store.putRecord('live', state),
+    );
+    if (differing)
+      conflict(
+        'record',
+        differing,
+        store.getPlan('record', differing)
+          ? 'final state differs from the reviewed bundle'
+          : 'preserved destination namespace changed',
+      );
+    for (const entry of store.iteratePlan('record')) {
+      if (entry.action !== 'create' && entry.action !== 'update') continue;
+      const state = store.getRecord('live', entry.id)!;
+      if (state.hash !== expectedFinal(entry, schedules))
+        conflict(
+          'record',
+          entry.id,
+          'final state differs from the reviewed bundle',
+        );
+      if (state.position !== (entry as RecordPlan).desired!.position)
+        conflict(
+          'record',
+          entry.id,
+          'final position differs from the reviewed bundle',
+        );
+    }
+    for (const table of ['uploads', 'collections'])
+      store.database.prepare(`DELETE FROM ${table} WHERE side='live'`).run();
+    await captureAssets({
+      client: context.client,
+      store,
+      side: 'live',
+      options: captureOptions(context),
+    });
+    verifyFinal(context, schedules, ['upload', 'collection']);
+  } finally {
+    clearScan(store, scan);
   }
 }
 
@@ -1853,6 +2121,7 @@ export async function applyBundle(args: {
       manifest,
       schema,
       locked: destinationLocked,
+      verification: args.options.verification ?? 'versions',
       bundlePath: args.bundlePath,
       concurrency: Math.max(
         1,
@@ -1872,12 +2141,6 @@ export async function applyBundle(args: {
     // DatoCMS exposes no persistent sandbox freeze. Maintenance mode applies
     // only to primary and is not an immutable snapshot or a transaction. These
     // complete baseline and focused checks reduce races; apply is not atomic.
-    context.log?.(`Verifying destination baseline in "${destinationId}".`);
-    await captureLive(context, destinationId);
-    validateBundlePreflight(context);
-    if (context.writesPlanned)
-      assertScheduleWindow(context, args.options.scheduleWindowMinutes ?? 120);
-    preserveBaseline(context);
     let environmentId = destinationId;
     if (!args.options.inPlace) {
       ownedFork = `content-apply-${randomUUID()}`;
@@ -1891,10 +2154,41 @@ export async function applyBundle(args: {
       }
       forkRequested = true;
       assertNotAborted(context.signal);
-      context.log?.(`Creating destination fork "${ownedFork}".`);
-      const fork = await args.rootClient.environments.fork(destinationId, {
-        id: ownedFork,
-      });
+      // DatoCMS copies the environment in the background. Request the fork
+      // first so the copy overlaps the destination check below; the fork is
+      // compared with the bundle and that check once both have finished.
+      context.log?.(
+        `Creating destination fork "${ownedFork}"${
+          args.options.fastFork ? ' with a fast fork' : ''
+        }.`,
+      );
+      const requested = await args.rootClient.environments.fork(
+        destinationId,
+        { id: ownedFork },
+        {
+          immediate_return: true,
+          ...(args.options.fastFork ? { fast: true } : {}),
+        },
+      );
+      if (requested.id !== ownedFork)
+        throw new ContentError(
+          'FORK_VERIFY_FAILED',
+          'DatoCMS created the fork under another ID.',
+        );
+    }
+    context.log?.(`Verifying destination baseline in "${destinationId}".`);
+    await captureLive(context, destinationId);
+    validateBundlePreflight(context);
+    if (context.writesPlanned)
+      assertScheduleWindow(context, args.options.scheduleWindowMinutes ?? 120);
+    preserveBaseline(context);
+    if (ownedFork) {
+      const fork = await waitForFork(
+        args.rootClient,
+        ownedFork,
+        context.log,
+        context.signal,
+      );
       if (fork.id !== ownedFork || fork.meta.read_only_mode) {
         throw new ContentError(
           'FORK_VERIFY_FAILED',
@@ -1925,12 +2219,16 @@ export async function applyBundle(args: {
         );
       }
       context.log?.(`Verifying fork baseline in "${environmentId}".`);
-      // One read suffices: it is compared with the bundle and the destination,
-      // and anything written to the fork later fails the final verification,
-      // which keeps its second consistency read.
-      await captureLive(context, environmentId, false);
-      validateBundlePreflight(context);
-      verifyForkBaseline(context);
+      if (context.verification === 'versions' && !context.locked) {
+        await verifyForkByVersions(context);
+      } else {
+        // One read suffices: it is compared with the bundle and the
+        // destination, and anything written to the fork later fails the final
+        // verification, which keeps its consistency check.
+        await captureLive(context, environmentId, false);
+        validateBundlePreflight(context);
+        verifyForkBaseline(context);
+      }
     }
     args.options.log?.(`Applying to ${environmentId}`);
     startedWrites = context.writesPlanned;
@@ -2080,8 +2378,12 @@ export async function applyBundle(args: {
     // fork that fails verification is deleted, so one final check suffices.
     if (args.options.inPlace && !context.locked) {
       context.log?.('Verifying final content before restoring schedules.');
-      await captureLive(context, environmentId);
-      verifyFinal(context, !context.writesPlanned);
+      if (context.verification === 'versions')
+        await verifyFinalByVersions(context, !context.writesPlanned);
+      else {
+        await captureLive(context, environmentId);
+        verifyFinal(context, !context.writesPlanned);
+      }
     }
     // Schedules are recreated once every write is done and the original field
     // settings are back, so DatoCMS validates them under the final schema.
@@ -2091,8 +2393,12 @@ export async function applyBundle(args: {
     // Schedules are writes too. Verify exact dates and all content again after
     // restoring them, using a second independently checked complete capture.
     context.log?.('Verifying final content and schedules.');
-    await captureLive(context, environmentId);
-    verifyFinal(context, true);
+    if (context.verification === 'versions' && !context.locked)
+      await verifyFinalByVersions(context, true);
+    else {
+      await captureLive(context, environmentId);
+      verifyFinal(context, true);
+    }
     assertNotAborted(context.signal);
     complete = true;
     return {
@@ -2212,6 +2518,11 @@ export async function applyBundle(args: {
     }
     if (ownedFork && forkRequested && !args.options.keepFailedFork) {
       try {
+        // A fork requested without waiting may still be copying; it can only
+        // be deleted once DatoCMS has finished creating it.
+        await waitForFork(args.rootClient, ownedFork, args.options.log).catch(
+          () => undefined,
+        );
         const fork = await findMaybe(() =>
           args.rootClient.environments.find(ownedFork!),
         );
@@ -2387,6 +2698,7 @@ export async function repairBundle(args: {
         mutations: 0,
         writesPlanned: true,
         locked: false,
+        verification: 'full',
         signal,
         log,
       };

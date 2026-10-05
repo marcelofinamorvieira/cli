@@ -9,11 +9,13 @@ import {
   canonicalUpload,
   hashJson,
   inspectRecord,
+  listingFingerprint,
   nullableString,
   object,
   recordGuard,
   recordHash,
   stableStringify,
+  stateFingerprint,
   string,
   timestamp,
 } from './codec';
@@ -23,6 +25,7 @@ import { SnapshotStore } from './store';
 import type {
   CaptureOptions,
   Client,
+  ModelSchema,
   RecordState,
   Schedules,
   SchemaState,
@@ -30,6 +33,26 @@ import type {
 } from './types';
 
 type RecordPageQuery = Parameters<Client['items']['rawList']>[0];
+
+/** The model of a raw record resource, without canonicalizing the record. */
+function rawModelId(row: Record<string, unknown>): string {
+  const data =
+    object(row.relationships) && object(row.relationships.item_type)
+      ? row.relationships.item_type.data
+      : row.item_type;
+  if (object(data) && typeof data.id === 'string') return data.id;
+  throw new ContentError('INVALID_RESPONSE', 'Record has no model identity.');
+}
+
+/**
+ * The nested flag only expands block fields, so a model without them reads
+ * the same payload unexpanded, 500 records per request instead of 30.
+ */
+function readsBlocks(model: ModelSchema): boolean {
+  return model.fields.some((field) =>
+    ['rich_text', 'single_block', 'structured_text'].includes(field.type),
+  );
+}
 type RecordPage = Awaited<ReturnType<Client['items']['rawList']>>;
 
 function readNativeRecordPage(
@@ -318,7 +341,250 @@ interface CaptureInput {
   store: SnapshotStore;
   side: Side;
   options: CaptureOptions;
-  verify?: boolean;
+  /**
+   * true rereads everything and compares; 'versions' lists record versions
+   * instead, assuming every edit creates a new version; false skips the check.
+   */
+  verify?: boolean | 'versions';
+}
+
+/** Uploads and collections. Their listings are cheap, so they are always reread. */
+export async function captureAssets(input: {
+  client: Client;
+  store: SnapshotStore;
+  side: Side;
+  options: CaptureOptions;
+}): Promise<void> {
+  const { client, store, side, options } = input;
+  const signal = options.signal;
+  options.progress?.('Reading asset metadata');
+  await pages(
+    (offset) =>
+      client.uploads.rawList({
+        order_by: 'id_ASC',
+        page: { offset, limit: 500 },
+      }),
+    500,
+    options.concurrency ?? 4,
+    (uploads) => {
+      store.transaction(() => {
+        for (const raw of uploads) {
+          assertNotAborted(signal);
+          const upload = canonicalUpload(raw);
+          if (store.getUpload(side, upload.id))
+            throw new ContentError(
+              'CAPTURE_DRIFT',
+              `Duplicate upload ${upload.id}.`,
+            );
+          store.putUpload(side, upload);
+        }
+      });
+    },
+    signal,
+  );
+  assertNotAborted(signal);
+  for (const raw of await client.uploadCollections.list()) {
+    assertNotAborted(signal);
+    const collection = canonicalCollection(raw);
+    if (store.getCollection(side, collection.id))
+      throw new ContentError(
+        'CAPTURE_DRIFT',
+        `Duplicate collection ${collection.id}.`,
+      );
+    store.putCollection(side, collection);
+  }
+  assertNotAborted(signal);
+}
+
+/**
+ * Lists every regular record's version metadata into a temporary table, 500
+ * records per request instead of nested 30-record pages, and yields each
+ * record's fingerprint. A record moving between pages fails the pagination
+ * checks, so the listing is complete.
+ */
+export async function scanFingerprints(input: {
+  client: Client;
+  schema: SchemaState;
+  store: SnapshotStore;
+  scan: string;
+  options: CaptureOptions;
+}): Promise<void> {
+  const { client, schema, store, scan, options } = input;
+  const signal = options.signal;
+  const db = store.database;
+  db.exec(
+    'CREATE TEMP TABLE IF NOT EXISTS scan_rows(scan TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scan,slice,id)) WITHOUT ROWID',
+  );
+  db.prepare('DELETE FROM scan_rows WHERE scan=?').run(scan);
+  const insert = db.prepare('INSERT OR IGNORE INTO scan_rows VALUES(?,?,?,?)');
+  for (const model of schema.models) {
+    if (model.block) continue;
+    for (const version of ['current', 'published'] as const) {
+      options.progress?.(`Listing ${model.apiKey} versions (${version})`);
+      await pages(
+        (offset) =>
+          readNativeRecordPage(client, {
+            filter: { type: model.id },
+            nested: false,
+            version,
+            order_by: 'id_ASC',
+            page: { offset, limit: 500 },
+          }),
+        500,
+        options.concurrency ?? 4,
+        (rows) => {
+          store.transaction(() => {
+            for (const row of rows) {
+              assertNotAborted(signal);
+              if (!object(row) || rawModelId(row) !== model.id)
+                throw new ContentError(
+                  'INVALID_RESPONSE',
+                  'A model listing contains a foreign record.',
+                );
+              // Only what the fingerprint needs is kept, not the content.
+              const attributes = object(row.attributes) ? row.attributes : row;
+              const kept = {
+                id: row.id,
+                meta: row.meta,
+                relationships: row.relationships,
+                item_type: row.item_type,
+                parent_id: attributes.parent_id,
+                position: attributes.position,
+              };
+              if (
+                !insert.run(
+                  scan,
+                  version,
+                  string(row.id, 'record ID'),
+                  JSON.stringify(kept),
+                ).changes
+              )
+                throw new ContentError(
+                  'CAPTURE_DRIFT',
+                  'Duplicate record identity during a version listing.',
+                );
+            }
+          });
+        },
+        signal,
+      );
+    }
+  }
+}
+
+/** Each listed record's fingerprint, in ID order. */
+export function* scannedFingerprints(
+  store: SnapshotStore,
+  scan: string,
+): Generator<{ id: string; fingerprint: string }> {
+  const db = store.database;
+  const orphan = db
+    .prepare(
+      "SELECT p.id FROM scan_rows p WHERE p.scan=? AND p.slice='published' AND NOT EXISTS(SELECT 1 FROM scan_rows c WHERE c.scan=p.scan AND c.slice='current' AND c.id=p.id) LIMIT 1",
+    )
+    .get(scan);
+  if (orphan)
+    throw new ContentError(
+      'CAPTURE_DRIFT',
+      `Published record ${orphan.id} disappeared during a version listing.`,
+    );
+  const published = db.prepare(
+    "SELECT data FROM scan_rows WHERE scan=? AND slice='published' AND id=?",
+  );
+  for (const row of db
+    .prepare(
+      "SELECT id,data FROM scan_rows WHERE scan=? AND slice='current' ORDER BY id",
+    )
+    .iterate(scan)) {
+    const pub = published.get(scan, String(row.id));
+    yield {
+      id: String(row.id),
+      fingerprint: listingFingerprint(
+        JSON.parse(String(row.data)),
+        pub ? JSON.parse(String(pub.data)) : null,
+      ),
+    };
+  }
+}
+
+/** Removes a version listing's temporary rows. */
+export function clearScan(store: SnapshotStore, scan: string): void {
+  store.database.exec(
+    'CREATE TEMP TABLE IF NOT EXISTS scan_rows(scan TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scan,slice,id)) WITHOUT ROWID',
+  );
+  store.database.prepare('DELETE FROM scan_rows WHERE scan=?').run(scan);
+}
+
+/**
+ * Compares a version listing with a side's captured states. Records whose
+ * version changed are returned for a full read: a new version does not always
+ * mean new content (renumbering siblings, for example). A record present on
+ * only one side is reported as missing or extra.
+ */
+export function fingerprintDifferences(
+  store: SnapshotStore,
+  side: Side,
+  scan: string,
+): { changed: string[]; missing: string | null; extra: string | null } {
+  const changed: string[] = [];
+  let matched = 0;
+  let extra: string | null = null;
+  for (const { id, fingerprint } of scannedFingerprints(store, scan)) {
+    const state = store.getRecord(side, id);
+    if (!state) {
+      extra ??= id;
+      continue;
+    }
+    matched++;
+    if (stateFingerprint(state) !== fingerprint) changed.push(id);
+  }
+  const captured = Number(
+    store.database
+      .prepare('SELECT COUNT(*) AS count FROM records WHERE side=?')
+      .get(side)?.count ?? 0,
+  );
+  const missing =
+    captured === matched
+      ? null
+      : String(
+          store.database
+            .prepare(
+              "SELECT r.id FROM records r WHERE r.side=? AND NOT EXISTS(SELECT 1 FROM scan_rows s WHERE s.scan=? AND s.slice='current' AND s.id=r.id) LIMIT 1",
+            )
+            .get(side, scan)?.id,
+        );
+  return { changed, missing, extra };
+}
+
+/**
+ * Reads records in full and returns those whose content, schedules or
+ * position differ from the expected states (or that no longer exist).
+ */
+export async function contentDifferences(
+  client: Client,
+  schema: SchemaState,
+  ids: Iterable<string>,
+  expected: (id: string) => RecordState | undefined,
+  options: CaptureOptions,
+  accept?: (state: RecordState) => void,
+): Promise<string | null> {
+  for (const batch of batches(ids)) {
+    assertNotAborted(options.signal);
+    const states = await readRecordBatch(client, batch, schema);
+    for (const id of batch) {
+      const state = states.find((candidate) => candidate.id === id);
+      const wanted = expected(id);
+      if (
+        !state ||
+        !wanted ||
+        state.hash !== wanted.hash ||
+        state.position !== wanted.position
+      )
+        return id;
+      accept?.(state);
+    }
+  }
+  return null;
 }
 
 async function captureOnce(input: CaptureInput): Promise<void> {
@@ -341,18 +607,20 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     for (const model of schema.models) {
       assertNotAborted(signal);
       if (model.block) continue;
+      const nested = readsBlocks(model);
+      const limit = nested ? 30 : 500;
       for (const version of ['current', 'published'] as const) {
         options.progress?.(`Reading ${model.apiKey} (${version})`);
         await pages(
           (offset) =>
             readNativeRecordPage(client, {
               filter: { type: model.id },
-              nested: true,
+              nested,
               version,
               order_by: 'id_ASC',
-              page: { offset, limit: 30 },
+              page: { offset, limit },
             }),
-          30,
+          limit,
           concurrency,
           (rows) => {
             store.transaction(() => {
@@ -363,8 +631,8 @@ async function captureOnce(input: CaptureInput): Promise<void> {
                     'INVALID_RESPONSE',
                     'Record is malformed.',
                   );
-                const record = canonicalRecord(row, null, schema);
-                if (record.modelId !== model.id)
+                // Records are canonicalized once, below, with both versions.
+                if (rawModelId(row) !== model.id)
                   throw new ContentError(
                     'INVALID_RESPONSE',
                     'A model page contains a foreign record.',
@@ -374,7 +642,7 @@ async function captureOnce(input: CaptureInput): Promise<void> {
                 const inserted = insert.run(
                   side,
                   version,
-                  record.id,
+                  string(row.id, 'record ID'),
                   JSON.stringify(row),
                 );
                 if (!inserted.changes)
@@ -459,20 +727,13 @@ async function captureOnce(input: CaptureInput): Promise<void> {
         assertNotAborted(signal);
         states.push(canonicalRecord(current, pub, schema, schedules));
       });
-      // Bound memory to one nested-read batch and commit all dependency indexes
-      // together. Autocommitting each block/reference makes large captures pay
-      // millions of disk transactions and can leave a partially indexed record.
+      // Bound memory to one batch and commit it in one transaction. Dependency
+      // indexes are not built here: the planner rebuilds them from these
+      // records, and apply never reads them.
       store.transaction(() => {
         for (const state of states) {
           assertNotAborted(signal);
           store.putRecord(side, state);
-          const inspected = inspectRecord(state, schema);
-          for (const reference of inspected.references)
-            store.putReference(side, reference);
-          for (const owner of inspected.blockOwners)
-            store.putBlockOwner(side, owner);
-          for (const value of inspected.uniqueValues)
-            store.putUniqueValue(side, value);
         }
       });
     }
@@ -486,43 +747,7 @@ async function captureOnce(input: CaptureInput): Promise<void> {
         'CAPTURE_DRIFT',
         `Published record ${orphan.id} disappeared during capture.`,
       );
-    options.progress?.('Reading asset metadata');
-    await pages(
-      (offset) =>
-        client.uploads.rawList({
-          order_by: 'id_ASC',
-          page: { offset, limit: 500 },
-        }),
-      500,
-      concurrency,
-      (uploads) => {
-        store.transaction(() => {
-          for (const raw of uploads) {
-            assertNotAborted(signal);
-            const upload = canonicalUpload(raw);
-            if (store.getUpload(side, upload.id))
-              throw new ContentError(
-                'CAPTURE_DRIFT',
-                `Duplicate upload ${upload.id}.`,
-              );
-            store.putUpload(side, upload);
-          }
-        });
-      },
-      signal,
-    );
-    assertNotAborted(signal);
-    for (const raw of await client.uploadCollections.list()) {
-      assertNotAborted(signal);
-      const collection = canonicalCollection(raw);
-      if (store.getCollection(side, collection.id))
-        throw new ContentError(
-          'CAPTURE_DRIFT',
-          `Duplicate collection ${collection.id}.`,
-        );
-      store.putCollection(side, collection);
-    }
-    assertNotAborted(signal);
+    await captureAssets({ ...input, store });
   } finally {
     db.prepare('DELETE FROM capture_raw WHERE side=?').run(side);
     db.exec(
@@ -532,10 +757,81 @@ async function captureOnce(input: CaptureInput): Promise<void> {
   }
 }
 
+/**
+ * The consistency check without a second full read. A record edited while the
+ * first pass read it has a new version afterwards, so one listing after the
+ * pass proves every record was unchanged at the moment the pass ended.
+ * Uploads and collections are cheap to list and are reread in full.
+ */
+async function verifyByVersions(input: CaptureInput): Promise<void> {
+  const signal = input.options.signal;
+  const scan = `verify-${input.side}`;
+  const assets = new SnapshotStore();
+  try {
+    input.options.progress?.('Checking capture consistency by version');
+    const schema = await fetchSchema(input.client, input.environmentId);
+    assertNotAborted(signal);
+    if (
+      schema.hash !== input.schema.hash ||
+      schema.siteId !== input.schema.siteId
+    )
+      throw new ContentError(
+        'CAPTURE_DRIFT',
+        'The schema changed during capture.',
+      );
+    await scanFingerprints({ ...input, schema, scan });
+    const {
+      changed: newer,
+      missing,
+      extra,
+    } = fingerprintDifferences(input.store, input.side, scan);
+    const changed =
+      missing ??
+      extra ??
+      (await contentDifferences(
+        input.client,
+        schema,
+        newer,
+        (id) => input.store.getRecord(input.side, id),
+        input.options,
+      ));
+    if (changed)
+      throw new ContentError(
+        'CAPTURE_DRIFT',
+        `Record ${changed} changed during capture. Start a new generation after editing stops.`,
+      );
+    await captureAssets({ ...input, store: assets });
+    const after = await fetchSchema(input.client, input.environmentId);
+    assertNotAborted(signal);
+    if (
+      after.hash !== schema.hash ||
+      (await snapshotDigest(input.store, input.side, signal, false)) !==
+        (await snapshotDigest(assets, input.side, signal, false))
+    )
+      throw new ContentError(
+        'CAPTURE_DRIFT',
+        'Assets or schema changed during capture. Start a new generation after editing stops.',
+      );
+  } finally {
+    clearScan(input.store, scan);
+    assets.dispose();
+  }
+}
+
+/** A digest of a side's uploads and collections. */
+export function assetDigest(
+  store: SnapshotStore,
+  side: Side,
+  signal?: AbortSignal,
+): Promise<string> {
+  return snapshotDigest(store, side, signal, false);
+}
+
 async function snapshotDigest(
   store: SnapshotStore,
   side: Side,
   signal?: AbortSignal,
+  records = true,
 ): Promise<string> {
   const digest = createHash('sha256');
   let count = 0;
@@ -543,7 +839,7 @@ async function snapshotDigest(
     if (++count % 30 === 0) await setImmediate();
     assertNotAborted(signal);
   };
-  for (const record of store.records(side)) {
+  for (const record of records ? store.records(side) : []) {
     await checkpoint();
     digest
       .update(
@@ -580,6 +876,10 @@ export async function captureSnapshot(input: CaptureInput): Promise<void> {
   assertNotAborted(signal);
   await captureOnce(input);
   if (input.verify === false) return;
+  if (input.verify === 'versions') {
+    await verifyByVersions(input);
+    return;
+  }
   // These checks are necessary because DatoCMS maintenance mode applies only
   // to primary and does not make it an immutable snapshot or transaction. No
   // public persistent sandbox freeze exists; rereads reject observed drift.
