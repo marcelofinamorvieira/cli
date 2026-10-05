@@ -10,7 +10,7 @@ This is the DatoCMS CLI - a monorepo containing CLI tools for managing DatoCMS p
 - `@datocms/cli` (`packages/cli-legacy/`): Legacy scoped alias that just depends on `datocms`
 - `@datocms/cli-plugin-wordpress`: WordPress import functionality
 - `@datocms/cli-plugin-contentful`: Contentful import functionality
-- `@datocms/cli-plugin-content-diff`: Content migrations between environments or projects (`content:diff`), with its own `migrations:new` and `migrations:run`
+- `@datocms/cli-plugin-content-diff`: Content bundles between environments or projects (`content:diff`, `content:apply`)
 - `@datocms/cli-utils`: Shared utilities and base commands
 
 ## Architecture
@@ -86,10 +86,7 @@ npm run prepack  # Build + generate oclif manifest
   what is missing and how to fix it, so a misconfiguration fails as itself
   rather than as a 401 halfway through an import
 - `packages/cli`'s suite needs nothing, and neither does
-  `packages/cli-plugin-content-diff`'s; its live suites are separate opt-in
-  scripts (see its `test/e2e/README.md`). Its `test/compat/host-sources.test.ts`
-  fails when `packages/cli`'s migrations code changes, because the plugin
-  replaces `migrations:new` and `migrations:run` with copies of it
+  `packages/cli-plugin-content-diff`'s
 
 ## Code Quality
 

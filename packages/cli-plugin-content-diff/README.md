@@ -2,7 +2,7 @@
 
 Compare content across DatoCMS environments, export a reviewable bundle, and apply it into an isolated destination fork. This plugin adds `content:diff` and `content:apply`; schema migrations continue to use the normal DatoCMS CLI commands.
 
-Requires Node.js 22.13+ on the 22.x line, or Node.js 24+. Install the plugin in the DatoCMS CLI:
+Requires Node.js 22.13+ on the 22.x line, or Node.js 24+. On Node.js 22, each run prints an `ExperimentalWarning` about SQLite to stderr; it is harmless. Install the plugin in the DatoCMS CLI:
 
 ```sh
 datocms plugins:install @datocms/cli-plugin-content-diff
@@ -53,7 +53,7 @@ datocms content:diff \
 
 ## Review and apply
 
-Review `manifest.json` and the `plan/*.jsonl` entries before applying. Changed entries contain complete baseline and desired states. Unchanged entries contain fingerprints and the metadata needed to preserve dependencies, publication, ordering, and schedules. Required new/replacement upload binaries are downloaded and checked during generation.
+Review `manifest.json` and the `plan/*.jsonl` entries before applying. Changed entries contain complete baseline and desired states. Unchanged entries contain fingerprints and the metadata needed to preserve dependencies, publication, ordering, and schedules. Required new/replacement upload binaries are downloaded and checked during generation; transient download failures are retried a few times before generation fails.
 
 ```sh
 datocms content:apply ./content-bundle --profile=target-project
@@ -67,7 +67,7 @@ Apply verifies the manifest, JSONL chunks, asset binaries, destination project b
 | `--allow-primary` | Additionally authorize in-place primary writes; requires `--in-place`. |
 | `--keep-failed-fork` | Keep a fork created by this run if execution fails. |
 | `--allow-temporary-schema-changes` | Permit the exact temporary validator/default changes recorded in the bundle. |
-| `--concurrency=4` | Bound independent writes to a value from 1 to 16. Dependent writes retain their required order. |
+| `--concurrency=4` | Bound independent requests to a value from 1 to 16. Dependent writes retain their required order. |
 
 Existing managed schedules are temporarily cancelled before content changes and exact desired future schedules are restored after verification. Temporary field settings are restored before success. In-place failures attempt to restore original schedules and temporary settings; failures report repair problems. Failed forks created by the run are removed unless explicitly retained. Pre-existing environments are never deleted.
 
@@ -75,13 +75,25 @@ DatoCMS provides no public persistent sandbox write freeze. Maintenance mode app
 
 ## Bundle format and lifecycle
 
-A complete bundle contains a small checksummed `manifest.json`, a streamed checksummed `chunks.jsonl` index, deterministic byte-bounded JSONL plan chunks, and checksummed asset files referenced by upload entries. Integrity checks reject unsafe relative paths, symlinks, duplicate identities, malformed executable states, and changed bytes. Bundles are content exports and exclude client authentication credentials.
+A complete bundle contains a small checksummed `manifest.json`, a streamed checksummed `chunks.jsonl` index, deterministic byte-bounded JSONL plan chunks, and checksummed asset files referenced by upload entries. Integrity checks reject unsafe relative paths, symlinks, duplicate identities, malformed executable states, and files that do not match their checksums. The checksums are stored inside the bundle, so they detect accidental corruption and partial copies, not deliberate edits. Between review and apply, keep a reviewed bundle where only trusted people can change it, or record the value in its `manifest.sha256` and check that it is unchanged before applying. Bundles are content exports and exclude client authentication credentials.
 
-Generation and application are one-shot operations. Temporary SQLite databases and staging files are removed on completion or failure. Completed bundles survive application and can be retained as exports. The format does not accept progress files, checkpoints, or temporary databases as inputs. Previous unreleased generated migration/runtimes are unsupported.
+Generation and application are one-shot operations. Temporary SQLite databases and staging files are removed on completion or failure. Completed bundles survive application and can be retained as exports. The format does not accept progress files, checkpoints, or temporary databases as inputs.
 
-SIGINT and SIGTERM stop queued work, wait for submitted CMA operations to settle, and run the same restoration and cleanup as other failures. Cleanup can take time while a CMA operation is pending. Forced process termination, such as SIGKILL or a machine shutdown, cannot run cleanup; inspect the destination before starting a new operation.
+SIGINT, SIGTERM, and SIGHUP stop queued work, wait for submitted CMA operations to settle, and run the same restoration and cleanup as other failures. Cleanup can take time while a CMA operation is pending. Closing the terminal therefore stops a run too; start long runs inside a terminal multiplexer such as tmux. Forced process termination, such as SIGKILL or a machine shutdown, cannot run cleanup; inspect the destination before starting a new operation, and delete any leftover `content-diff-*` directory in the temporary directory and `.content-bundle-*` directory next to the output.
 
 Both commands support `--json` and the standard CLI logging flags. Authentication credentials are redacted from request logs and surfaced errors.
+
+## Known limitations
+
+- Record and upload creators are not preserved: records and uploads that apply creates are attributed to the API token or account that runs it. This matters for roles limited to records their user created.
+- Only the timestamps that clients can set are preserved: `created_at` and `first_published_at`. A record that apply writes gets a new `updated_at`, one that it publishes gets a new `published_at`, and version history is not copied from the source.
+- In models with draft/published, a cycle of published references among records that are new to the destination or not yet published there, such as two new articles that link to each other, cannot be planned. Generation fails, and `--allow-partial` skips the records in the cycle and everything that depends on them.
+- In sortable and tree models, created and updated records take their source position, and every other destination record keeps its current one. If two records in the same sibling group would end up at the same position (for example, a record was removed from the middle of a source list while `--include-deletions` is off, or each environment added a different record at the same place), generation fails with `ORDERING_CONFLICT`, which `--allow-partial` cannot skip.
+- References stored inside JSON or text fields, such as IDs saved by plugin field editors or asset URLs in Markdown, are not tracked as dependencies. `--uploads=referenced` does not bundle the assets they point to, and `--include-deletions` can delete records they point to.
+- When a bundle has changes to apply, apply cancels the scheduled publications and unpublishings of records in the models selected with `--item-types` while it runs and recreates them at the end. A schedule that falls due during the run is not executed, and the run fails when it tries to recreate it.
+- Apply never promotes the fork, and edits made in the destination after the fork was created are not in it.
+- Apply's writes are ordinary content edits, so they trigger the webhooks configured for those events in the environment being written, and a large bundle can send many events.
+- Working data lives in a `content-diff-*` directory inside the operating system's temporary directory (`TMPDIR` on macOS and Linux) and can be large: roughly a copy of the content of both environments, plus a staged copy of each asset file while apply uploads it.
 
 ## Development
 

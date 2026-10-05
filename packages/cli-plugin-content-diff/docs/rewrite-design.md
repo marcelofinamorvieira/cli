@@ -2,9 +2,7 @@
 
 ## Scope
 
-Replace the unreleased content-diff implementation. Existing generated plans,
-runtimes, migration-command overrides, and their compatibility layers are not
-supported. The new public commands are `content:diff` and `content:apply`.
+The public commands are `content:diff` and `content:apply`.
 
 ## Agreed requirements
 
@@ -58,7 +56,7 @@ supported. The new public commands are `content:diff` and `content:apply`.
     `--keep-failed-fork` was supplied. Never delete a pre-existing environment.
 20. Keep completed bundles. They are content exports and must exclude credentials.
 
-Decision 22 is deferred: no fixed 1 GiB RAM acceptance target and no mandatory
+Large-scale acceptance is deferred: no fixed 1 GiB RAM acceptance target and no mandatory
 600k benchmark or live-scale gate. Ordinary correctness, compilation, lint,
 CLI, packaging, failure, and cleanup verification are required. Large-project
 readiness must not be presented as experimentally verified without evidence.
@@ -81,9 +79,7 @@ readiness must not be presented as experimentally verified without evidence.
 
 ## Implementation and verification
 
-The old implementation, generated runtime machinery, migration overrides, and
-compatibility fixtures have been removed. Focused correctness tests cover the
-new contract.
+Focused correctness tests cover this contract.
 Use bounded local/mock cases for nested content, lifecycle, dependencies,
 integrity, CLI routing, uncertain outcomes, and cleanup. Do not call live CMA
 projects without explicit authorization or run deferred large-scale acceptance

@@ -1,9 +1,0 @@
-# The generated runtime source is embedded byte for byte in versioned
-# migration runtimes, so it must keep LF line endings on every checkout.
-src/content-diff/generated/** text eol=lf
-# Every input of scripts/runtime-shared.mjs must be LF too: the generator
-# rejects shared modules with CRLF line endings, and `npm run build` (and so a
-# git install's prepare) runs its --check first.
-src/content-diff/shared/** text eol=lf
-src/content-diff/runtime-template.ts text eol=lf
-scripts/runtime-shared.mjs text eol=lf

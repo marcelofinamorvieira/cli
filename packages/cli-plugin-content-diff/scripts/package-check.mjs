@@ -64,17 +64,10 @@ function assertNoCredentials(files) {
 try {
   const metadata = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   assert.equal(metadata.engines.node, '^22.13.0 || >=24.0.0');
-  assert.equal(
-    metadata.oclif.hooks,
-    undefined,
-    'legacy init hooks remain configured',
-  );
-  assert.equal(
-    Object.keys(metadata.scripts).some(
-      (key) => key.startsWith('runtime:') || key.startsWith('test:e2e:'),
-    ),
-    false,
-    'legacy runtime/test scripts remain configured',
+  // Without it, oclif describes the topic with the first command's summary.
+  assert.ok(
+    metadata.oclif.topics?.content?.description,
+    'the content topic has no description',
   );
   run('npm', ['run', 'build']);
   run('npm', ['exec', '--', 'oclif', 'manifest']);
@@ -107,17 +100,6 @@ try {
     expected.sort(),
     'package dry-run contains unexpected or missing files',
   );
-  const legacy = files.filter(
-    (path) =>
-      /^lib\/(?:content-diff|hooks|compat|commands\/migrations|utils\/(?:environments-diff|migrations))\//.test(
-        path,
-      ) || /^lib\/utils\/migrations-/.test(path),
-  );
-  assert.deepEqual(
-    legacy,
-    [],
-    'legacy migration/runtime/compatibility files remain packaged',
-  );
   for (const name of [
     'types',
     'errors',
@@ -146,12 +128,6 @@ try {
       '--help',
     ]);
     assert.ok(help.includes(command), `compiled help is missing ${command}`);
-    assert.ok(
-      !/autogenerate|migrations-dir|migrations-model|bundle-assets|migrate-invalid-content|--resume|--pause/.test(
-        help,
-      ),
-      `compiled help exposes legacy flags for ${command}`,
-    );
   }
   console.log(
     `Verified ${files.length} package files, both content commands, bundle engine modules, and credential exclusion without publishing.`,

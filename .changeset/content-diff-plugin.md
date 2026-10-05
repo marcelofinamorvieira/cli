@@ -1,16 +1,14 @@
 ---
-"@datocms/cli-plugin-content-diff": minor
+'@datocms/cli-plugin-content-diff': minor
 ---
 
-Add `@datocms/cli-plugin-content-diff`, a plugin that moves content between
-environments, or between duplicated projects, as a reviewable migration.
+Add `@datocms/cli-plugin-content-diff`, a plugin that copies content between
+two DatoCMS environments, in the same project or across two projects.
 
 `content:diff` compares a source environment with a destination and writes a
-migration plus a plan listing every change: records with their current and
-published versions, nested blocks, references, uploads and upload collections,
-publication schedules, positions and workflow stages. Generating never changes
-the project. The migration applies the plan with `migrations:run`, normally in
-a fork, and verifies the result before it finishes.
+reviewable, checksummed content bundle. It never changes either project.
 
-The plugin supplies its own `migrations:new` and `migrations:run`, which keep
-working for ordinary migrations, and supports `datocms` 4.x from 4.2.0 on.
+`content:apply` verifies the bundle, applies it into a new fork of the
+destination, and verifies the result before it finishes. It writes into an
+existing environment only when asked to with explicit flags, and it never
+promotes the fork. The plugin requires Node.js 22.13+ or 24+.
