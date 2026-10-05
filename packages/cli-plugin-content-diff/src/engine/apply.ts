@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { stageBinary } from './apply-binary';
 import { validateExecution } from './apply-validation';
@@ -1147,12 +1148,21 @@ async function upload(context: Context, entry: UploadPlan): Promise<void> {
       entry.binary,
       context.signal,
     );
-    assertNotAborted(context.signal);
-    const path = await CmaClient.uploadLocalFileAndReturnPath(
-      context.client,
-      staged,
-      { filename: `${randomUUID()}-${desired.filename}` },
-    );
+    let path: string;
+    try {
+      assertNotAborted(context.signal);
+      path = await CmaClient.uploadLocalFileAndReturnPath(
+        context.client,
+        staged,
+        { filename: `${randomUUID()}-${desired.filename}` },
+      );
+    } finally {
+      // The bundle retains the verified bytes. Remove each copy once its
+      // upload settles, bounding staged disk use by the write concurrency.
+      // A failed removal must not mask the upload result; disposal of the
+      // working directory removes any remaining copy.
+      await rm(staged, { force: true }).catch(() => undefined);
+    }
     const beforeBinaryWrite = await findMaybe(() =>
       context.client.uploads.find(entry.id),
     );
@@ -2152,23 +2162,33 @@ export async function applyBundle(args: {
         recordRepairFailure(`Failed fork ${ownedFork}: ${String(repair)}`);
       }
     }
-    if (repairFailureCount)
-      throw new ContentError(
-        'APPLY_FAILED_REPAIR_INCOMPLETE',
-        `${
-          error instanceof Error ? error.message : String(error)
-        } Cleanup problems: ${repairFailureCount} repair ${
-          repairFailureCount === 1 ? 'failure' : 'failures'
-        }; showing ${repairs.length} ${
-          repairs.length === 1 ? 'sample' : 'samples'
-        }: ${repairs.join('; ')}`,
-        {
-          repairFailureCount,
-          retainedRepairSamples: repairs.length,
-          repairSamples: repairs,
-        },
-      );
-    throw error;
+    const failure = repairFailureCount
+      ? new ContentError(
+          'APPLY_FAILED_REPAIR_INCOMPLETE',
+          `${
+            error instanceof Error ? error.message : String(error)
+          } Cleanup problems: ${repairFailureCount} repair ${
+            repairFailureCount === 1 ? 'failure' : 'failures'
+          }; showing ${repairs.length} ${
+            repairs.length === 1 ? 'sample' : 'samples'
+          }: ${repairs.join('; ')}`,
+          {
+            repairFailureCount,
+            retainedRepairSamples: repairs.length,
+            repairSamples: repairs,
+          },
+        )
+      : error;
+    // Progress output can be off (for example under --json), so a retained
+    // fork is also named on the reported failure.
+    if (
+      ownedFork &&
+      forkRequested &&
+      args.options.keepFailedFork &&
+      failure instanceof Error
+    )
+      Object.assign(failure, { keptForkEnvironmentId: ownedFork });
+    throw failure;
   } finally {
     // The bundle is an export and survives both success and failure. Only the
     // SQLite workspace owned by this execution is disposed here.

@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { CmaClient } from '@datocms/cli-utils';
 import { afterEach, describe, it } from 'mocha';
 import ContentApplyCommand from '../../src/commands/content/apply';
 import ContentDiffCommand from '../../src/commands/content/diff';
 import * as apply from '../../src/engine/apply';
 import * as bundle from '../../src/engine/bundle';
 import * as capture from '../../src/engine/capture';
+import { ContentError } from '../../src/engine/errors';
 import * as planner from '../../src/engine/planner';
 import * as schema from '../../src/engine/schema';
 import type { SnapshotStore } from '../../src/engine/store';
@@ -19,6 +21,7 @@ import {
   environmentId,
   selectedModels,
 } from '../../src/utils/content-command';
+import { REDACTED_CREDENTIAL } from '../../src/utils/credential-redaction';
 
 const root = resolve(__dirname, '../..');
 const restorations: (() => void)[] = [];
@@ -255,6 +258,244 @@ describe('content command integration', () => {
     assert.deepEqual(await command.run(), result);
   });
 
+  it('passes each paired profile its own endpoint API token', async () => {
+    const requested: [string | undefined, string | undefined][] = [];
+    const command = Object.assign(Object.create(ContentDiffCommand.prototype), {
+      parse: async () => ({
+        flags: {
+          source: 'source',
+          destination: 'primary',
+          output: join(tmpdir(), `content-command-missing-${process.pid}`),
+          'source-profile': 'one',
+          'destination-profile': 'two',
+          'source-api-token': 'source-token',
+          'destination-api-token': 'destination-token',
+          'item-types': 'all',
+          uploads: 'referenced',
+          concurrency: 4,
+          'chunk-bytes': 1024,
+        },
+      }),
+      endpoint: async (profileId?: string, apiToken?: string) => {
+        requested.push([profileId, apiToken]);
+        return {
+          rootClient: {
+            environments: {
+              list: async () => {
+                throw new Error('stop after endpoint selection');
+              },
+            },
+          },
+          buildEnvironmentClient: () => ({}),
+        };
+      },
+      progress: () => undefined,
+      jsonEnabled: () => true,
+    });
+    await assert.rejects(command.run(), /stop after endpoint selection/);
+    assert.deepEqual(requested, [
+      ['one', 'source-token'],
+      ['two', 'destination-token'],
+    ]);
+  });
+
+  it('reports a partial bundle and a kept fork in human-readable output', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'content-command-apply-'));
+    try {
+      const counts = (skip: number) => ({
+        create: 0,
+        update: 1,
+        delete: 0,
+        noop: 0,
+        skip,
+      });
+      await writeFile(
+        join(directory, 'manifest.json'),
+        JSON.stringify({
+          counts: {
+            record: counts(2),
+            upload: counts(1),
+            collection: counts(0),
+          },
+        }),
+      );
+      let outcome: unknown = {
+        environmentId: 'isolated',
+        mutations: 3,
+        partial: true,
+      };
+      replace(
+        apply,
+        'applyBundle',
+        async (args: Parameters<typeof apply.applyBundle>[0]) => {
+          if (outcome instanceof Error) {
+            args.options.log?.('Kept failed fork content-apply-kept');
+            throw outcome;
+          }
+          return outcome;
+        },
+      );
+      const logged: string[] = [];
+      const progress: string[] = [];
+      const command = (bundlePath: string) =>
+        Object.assign(Object.create(ContentApplyCommand.prototype), {
+          parse: async () => ({
+            args: { BUNDLE: bundlePath },
+            flags: {
+              'in-place': false,
+              'allow-primary': false,
+              'keep-failed-fork': true,
+              'allow-temporary-schema-changes': false,
+              concurrency: 4,
+            },
+          }),
+          endpoint: async () => ({
+            rootClient: {},
+            buildEnvironmentClient: () => ({}),
+          }),
+          log: (message: string) => logged.push(message),
+          logToStderr: (message: string) => progress.push(message),
+          jsonEnabled: () => false,
+        });
+      await command(directory).run();
+      await command(join(directory, 'missing')).run();
+      outcome = { environmentId: 'isolated', mutations: 3, partial: false };
+      await command(directory).run();
+      assert.deepEqual(logged, [
+        'Applied 3 mutations in environment "isolated" from a partial bundle; 3 skipped entries were not applied.',
+        'Applied 3 mutations in environment "isolated" from a partial bundle; its skipped entries were not applied.',
+        'Applied 3 mutations in environment "isolated".',
+      ]);
+      outcome = new ContentError('APPLY_FAILED', 'Injected failure.');
+      await assert.rejects(command(directory).run(), /Injected failure/);
+      assert.deepEqual(progress, ['Kept failed fork content-apply-kept']);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reports --json failures as redacted JSON errors with the human exit status', async () => {
+    const reported: unknown[] = [];
+    const command = Object.assign(
+      Object.create(ContentApplyCommand.prototype),
+      {
+        jsonEnabled: () => true,
+        logJson: (json: unknown) => reported.push(json),
+      },
+    );
+    command.credentialRedactor.register('failure-token');
+    const previousExitCode = process.exitCode;
+    const exitCodes: unknown[] = [];
+    try {
+      for (const error of [
+        Object.assign(
+          new ContentError(
+            'APPLY_FAILED',
+            'Request with failure-token failed.',
+            { step: 'records' },
+          ),
+          { keptForkEnvironmentId: 'content-apply-kept' },
+        ),
+        Object.assign(new Error('Invalid flags.'), {
+          oclif: { exit: 2 },
+          suggestions: ['See --help'],
+          parse: { input: { argv: ['--api-token=failure-token'] } },
+        }),
+        Object.assign(new ContentError('INTERRUPTED', 'Interrupted.'), {
+          exitCode: 130,
+          oclif: { exit: 130 },
+        }),
+        Object.assign(new Error('PUT /items/1: 401 Unauthorized'), {
+          name: 'ApiError',
+          errors: [{ attributes: { code: 'INVALID_AUTHORIZATION_HEADER' } }],
+        }),
+      ]) {
+        process.exitCode = undefined;
+        await command.catch(error);
+        exitCodes.push(process.exitCode);
+      }
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+    assert.deepEqual(exitCodes, [1, 2, 130, 1]);
+    assert.deepEqual(JSON.parse(JSON.stringify(reported)), [
+      {
+        error: {
+          name: 'ContentError',
+          message: `Request with ${REDACTED_CREDENTIAL} failed.`,
+          code: 'APPLY_FAILED',
+          details: { step: 'records' },
+          keptForkEnvironmentId: 'content-apply-kept',
+        },
+      },
+      {
+        error: {
+          name: 'Error',
+          message: 'Invalid flags.',
+          suggestions: ['See --help'],
+        },
+      },
+      {
+        error: {
+          name: 'ContentError',
+          message: 'Interrupted.',
+          code: 'INTERRUPTED',
+        },
+      },
+      {
+        error: {
+          name: 'ApiError',
+          message: 'PUT /items/1: 401 Unauthorized',
+          code: 'INVALID_AUTHORIZATION_HEADER',
+        },
+      },
+    ]);
+    const human = Object.assign(Object.create(ContentApplyCommand.prototype), {
+      jsonEnabled: () => false,
+      logJson: () => assert.fail(),
+    });
+    human.credentialRedactor.register('failure-token');
+    const failure = Object.assign(new Error('Uses failure-token.'), {
+      oclif: { exit: 2 },
+    });
+    await assert.rejects(human.catch(failure), (error) => error === failure);
+    assert.equal(failure.message, `Uses ${REDACTED_CREDENTIAL}.`);
+  });
+
+  it('honors --log-level for content:diff despite its --output flag', async () => {
+    const levels: unknown[] = [];
+    for (const [flags, profile] of [
+      [{ 'log-level': 'BODY' }, undefined],
+      [{}, { logLevel: 'BASIC' }],
+      [{ 'log-level': 'BODY', json: true }, undefined],
+      [{}, undefined],
+    ] as const) {
+      const command = Object.assign(
+        Object.create(ContentDiffCommand.prototype),
+        {
+          parse: async () => ({
+            flags: {
+              source: 'source',
+              output: './bundle',
+              'api-token': 'placeholder-token',
+              ...flags,
+            },
+          }),
+          profileId: 'default',
+          datoProfileConfig: profile,
+        },
+      );
+      const { rootClient } = await command.endpoint();
+      levels.push(rootClient.config.logLevel);
+    }
+    assert.deepEqual(levels, [
+      CmaClient.LogLevel.BODY,
+      CmaClient.LogLevel.BASIC,
+      CmaClient.LogLevel.NONE,
+      CmaClient.LogLevel.NONE,
+    ]);
+  });
+
   it('rejects incompatible or legacy CLI flags before resolving client authentication', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'content-command-parse-'));
     const environment: NodeJS.ProcessEnv = {
@@ -265,46 +506,117 @@ describe('content command integration', () => {
     for (const key of Object.keys(environment))
       if (/^DATOCMS_.*API_TOKEN$/.test(key)) delete environment[key];
     try {
-      const cases = [
-        ['content:diff', '--source=a', '--output=b', '--source-profile=one'],
-        [
-          'content:diff',
-          '--source=a',
-          '--output=b',
-          '--source-profile=one',
-          '--destination-profile=two',
-          '--profile=three',
-        ],
-        [
-          'content:diff',
-          '--source=a',
-          '--output=b',
-          '--source-profile=one',
-          '--destination-profile=two',
-          '--api-token=placeholder',
-        ],
-        ['content:diff', '--source=a', '--output=b', '--concurrency=0'],
-        ['content:diff', '--source=a', '--output=b', '--chunk-bytes=0'],
-        ['content:diff', '--source=a', '--output=b', '--autogenerate=legacy'],
-        ['content:apply', './bundle', '--allow-primary'],
+      const cases: {
+        args: string[];
+        message: RegExp;
+        code?: string;
+        status: number;
+      }[] = [
+        {
+          args: [
+            'content:diff',
+            '--source=a',
+            '--output=b',
+            '--source-profile=one',
+          ],
+          message:
+            /All of the following must be provided when using --source-profile: --destination-profile/,
+          status: 2,
+        },
+        {
+          args: [
+            'content:diff',
+            '--source=a',
+            '--output=b',
+            '--source-profile=',
+            '--destination-profile=two',
+          ],
+          message: /Both source and destination profiles must be nonempty\./,
+          status: 2,
+        },
+        {
+          args: [
+            'content:diff',
+            '--source=a',
+            '--output=b',
+            '--source-profile=one',
+            '--destination-profile=two',
+            '--profile=three',
+          ],
+          message: /--profile and --api-token select a single project\./,
+          status: 2,
+        },
+        {
+          args: [
+            'content:diff',
+            '--source=a',
+            '--output=b',
+            '--source-profile=one',
+            '--destination-profile=two',
+            '--api-token=placeholder-flag-token',
+          ],
+          message: /--profile and --api-token select a single project\./,
+          status: 2,
+        },
+        {
+          args: ['content:diff', '--source=a', '--output=b', '--concurrency=0'],
+          message: /Concurrency must be an integer from 1 to 16\./,
+          code: 'INVALID_CONCURRENCY',
+          status: 1,
+        },
+        {
+          args: ['content:diff', '--source=a', '--output=b', '--chunk-bytes=0'],
+          message: /--chunk-bytes must be a positive safe integer\./,
+          code: 'INVALID_CHUNK_SIZE',
+          status: 1,
+        },
+        {
+          args: [
+            'content:diff',
+            '--source=a',
+            '--output=b',
+            '--api-token=placeholder-flag-token',
+            '--autogenerate=legacy',
+          ],
+          message: /Nonexistent flag: --autogenerate=legacy/,
+          status: 2,
+        },
+        {
+          args: ['content:apply', './bundle', '--allow-primary'],
+          message: /--allow-primary requires --in-place\./,
+          code: 'INVALID_PRIMARY_AUTHORIZATION',
+          status: 1,
+        },
       ];
-      for (const args of cases) {
-        const result = spawnSync(
-          process.execPath,
-          [join(root, 'bin/dev'), ...args],
-          {
-            cwd: directory,
-            env: environment,
-            encoding: 'utf8',
-            timeout: 20_000,
-          },
-        );
-        assert.equal(result.error, undefined);
-        assert.notEqual(result.status, 0, args.join(' '));
-        assert.doesNotMatch(
-          `${result.stdout}${result.stderr}`,
-          /Cannot find an API token|No API token is available|OAuth credentials|ECONNREFUSED|ENOTFOUND/,
-        );
+      for (const { args, message, code, status } of cases) {
+        for (const json of [false, true]) {
+          const label = `${args.join(' ')}${json ? ' --json' : ''}`;
+          const result = spawnSync(
+            process.execPath,
+            [join(root, 'bin/dev'), ...args, ...(json ? ['--json'] : [])],
+            {
+              cwd: directory,
+              env: environment,
+              encoding: 'utf8',
+              timeout: 20_000,
+            },
+          );
+          assert.equal(result.error, undefined, label);
+          assert.equal(result.status, status, label);
+          assert.doesNotMatch(
+            `${result.stdout}${result.stderr}`,
+            /Cannot find an API token|No API token is available|OAuth credentials|ECONNREFUSED|ENOTFOUND|placeholder-flag-token/,
+            label,
+          );
+          if (json) {
+            const { error } = JSON.parse(result.stdout);
+            assert.match(error.message, message, label);
+            assert.equal(error.code, code, label);
+          } else {
+            assert.match(result.stderr, message, label);
+            if (code) assert.match(result.stdout, new RegExp(code), label);
+          }
+        }
       }
     } finally {
       await rm(directory, { recursive: true, force: true });

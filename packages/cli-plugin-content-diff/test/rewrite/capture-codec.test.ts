@@ -1100,6 +1100,54 @@ describe('expanded capture and native payload codec', () => {
     }
   });
 
+  it('keeps SQLite failures while storing capture pages instead of reporting drift', async () => {
+    for (const scenario of ['full', 'error'] as const) {
+      const records = Array.from({ length: 31 }, (_, index) =>
+        rawRecord(identity(`stored-${index}`), { title: 'x'.repeat(2048) }),
+      );
+      const fixture = mockClient([model()], records);
+      const store = new SnapshotStore();
+      try {
+        const schema = await fetchSchema(fixture.client, 'source');
+        // Capture reuses an existing raw page table with this layout.
+        store.database.exec(
+          'CREATE TEMP TABLE capture_raw(side TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,slice,id)) WITHOUT ROWID',
+        );
+        if (scenario === 'full') {
+          const pages = store.database.prepare('PRAGMA temp.page_count').get()!
+            .page_count as number;
+          store.database.exec(`PRAGMA temp.max_page_count = ${pages}`);
+        } else {
+          store.database.exec(`
+            CREATE TEMP TRIGGER capture_unavailable BEFORE INSERT ON capture_raw
+            BEGIN SELECT json('unavailable'); END;
+          `);
+        }
+        await assert.rejects(
+          captureSnapshot({
+            client: fixture.client,
+            environmentId: 'source',
+            schema,
+            store,
+            side: 'source',
+            options: { modelIds: [MODEL], uploads: 'all' },
+            verify: false,
+          }),
+          (error: unknown) =>
+            !(error instanceof ContentError) &&
+            (scenario === 'full'
+              ? /database or disk is full/
+              : /malformed JSON/
+            ).test((error as Error).message),
+          scenario,
+        );
+        assert.equal([...store.records('source')].length, 0);
+      } finally {
+        store.dispose();
+      }
+    }
+  });
+
   it('rolls back a bounded record batch when a nested dependency cannot be indexed', async () => {
     const models = [
       model(MODEL, [field('blocks', 'rich_text')]),

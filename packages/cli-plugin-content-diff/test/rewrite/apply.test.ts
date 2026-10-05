@@ -2026,6 +2026,62 @@ describe('apply executor with the SDK resource contract', () => {
     }
   });
 
+  it('creates mutually linked records without draft mode before publication writes set their links', async () => {
+    const otherId = 'dddddddddddddddddddddd';
+    const desired = [
+      { id: recordId, fields: { title: 'a', link: otherId } },
+      { id: otherId, fields: { title: 'b', link: recordId } },
+    ].map(({ id, fields }) =>
+      state(fields, {
+        id,
+        published: fields,
+        firstPublishedAt: '2019-01-01T00:00:00.000Z',
+        publishedUpdatedAt: '2020-01-02T00:00:00.000Z',
+        validity: { current: true, published: true },
+      }),
+    );
+    // Creation also publishes on this model, so both seeds defer the mutual
+    // link and no publish edge orders the records; publication sets the links.
+    const entries = desired.map((record) => {
+      const entry = plan(null, record);
+      entry.execution = {
+        ...entry.execution,
+        creationFields: { ...record.current, link: null },
+      };
+      entry.safety.currentReferences = [record.current.link as string];
+      entry.safety.publishedReferences = [record.current.link as string];
+      return entry;
+    });
+    const mock = sdk();
+    mock.withoutDraftMode();
+    mock.withLinks();
+    const bundlePath = await bundle(directory, mock, entries);
+    const result = await applyBundle({
+      rootClient: mock.root,
+      buildEnvironmentClient: mock.client,
+      bundlePath,
+      options: defaults,
+    });
+    for (const record of desired) {
+      const actual = mock.environments
+        .get(result.environmentId)!
+        .get(record.id)!;
+      assert.deepEqual(actual.current, record.current);
+      assert.deepEqual(actual.published, record.published);
+    }
+    const writes = mock.events.filter((event) =>
+      /^(create|update):/.test(event),
+    );
+    assert.deepEqual(writes.slice(0, 2).sort(), [
+      `create:${recordId}`,
+      `create:${otherId}`,
+    ]);
+    assert.deepEqual(writes.slice(2).sort(), [
+      `update:${recordId}`,
+      `update:${otherId}`,
+    ]);
+  });
+
   it('publishes, unpublishes, and deletes records with self references without bypassing external referrers', async () => {
     for (const action of [
       'publish',
@@ -2551,6 +2607,160 @@ describe('apply executor with the SDK resource contract', () => {
     assert.deepEqual(mock.events, []);
   });
 
+  it('rejects a destination that is read-only or not ready before any mutation', async () => {
+    for (const [index, override] of [
+      { read_only_mode: true },
+      { status: 'creating' },
+    ].entries()) {
+      const runDirectory = join(directory, String(index));
+      mkdirSync(runDirectory);
+      const baseline = state({ title: 'old' });
+      const mock = sdk([baseline]);
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, state({ title: 'new' })),
+      ]);
+      const find = mock.root.environments.find;
+      mock.root.environments.find = (async (id: string) => {
+        const environment = await find(id);
+        return id === 'destination'
+          ? { ...environment, meta: { ...environment.meta, ...override } }
+          : environment;
+      }) as typeof find;
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: defaults,
+        }),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.code === 'DESTINATION_UNAVAILABLE',
+      );
+      assert.deepEqual(mock.events, []);
+    }
+  });
+
+  it('requires explicit consent for bundled temporary schema changes before any mutation', async () => {
+    const change: TemporarySchemaChange = {
+      modelId,
+      fieldId: 'cccccccccccccccccccccc',
+      original: { validators: { required: {} }, defaultValue: 'automatic' },
+      temporary: { validators: {}, defaultValue: null },
+      reasons: ['Explicit managed transition'],
+    };
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    mock.requireField();
+    const bundlePath = await bundle(
+      directory,
+      mock,
+      [plan(baseline, state({ title: 'new' }))],
+      [modelId],
+      [change],
+    );
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: { ...defaults, inPlace: true },
+      }),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.code === 'TEMPORARY_SCHEMA_CHANGES_REQUIRED',
+    );
+    assert.deepEqual(mock.events, []);
+    assert.deepEqual(mock.fieldStates.get('destination'), change.original);
+  });
+
+  it('rejects a destination schema changed since generation before a fork or content mutation', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    mock.fieldStates.set('destination', {
+      validators: { required: {} },
+      defaultValue: null,
+    });
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: defaults,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'DESTINATION_MISMATCH',
+    );
+    assert.deepEqual(mock.events, []);
+  });
+
+  it('rejects and removes a fork whose schema or content differs from the verified destination', async () => {
+    for (const drift of ['schema', 'content']) {
+      const runDirectory = join(directory, drift);
+      mkdirSync(runDirectory);
+      const baseline = state({ title: 'old' });
+      const mock = sdk([baseline]);
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, state({ title: 'new' })),
+      ]);
+      // A destination edit committed after its verified capture but before
+      // the fork copied it appears only in the fork.
+      mock.afterNextFork(() => {
+        const forkId = [...mock.environments.keys()].find(
+          (id) => id !== 'destination',
+        )!;
+        if (drift === 'schema')
+          mock.fieldStates.set(forkId, {
+            validators: { required: {} },
+            defaultValue: null,
+          });
+        else
+          mock.environments.get(forkId)!.get(recordId)!.current.title =
+            'edited while forking';
+      });
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: defaults,
+        }),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.code ===
+            (drift === 'schema' ? 'FORK_VERIFY_FAILED' : 'APPLY_CONFLICT'),
+      );
+      assert(!mock.events.some((event) => event.startsWith('update:')));
+      assert(mock.events.some((event) => event.startsWith('delete-fork:')));
+      assert.equal(mock.environments.size, 1);
+    }
+  });
+
+  it('rejects a schema changed during writes before accepting the final content', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    const concurrent = { validators: { required: {} }, defaultValue: null };
+    mock.afterNextUpdate(() => mock.fieldStates.set('destination', concurrent));
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: { ...defaults, inPlace: true },
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'SCHEMA_CONFLICT',
+    );
+    assert(mock.events.includes(`update:${recordId}`));
+    assert.deepEqual(mock.fieldStates.get('destination'), concurrent);
+  });
+
   it('deletes only its own failed fork, and honors keep-failed-fork', async () => {
     for (const keepFailedFork of [false, true]) {
       const runDirectory = join(directory, String(keepFailedFork));
@@ -2568,7 +2778,16 @@ describe('apply executor with the SDK resource contract', () => {
           bundlePath,
           options: { ...defaults, keepFailedFork },
         }),
-        /injected update failure/,
+        (error: Error & { keptForkEnvironmentId?: string }) => {
+          assert.match(error.message, /injected update failure/);
+          assert.equal(
+            error.keptForkEnvironmentId !== undefined &&
+              error.keptForkEnvironmentId !== 'destination' &&
+              mock.environments.has(error.keptForkEnvironmentId),
+            keepFailedFork,
+          );
+          return true;
+        },
       );
       assert(mock.environments.has('destination'));
       assert.equal(mock.environments.size, keepFailedFork ? 2 : 1);
@@ -3156,6 +3375,100 @@ describe('apply executor with the SDK resource contract', () => {
       }
     } finally {
       sdkUpload.uploadLocalFileAndReturnPath = uploadLocalFile;
+    }
+  });
+
+  it('removes each staged binary copy as soon as its upload succeeds or fails', async () => {
+    const sdkUpload = require(
+      join(
+        dirname(require.resolve('@datocms/cma-client-node')),
+        'utils/uploadLocalFileAndReturnPath.js',
+      ),
+    );
+    const uploadLocalFile = sdkUpload.uploadLocalFileAndReturnPath;
+    const dispose = SnapshotStore.prototype.dispose;
+    const staged: string[] = [];
+    const retained: string[] = [];
+    // The workspace removal would hide copies kept for the whole run.
+    SnapshotStore.prototype.dispose = function (this: SnapshotStore) {
+      retained.push(...staged.filter((path) => existsSync(path)));
+      dispose.call(this);
+    };
+    try {
+      for (const fail of [false, true]) {
+        const runDirectory = join(directory, String(fail));
+        mkdirSync(runDirectory);
+        const resource = uploadFixture();
+        const baseline = canonicalUpload(resource);
+        const bytes = Buffer.from('replacement bytes');
+        const native = clone(resource);
+        const wanted = clone(resource);
+        wanted.attributes.md5 = createHash('md5').update(bytes).digest('hex');
+        wanted.attributes.size = bytes.length;
+        const desired = canonicalUpload(wanted);
+        sdkUpload.uploadLocalFileAndReturnPath = async (
+          _client: Client,
+          path: string,
+        ) => {
+          assert(existsSync(path));
+          staged.push(path);
+          if (fail) throw new Error('injected upload failure');
+          return '/staged/replacement.txt';
+        };
+        const mock = sdk();
+        const originalClient = mock.client;
+        mock.client = (environmentId) => {
+          const client = originalClient(environmentId);
+          client.uploads.rawList = (async () => ({
+            data: [clone(native)],
+            meta: { total_count: 1 },
+          })) as unknown as Client['uploads']['rawList'];
+          client.uploads.find = (async () =>
+            clone(native)) as unknown as Client['uploads']['find'];
+          client.uploads.update = (async (_id: string, body: JsonObject) => {
+            if ('path' in body) {
+              assert(!existsSync(staged[staged.length - 1]));
+              native.attributes.md5 = desired.md5;
+              native.attributes.size = desired.size;
+            } else {
+              Object.assign(native.attributes, body);
+            }
+            return clone(native);
+          }) as unknown as Client['uploads']['update'];
+          return client;
+        };
+        const bundlePath = await bundle(
+          runDirectory,
+          mock,
+          [
+            {
+              kind: 'upload',
+              id: resource.id,
+              action: 'update',
+              baseline,
+              desired,
+              guard: { hash: baseline.hash },
+              diagnostics: [],
+            },
+          ],
+          [modelId],
+          [],
+          async () => new Response(bytes),
+        );
+        const execution = applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: { ...defaults, inPlace: true },
+        });
+        if (fail) await assert.rejects(execution, /injected upload failure/);
+        else await execution;
+      }
+      assert.equal(staged.length, 2);
+      assert.deepEqual(retained, []);
+    } finally {
+      sdkUpload.uploadLocalFileAndReturnPath = uploadLocalFile;
+      SnapshotStore.prototype.dispose = dispose;
     }
   });
 

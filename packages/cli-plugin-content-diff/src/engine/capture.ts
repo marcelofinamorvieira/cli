@@ -18,7 +18,7 @@ import {
   timestamp,
 } from './codec';
 import { ContentError } from './errors';
-import { assertFullReadAccess, fetchSchema } from './schema';
+import { assertFullReadAccess, compareIds, fetchSchema } from './schema';
 import { SnapshotStore } from './store';
 import type {
   CaptureOptions,
@@ -308,7 +308,7 @@ export async function readRecordBatch(
         'CAPTURE_DRIFT',
         `Published record ${id} disappeared from the current batch.`,
       );
-  return result.sort((a, b) => a.id.localeCompare(b.id));
+  return result.sort((a, b) => compareIds(a.id, b.id));
 }
 
 interface CaptureInput {
@@ -332,7 +332,9 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     'CREATE TEMP TABLE IF NOT EXISTS capture_raw(side TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,slice,id)) WITHOUT ROWID',
   );
   db.prepare('DELETE FROM capture_raw WHERE side=?').run(side);
-  const insert = db.prepare('INSERT INTO capture_raw VALUES(?,?,?,?)');
+  const insert = db.prepare(
+    'INSERT OR IGNORE INTO capture_raw VALUES(?,?,?,?)',
+  );
   try {
     // Capture every regular model. Outside the selected mutation scope these
     // rows prove reference safety and preservation, including incoming links.
@@ -367,17 +369,19 @@ async function captureOnce(input: CaptureInput): Promise<void> {
                     'INVALID_RESPONSE',
                     'A model page contains a foreign record.',
                   );
-                try {
-                  insert.run(side, version, record.id, JSON.stringify(row));
-                } catch (error) {
+                // Only a repeated identity is ignored. Other SQLite or I/O
+                // failures, such as a full temporary disk, keep their error.
+                const inserted = insert.run(
+                  side,
+                  version,
+                  record.id,
+                  JSON.stringify(row),
+                );
+                if (!inserted.changes)
                   throw new ContentError(
                     'CAPTURE_DRIFT',
                     'Duplicate record identity during capture.',
-                    {
-                      cause: error instanceof Error ? error.message : 'unknown',
-                    },
                   );
-                }
               }
             });
           },

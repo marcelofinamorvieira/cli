@@ -1502,6 +1502,68 @@ describe('indexed rewrite planner', () => {
     );
   });
 
+  it('does not wait for publication of creates that models without draft mode publish', async () => {
+    const automatic = model({
+      id: id('automatic'),
+      apiKey: 'automatic',
+      draftMode: false,
+      fields: [field({ id: LINK, apiKey: 'link', type: 'link' })],
+    });
+    const drafted = model({
+      fields: [field({ id: id('drafted-link'), apiKey: 'link', type: 'link' })],
+    });
+    const state = schema([drafted, automatic]);
+    const opts = options({ modelIds: [MODEL, automatic.id] });
+    const linked = (recordId: string, link: string, modelId: string) =>
+      record(
+        recordId,
+        { link },
+        {
+          modelId,
+          published: { link },
+          validity: { current: true, published: true },
+        },
+      );
+    await fixture(
+      [linked(A, B, automatic.id), linked(B, A, automatic.id)],
+      [],
+      state,
+      opts,
+      (store, metadata) => {
+        for (const recordId of [A, B]) {
+          const entry = store.getPlan('record', recordId) as RecordPlan;
+          assert.equal(entry.action, 'create');
+          assert.deepEqual(entry.diagnostics, []);
+          assert.deepEqual(entry.execution?.creationFields, { link: null });
+          assert.equal(entry.execution?.createOrder, 0);
+          assert.equal(entry.execution?.publishOrder, 0);
+        }
+        assert.deepEqual(metadata.temporarySchemaChanges, []);
+      },
+    );
+    // A new draft is published only in the publication phase, so the record
+    // linking back to it still writes that link afterwards.
+    await fixture(
+      [linked(A, B, MODEL), linked(B, A, automatic.id)],
+      [],
+      state,
+      opts,
+      (store, metadata) => {
+        const draft = store.getPlan('record', A) as RecordPlan;
+        const owner = store.getPlan('record', B) as RecordPlan;
+        for (const entry of [draft, owner]) {
+          assert.equal(entry.action, 'create');
+          assert.deepEqual(entry.diagnostics, []);
+          assert.deepEqual(entry.execution?.creationFields, { link: null });
+        }
+        assert.ok(
+          draft.execution!.publishOrder! < owner.execution!.publishOrder!,
+        );
+        assert.deepEqual(metadata.temporarySchemaChanges, []);
+      },
+    );
+  });
+
   it('plans native self-reference publication, unpublication, and deletion', async () => {
     const dast: JsonObject = {
       schema: 'dast',
@@ -1678,6 +1740,30 @@ describe('indexed rewrite planner', () => {
       options({ allowTemporarySchemaChanges: true, allowPartial: true }),
       (_store, metadata) =>
         assert.deepEqual(metadata.temporarySchemaChanges, []),
+    );
+  });
+
+  it('orders temporary schema changes by code unit rather than locale collation', async () => {
+    const lower = `a${id('lower').slice(1)}`;
+    const upper = `Z${id('upper').slice(1)}`;
+    const state = schema([
+      model({
+        fields: [
+          field({ id: lower, apiKey: 'title', defaultValue: 'default' }),
+          field({ id: upper, apiKey: 'subtitle', defaultValue: 'default' }),
+        ],
+      }),
+    ]);
+    await fixture(
+      [record(A, { title: null, subtitle: null })],
+      [],
+      state,
+      options({ allowTemporarySchemaChanges: true }),
+      (_store, metadata) =>
+        assert.deepEqual(
+          metadata.temporarySchemaChanges.map((change) => change.fieldId),
+          [upper, lower],
+        ),
     );
   });
 
@@ -2400,6 +2486,75 @@ describe('indexed rewrite planner', () => {
         assert.ok(
           owner.execution!.deleteOrder! < dependency.execution!.deleteOrder!,
         );
+      },
+    );
+  });
+
+  it('moves tree records after every moved ancestor on their desired path', async () => {
+    const state = schema([model({ tree: true })]);
+    const node = (recordId: string, parentId: string | null) =>
+      record(recordId, { title: 'node' }, { parentId, position: 0 });
+    const order = (store: SnapshotStore, recordId: string) =>
+      (store.getPlan('record', recordId) as RecordPlan).execution!
+        .publishOrder!;
+    const clean = (store: SnapshotStore) => {
+      for (const entry of store.planEntries('record'))
+        assert.deepEqual(entry.diagnostics, []);
+    };
+    // X > P > Y becomes P > Y > X with Y unchanged. Moving X first would put
+    // it beneath Y while Y's ancestors still include X, whatever the ID order.
+    const [first, second] = [A, B].sort();
+    for (const [moved, ancestor] of [
+      [first, second],
+      [second, first],
+    ]) {
+      const unchanged = node(C, ancestor);
+      await fixture(
+        [node(ancestor, null), unchanged, node(moved, C)],
+        [node(moved, null), node(ancestor, moved), unchanged],
+        state,
+        options(),
+        (store, metadata) => {
+          assert.equal(metadata.counts.record.update, 2);
+          assert.equal(metadata.counts.record.noop, 1);
+          assert.ok(order(store, ancestor) < order(store, moved));
+          clean(store);
+        },
+      );
+    }
+    // X > P > U > Q > V becomes Q > V > P > U > X with U and V unchanged.
+    // Each move waits for the nearest moved ancestor, which waits for its own.
+    const [x, p, u, q, v] = ['x', 'p', 'u', 'q', 'v'].map(id);
+    await fixture(
+      [node(q, null), node(v, q), node(p, v), node(u, p), node(x, u)],
+      [node(x, null), node(p, x), node(u, p), node(q, u), node(v, q)],
+      state,
+      options(),
+      (store, metadata) => {
+        assert.equal(metadata.counts.record.update, 3);
+        assert.ok(order(store, q) < order(store, p));
+        assert.ok(order(store, p) < order(store, x));
+        clean(store);
+      },
+    );
+    // An ordinary leaf move has no moved ancestor to wait for.
+    await fixture(
+      [
+        record(A, { title: 'a' }, { position: 0 }),
+        record(B, { title: 'b' }, { position: 1 }),
+        record(C, { title: 'leaf' }, { parentId: B, position: 0 }),
+      ],
+      [
+        record(A, { title: 'a' }, { position: 0 }),
+        record(B, { title: 'b' }, { position: 1 }),
+        record(C, { title: 'leaf' }, { parentId: A, position: 0 }),
+      ],
+      state,
+      options(),
+      (store, metadata) => {
+        assert.equal(metadata.counts.record.update, 1);
+        assert.equal(order(store, C), 0);
+        clean(store);
       },
     );
   });

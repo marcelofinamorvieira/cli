@@ -6,8 +6,8 @@ import { CredentialRedactor } from './credential-redaction';
  * authenticate with, at any --log-level or --log-mode, and whose uncaught API
  * errors are reported without their Authorization header.
  *
- * Every client built through `buildClient()` (the root client, environment
- * clients, and the clients handed to migrations) derives its options from
+ * Every client built through `buildClient()` (the root client and the
+ * environment clients) derives its options from
  * `buildBaseClientInitializationOptions()`, so protecting that single entry
  * point covers them all. Commands that build clients through another path
  * must pass the options through `credentialRedactor.protectClientOptions()`.

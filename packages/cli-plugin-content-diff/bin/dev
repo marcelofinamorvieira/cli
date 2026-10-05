@@ -11,8 +11,8 @@ require('ts-node').register({ project });
 
 oclif.settings.debug = true;
 
-// A generated oclif.manifest.json (`npm run manifest`, also run by
-// `prepare`) points every command at its compiled lib/ file, and oclif loads
+// A generated oclif.manifest.json (`oclif manifest`, run by `prepack`)
+// points every command at its compiled lib/ file, and oclif loads
 // that file even in development. Ignoring the manifest keeps bin/dev on the
 // TypeScript sources of this checkout.
 async function run() {

@@ -1,7 +1,9 @@
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
 import { applyBundle } from '../../engine/apply';
 import { ContentError } from '../../engine/errors';
-import type { ApplyResult } from '../../engine/types';
+import type { ApplyResult, BundleManifest } from '../../engine/types';
 import { ContentCommand, concurrency } from '../../utils/content-command';
 import { withInterruptHandling } from '../../utils/interruption';
 
@@ -81,10 +83,31 @@ export default class ContentApplyCommand extends ContentCommand {
         log: (message) => this.progress(message),
       },
     });
-    if (!this.jsonEnabled())
+    if (!this.jsonEnabled()) {
+      const partial = result.partial ? await partialSummary(args.BUNDLE) : '';
       this.log(
-        `Applied ${result.mutations} mutations in environment "${result.environmentId}".`,
+        `Applied ${result.mutations} mutations in environment "${result.environmentId}"${partial}.`,
       );
+    }
     return result;
+  }
+}
+
+/** Describes how many entries an applied partial bundle skipped. */
+async function partialSummary(bundlePath: string): Promise<string> {
+  try {
+    const { counts } = JSON.parse(
+      await readFile(join(bundlePath, 'manifest.json'), 'utf8'),
+    ) as BundleManifest;
+    const skipped = Object.values(counts).reduce(
+      (total, actions) => total + actions.skip,
+      0,
+    );
+    return ` from a partial bundle; ${skipped} skipped ${
+      skipped === 1 ? 'entry was' : 'entries were'
+    } not applied`;
+  } catch {
+    // The manifest was verified before any write; this summary is optional.
+    return ' from a partial bundle; its skipped entries were not applied';
   }
 }

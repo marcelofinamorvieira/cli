@@ -12,7 +12,8 @@ import { ContentError } from './errors';
 import type { SnapshotStore } from './store';
 import type { Client, JsonObject, ModelSchema, SchemaState } from './types';
 
-const compareIds = (a: string, b: string): number =>
+// Code unit order, like SQLite, so bundles do not depend on the machine locale.
+export const compareIds = (a: string, b: string): number =>
   a < b ? -1 : a > b ? 1 : 0;
 
 export function schemaHash(

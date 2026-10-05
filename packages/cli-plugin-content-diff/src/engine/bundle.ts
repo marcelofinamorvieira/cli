@@ -11,7 +11,7 @@ import {
 } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { setImmediate } from 'node:timers/promises';
+import { setImmediate, setTimeout } from 'node:timers/promises';
 import { assertNotAborted } from './cancellation';
 import {
   assertMetadataIntegerPrecision,
@@ -42,6 +42,9 @@ const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024;
 const CHUNK_INDEX_FILE = 'chunks.jsonl';
 const MAX_INDEX_LINE_BYTES = 1024;
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
+const DOWNLOAD_ATTEMPTS = 4;
+const DOWNLOAD_RETRY_MS = 1000;
+const MAX_DOWNLOAD_RETRY_MS = 30_000;
 const KINDS = ['collection', 'record', 'upload'] as const;
 const ACTIONS = ['create', 'update', 'delete', 'noop', 'skip'] as const;
 const sha256 = (value: string | Buffer) =>
@@ -544,10 +547,53 @@ async function writeBytes(
   assertNotAborted(signal);
 }
 
+type RetryWait = (
+  milliseconds: number,
+  signal?: AbortSignal,
+) => Promise<unknown>;
+
+/** A network or server failure that a fresh request may not repeat. */
+class TransientDownloadError extends Error {
+  constructor(
+    readonly failure: unknown,
+    readonly retryAfter?: number,
+  ) {
+    super('Asset download failed transiently.');
+  }
+}
+
+function transientStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+/** Retry-After holds either delay seconds or an HTTP date. */
+function retryAfter(response: Response): number | undefined {
+  const value = response.headers.get('retry-after')?.trim();
+  if (!value) return undefined;
+  const delay = /^\d+$/.test(value)
+    ? Number(value) * 1000
+    : Date.parse(value) - Date.now();
+  return Number.isFinite(delay)
+    ? Math.min(Math.max(delay, 0), MAX_DOWNLOAD_RETRY_MS)
+    : undefined;
+}
+
+/** Body stream failures, such as a reset or terminated connection, are transient. */
+async function* transferred(
+  body: NonNullable<Response['body']>,
+): AsyncGenerator<Uint8Array> {
+  try {
+    for await (const chunk of body) yield chunk;
+  } catch (error) {
+    throw new TransientDownloadError(error);
+  }
+}
+
 async function fetchBinary(
   entry: UploadPlan,
   staging: string,
   fetchFn: typeof fetch,
+  retryWait: RetryWait,
   signal?: AbortSignal,
 ): Promise<BinaryFile> {
   assertNotAborted(signal);
@@ -569,21 +615,80 @@ async function fetchBinary(
   url.searchParams.set('dl', desired.filename);
   url.searchParams.set('skip-default-optimizations', 'true');
   url.searchParams.set('svg-sanitize', 'false');
-  const response = await fetchFn(url, { signal });
   const temporary = join(staging, 'binaries', '.download');
+  let download: Omit<BinaryFile, 'file'> | undefined;
+  // Asset GETs bypass the CMA client's retries. Integrity failures and other
+  // client errors are final; a retry restarts with an empty file and hashes.
+  for (let attempt = 1; !download; attempt++) {
+    try {
+      download = await transferBinary(entry, url, temporary, fetchFn, signal);
+    } catch (error) {
+      if (!(error instanceof TransientDownloadError)) throw error;
+      await rm(temporary, { force: true });
+      if (attempt === DOWNLOAD_ATTEMPTS) throw error.failure;
+      try {
+        await retryWait(
+          error.retryAfter ?? DOWNLOAD_RETRY_MS * 2 ** (attempt - 1),
+          signal,
+        );
+      } finally {
+        assertNotAborted(signal);
+      }
+    }
+  }
+  const { bytes, md5: actualMd5, sha256: actualSha256 } = download;
+  if (bytes !== desired.size || actualMd5 !== desired.md5)
+    throw new ContentError(
+      'ASSET_INTEGRITY_FAILED',
+      `Upload ${entry.id} differs from the captured binary.`,
+    );
+  const file = `binaries/${actualSha256}.bin`;
+  assertNotAborted(signal);
+  const destination = join(staging, file);
+  try {
+    await lstat(destination);
+    await rm(temporary);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await rename(temporary, destination);
+  }
+  return { file, sha256: actualSha256, md5: actualMd5, bytes };
+}
+
+/** Stream one request into the temporary file, hashing what was written. */
+async function transferBinary(
+  entry: UploadPlan,
+  url: URL,
+  temporary: string,
+  fetchFn: typeof fetch,
+  signal?: AbortSignal,
+): Promise<Omit<BinaryFile, 'file'>> {
+  assertNotAborted(signal);
+  const desired = entry.desired!;
+  let response: Response;
+  try {
+    response = await fetchFn(url, { signal });
+  } catch (error) {
+    assertNotAborted(signal);
+    throw new TransientDownloadError(error);
+  }
   let handle: FileHandle | undefined;
   const md5 = createHash('md5');
   const hash = createHash('sha256');
   let bytes = 0;
   try {
     assertNotAborted(signal);
-    if (!response.ok || !response.body)
-      throw new ContentError(
+    if (!response.ok || !response.body) {
+      const failure = new ContentError(
         'ASSET_DOWNLOAD_FAILED',
         `Upload ${entry.id} could not be downloaded (${response.status}).`,
       );
+      throw transientStatus(response.status)
+        ? new TransientDownloadError(failure, retryAfter(response))
+        : failure;
+    }
     handle = await open(temporary, 'wx', 0o600);
-    for await (const chunk of response.body) {
+    for await (const chunk of transferred(response.body)) {
       assertNotAborted(signal);
       const buffer = Buffer.from(chunk);
       bytes += buffer.length;
@@ -606,24 +711,7 @@ async function fetchBinary(
   } finally {
     await handle?.close();
   }
-  const actualMd5 = md5.digest('hex');
-  const actualSha256 = hash.digest('hex');
-  if (bytes !== desired.size || actualMd5 !== desired.md5)
-    throw new ContentError(
-      'ASSET_INTEGRITY_FAILED',
-      `Upload ${entry.id} differs from the captured binary.`,
-    );
-  const file = `binaries/${actualSha256}.bin`;
-  assertNotAborted(signal);
-  const destination = join(staging, file);
-  try {
-    await lstat(destination);
-    await rm(temporary);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    await rename(temporary, destination);
-  }
-  return { file, sha256: actualSha256, md5: actualMd5, bytes };
+  return { sha256: hash.digest('hex'), md5: md5.digest('hex'), bytes };
 }
 
 export async function writeBundle({
@@ -632,6 +720,8 @@ export async function writeBundle({
   outputPath,
   chunkBytes = DEFAULT_CHUNK_BYTES,
   fetchFn = fetch,
+  retryWait = (milliseconds, signal) =>
+    setTimeout(milliseconds, undefined, { signal }),
   signal,
 }: {
   store: SnapshotStore;
@@ -639,6 +729,7 @@ export async function writeBundle({
   outputPath: string;
   chunkBytes?: number;
   fetchFn?: typeof fetch;
+  retryWait?: RetryWait;
   signal?: AbortSignal;
 }): Promise<string> {
   assertNotAborted(signal);
@@ -708,7 +799,13 @@ export async function writeBundle({
       const entry = compactEntry(original);
       validateEntry(entry, false);
       if (entry.kind === 'upload' && requiresBinary(entry))
-        entry.binary = await fetchBinary(entry, staging, fetchFn, signal);
+        entry.binary = await fetchBinary(
+          entry,
+          staging,
+          fetchFn,
+          retryWait,
+          signal,
+        );
       validateEntry(entry, true);
       const line = Buffer.from(`${stableJson(entry)}\n`);
       if (current && current.descriptor.bytes + line.length > chunkBytes)
@@ -1010,7 +1107,7 @@ export async function readBundle({
       'CREATE TEMP TABLE bundle_keys(kind TEXT, id TEXT, PRIMARY KEY(kind,id)) WITHOUT ROWID',
     );
     const insertKey = store.database.prepare(
-      'INSERT INTO bundle_keys VALUES (?, ?)',
+      'INSERT OR IGNORE INTO bundle_keys VALUES (?, ?)',
     );
     try {
       // Validate all chunks and binaries before any plan becomes executable.
@@ -1019,11 +1116,9 @@ export async function readBundle({
           assertNotAborted(signal);
           if (previous && compareEntries(previous, entry) >= 0)
             invalid('Bundle plan entries are not deterministically ordered.');
-          try {
-            insertKey.run(entry.kind, entry.id);
-          } catch {
+          // Only an ignored row is a duplicate; storage errors keep their cause.
+          if (insertKey.run(entry.kind, entry.id).changes === 0)
             invalid(`Duplicate plan identity: ${entry.kind}/${entry.id}`);
-          }
           previous = entry;
           actualCounts[entry.kind][entry.action]++;
           if (entry.kind === 'upload' && entry.binary)
@@ -1051,7 +1146,11 @@ export async function readBundle({
       assertNotAborted(signal);
       store.database.exec('COMMIT');
     } catch (error) {
-      store.database.exec('ROLLBACK');
+      try {
+        store.database.exec('ROLLBACK');
+      } catch {
+        /* SQLite may already have rolled back, e.g. after SQLITE_FULL. */
+      }
       throw error;
     }
     return manifest;

@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, it } from 'mocha';
 import { readBundle, writeBundle } from '../../src/engine/bundle';
 import { hashJson, recordHash } from '../../src/engine/codec';
 import { ContentError } from '../../src/engine/errors';
-import { SnapshotStore } from '../../src/engine/store';
+import { SnapshotStore, loadSqlite } from '../../src/engine/store';
 import type {
   BundleChunk,
   BundleManifest,
@@ -125,6 +125,18 @@ function withUploadHash(state: UploadState): UploadState {
       collectionId: state.collectionId,
       attributes: state.attributes,
     }),
+  };
+}
+
+function uploadCreate(id: string, bytes: Buffer): PlanEntry {
+  return {
+    kind: 'upload',
+    id,
+    action: 'create',
+    guard: null,
+    baseline: null,
+    desired: upload(id, bytes),
+    diagnostics: [],
   };
 }
 
@@ -293,6 +305,106 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
     value.dispose();
     assert.equal(existsSync(ownedDirectory), false);
     assert.equal((await lstat(directory)).isDirectory(), true);
+  });
+
+  it('keeps the original transaction error when SQLite has already rolled back', () => {
+    const value = store();
+    assert.throws(
+      () =>
+        value.transaction(() => {
+          value.putRecord('source', record('rolled-back'));
+          value.database.exec('ROLLBACK');
+          throw new Error('original failure');
+        }),
+      /original failure/,
+    );
+    const pages = value.database.prepare('PRAGMA page_count').get()!
+      .page_count as number;
+    // A full disk makes SQLite roll back the transaction before the helper.
+    value.database.exec(`PRAGMA max_page_count = ${pages}`);
+    assert.throws(
+      () =>
+        value.transaction(() => {
+          for (let index = 0; index < 8; index++)
+            value.putRecord('source', {
+              ...record(`full-${index}`),
+              current: { title: 'x'.repeat(8192) },
+            });
+        }),
+      /database or disk is full/,
+    );
+    assert.equal([...value.records('source')].length, 0);
+    value.database.exec(`PRAGMA max_page_count = ${pages * 1000}`);
+    value.transaction(() => value.putRecord('source', record('after')));
+    assert.ok(value.getRecord('source', 'after'));
+  });
+
+  it('loads node:sqlite on first use and names the supported Node.js versions when it is unavailable', () => {
+    assert.equal(typeof loadSqlite().DatabaseSync, 'function');
+    assert.throws(
+      () =>
+        loadSqlite(() => {
+          throw Object.assign(
+            new Error('No such built-in module: node:sqlite'),
+            { code: 'ERR_UNKNOWN_BUILTIN_MODULE' },
+          );
+        }),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        error.code === 'UNSUPPORTED_NODE_VERSION' &&
+        error.message.includes('Node.js 22.13+') &&
+        error.message.includes('Node.js 24+') &&
+        error.message.includes(process.version),
+    );
+    const unrelated = new Error('loader failed');
+    assert.throws(
+      () =>
+        loadSqlite(() => {
+          throw unrelated;
+        }),
+      (error: unknown) => error === unrelated,
+    );
+    // Simulate a runtime without node:sqlite. Command modules must still load,
+    // so the store reports the requirement instead of a module-load failure.
+    const root = resolve(__dirname, '../..');
+    const script = `
+      const assert = require('node:assert/strict');
+      const { readdirSync } = require('node:fs');
+      const Module = require('node:module');
+      const load = Module._load;
+      Module._load = function (request, ...rest) {
+        if (request === 'node:sqlite')
+          throw Object.assign(new Error('No such built-in module: node:sqlite'), {
+            code: 'ERR_UNKNOWN_BUILTIN_MODULE',
+          });
+        return Reflect.apply(load, this, [request, ...rest]);
+      };
+      require(process.env.CONTENT_ROOT + '/src/commands/content/diff.ts');
+      require(process.env.CONTENT_ROOT + '/src/commands/content/apply.ts');
+      const { SnapshotStore } = require(process.env.CONTENT_ROOT + '/src/engine/store.ts');
+      assert.throws(
+        () => new SnapshotStore(process.env.CONTENT_STORE_PARENT),
+        (error) => error.code === 'UNSUPPORTED_NODE_VERSION',
+      );
+      assert.deepEqual(readdirSync(process.env.CONTENT_STORE_PARENT), []);
+    `;
+    const result = spawnSync(
+      process.execPath,
+      ['--require', 'ts-node/register', '--eval', script],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          TS_NODE_PROJECT: join(root, 'tsconfig.json'),
+          CONTENT_ROOT: root,
+          CONTENT_STORE_PARENT: directory,
+        },
+        encoding: 'utf8',
+        timeout: 60_000,
+      },
+    );
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
   });
 
   it('retains direct native iterator owners through forced GC without retaining every prepared query', () => {
@@ -948,6 +1060,7 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
         fetchFn: (async () => {
           throw new Error('connection lost');
         }) as typeof fetch,
+        retryWait: async () => undefined,
       }),
       /connection lost/,
     );
@@ -1113,6 +1226,217 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
         error instanceof ContentError && error.code === 'INTERRUPTED',
     );
     assert.equal(existsSync(parent), false);
+  });
+
+  it('retries transient asset responses with capped Retry-After delays and exponential backoff', async () => {
+    const source = store();
+    const bytes = Buffer.from('retried asset');
+    const entry = uploadCreate('one', bytes);
+    source.putPlan(entry);
+    const failures: [number, Record<string, string>][] = [
+      [503, { 'retry-after': '3600' }],
+      [429, {}],
+      [502, { 'retry-after': 'Wed, 21 Oct 2015 07:28:00 GMT' }],
+    ];
+    let requests = 0;
+    let cancelled = 0;
+    const waits: number[] = [];
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata([entry]),
+      outputPath: join(directory, 'bundle'),
+      fetchFn: (async () => {
+        const failure = failures[requests++];
+        if (!failure) return new Response(bytes);
+        return new Response(
+          new ReadableStream({
+            cancel() {
+              cancelled++;
+            },
+          }),
+          { status: failure[0], headers: failure[1] },
+        );
+      }) as typeof fetch,
+      retryWait: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+    assert.equal(requests, 4);
+    assert.equal(cancelled, 3);
+    assert.deepEqual(waits, [30_000, 2000, 0]);
+    const imported = store();
+    await readBundle({ directory: output, store: imported });
+    const saved = imported.getPlan('upload', 'one')!;
+    assert(saved.kind === 'upload' && saved.binary);
+    assert.deepEqual(await readFile(join(output, saved.binary.file)), bytes);
+  });
+
+  it('restarts an asset download from an empty file after a network or stream failure', async () => {
+    const source = store();
+    const bytes = Buffer.from('restarted asset '.repeat(64));
+    const entry = uploadCreate('one', bytes);
+    source.putPlan(entry);
+    let requests = 0;
+    const waits: number[] = [];
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata([entry]),
+      outputPath: join(directory, 'bundle'),
+      fetchFn: (async () => {
+        if (++requests === 1) throw new TypeError('fetch failed');
+        let sent = false;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (requests === 3) {
+                controller.enqueue(bytes);
+                controller.close();
+              } else if (!sent) {
+                sent = true;
+                controller.enqueue(bytes.subarray(0, bytes.length / 2));
+              } else controller.error(new TypeError('terminated'));
+            },
+          }),
+        );
+      }) as typeof fetch,
+      retryWait: async (milliseconds) => {
+        waits.push(milliseconds);
+      },
+    });
+    assert.equal(requests, 3);
+    assert.deepEqual(waits, [1000, 2000]);
+    assert.deepEqual(await readdir(join(output, 'binaries')), [
+      `${digest(bytes)}.bin`,
+    ]);
+    assert.deepEqual(
+      await readFile(join(output, 'binaries', `${digest(bytes)}.bin`)),
+      bytes,
+    );
+    await readBundle({ directory: output, store: store() });
+  });
+
+  it('stops after bounded transient attempts and never retries client or integrity failures', async () => {
+    const bytes = Buffer.from('expected asset');
+    const corrupted = Buffer.from(bytes);
+    corrupted[0] ^= 1;
+    const scenarios: [
+      string,
+      () => Response,
+      number,
+      (error: unknown) => boolean,
+    ][] = [
+      [
+        'unavailable',
+        () => new Response('busy', { status: 503 }),
+        4,
+        (error) =>
+          error instanceof ContentError &&
+          error.code === 'ASSET_DOWNLOAD_FAILED' &&
+          /\(503\)/.test(error.message),
+      ],
+      [
+        'network',
+        () => {
+          throw new TypeError('fetch failed');
+        },
+        4,
+        (error) =>
+          error instanceof TypeError && error.message === 'fetch failed',
+      ],
+      [
+        'missing',
+        () => new Response('missing', { status: 404 }),
+        1,
+        (error) =>
+          error instanceof ContentError &&
+          error.code === 'ASSET_DOWNLOAD_FAILED' &&
+          /\(404\)/.test(error.message),
+      ],
+      [
+        'checksum',
+        () => new Response(corrupted),
+        1,
+        (error) =>
+          error instanceof ContentError &&
+          error.code === 'ASSET_INTEGRITY_FAILED',
+      ],
+      [
+        'size',
+        () => new Response(Buffer.concat([bytes, bytes])),
+        1,
+        (error) =>
+          error instanceof ContentError &&
+          error.code === 'ASSET_INTEGRITY_FAILED',
+      ],
+    ];
+    for (const [name, respond, attempts, expected] of scenarios) {
+      const source = store();
+      const entry = uploadCreate(name, bytes);
+      source.putPlan(entry);
+      let requests = 0;
+      const waits: number[] = [];
+      const output = join(directory, name);
+      await assert.rejects(
+        writeBundle({
+          store: source,
+          metadata: metadata([entry]),
+          outputPath: output,
+          fetchFn: (async () => {
+            requests++;
+            return respond();
+          }) as typeof fetch,
+          retryWait: async (milliseconds) => {
+            waits.push(milliseconds);
+          },
+        }),
+        expected,
+        name,
+      );
+      assert.equal(requests, attempts, name);
+      assert.deepEqual(waits, [1000, 2000, 4000].slice(0, attempts - 1), name);
+      assert.equal(existsSync(output), false);
+    }
+    assert.equal(
+      (await readdir(directory)).some((name) =>
+        name.startsWith('.content-bundle-'),
+      ),
+      false,
+    );
+  });
+
+  it('interrupts an asset retry backoff promptly and removes its incomplete bundle', async () => {
+    const source = store();
+    const entry = uploadCreate('one', Buffer.from('asset'));
+    source.putPlan(entry);
+    const controller = new AbortController();
+    let requests = 0;
+    const output = join(directory, 'bundle');
+    const started = Date.now();
+    await assert.rejects(
+      writeBundle({
+        store: source,
+        metadata: metadata([entry]),
+        outputPath: output,
+        signal: controller.signal,
+        fetchFn: (async () => {
+          requests++;
+          setTimeout(() => controller.abort(), 20);
+          return new Response('busy', { status: 503 });
+        }) as typeof fetch,
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'INTERRUPTED',
+    );
+    // The default first backoff is one second.
+    assert.ok(Date.now() - started < 900);
+    assert.equal(requests, 1);
+    assert.equal(existsSync(output), false);
+    assert.equal(
+      (await readdir(directory)).some((name) =>
+        name.startsWith('.content-bundle-'),
+      ),
+      false,
+    );
   });
 
   it('rejects chunk corruption, traversal, symlinks, and missing binary integrity before importing entries', async () => {
@@ -1567,6 +1891,61 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
     assert.equal([...imported.planEntries()].length, 0);
   });
 
+  it('reports a full working disk during import instead of a failed rollback', async () => {
+    const source = store();
+    const entries = Array.from({ length: 8 }, (_, index) => {
+      const entry = recordPlan(`record-${index}`, 'update');
+      entry.desired!.current = { title: 'x'.repeat(8192) };
+      entry.desired!.hash = recordHash(entry.desired!);
+      return entry;
+    });
+    for (const entry of entries) source.putPlan(entry);
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata(entries),
+      outputPath: join(directory, 'bundle'),
+    });
+    const imported = store();
+    const pages = imported.database.prepare('PRAGMA page_count').get()!
+      .page_count as number;
+    imported.database.exec(`PRAGMA max_page_count = ${pages}`);
+    await assert.rejects(
+      readBundle({ directory: output, store: imported }),
+      (error: unknown) =>
+        error instanceof ContentError &&
+        /database or disk is full/.test(error.message),
+    );
+    assert.equal([...imported.planEntries()].length, 0);
+    imported.database.exec(`PRAGMA max_page_count = ${pages * 1000}`);
+    await readBundle({ directory: output, store: imported });
+    assert.equal([...imported.planEntries()].length, entries.length);
+  });
+
+  it('reports a full temporary identity index instead of a duplicate plan identity', async () => {
+    const source = store();
+    const entries = Array.from({ length: 512 }, (_, index) =>
+      recordPlan(`record-${String(index).padStart(4, '0')}-${'k'.repeat(64)}`),
+    );
+    source.transaction(() => {
+      for (const entry of entries) source.putPlan(entry);
+    });
+    const output = await writeBundle({
+      store: source,
+      metadata: metadata(entries),
+      outputPath: join(directory, 'bundle'),
+    });
+    const imported = store();
+    imported.database.exec('PRAGMA temp.max_page_count = 4');
+    await assert.rejects(
+      readBundle({ directory: output, store: imported }),
+      (error: unknown) =>
+        error instanceof Error &&
+        /database or disk is full/.test(error.message) &&
+        !/Duplicate plan identity/.test(error.message),
+    );
+    assert.equal([...imported.planEntries()].length, 0);
+  });
+
   it('interrupts buffered bundle validation and rolls back an interrupted import while retaining the completed export', async () => {
     const source = store();
     const entries = Array.from({ length: 128 }, (_, index) =>
@@ -1588,7 +1967,7 @@ describe('temporary indexed snapshot store and streamed bundles', () => {
       const prepare = imported.database.prepare.bind(imported.database);
       imported.database.prepare = (sql) => {
         const statement = prepare(sql);
-        if (sql === 'INSERT INTO bundle_keys VALUES (?, ?)') {
+        if (sql === 'INSERT OR IGNORE INTO bundle_keys VALUES (?, ?)') {
           const run = statement.run.bind(statement);
           statement.run = (...parameters) => {
             const result = Reflect.apply(

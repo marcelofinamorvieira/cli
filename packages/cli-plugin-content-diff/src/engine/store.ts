@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import type { DatabaseSync, StatementSync } from 'node:sqlite';
+import { ContentError } from './errors';
 import type {
   Action,
   BlockOwner,
@@ -25,45 +26,66 @@ export interface PlanEdge {
   ordering?: number;
 }
 
-/** Native iterators on Node 22.13 do not keep their statement alive through GC. */
-class WorkingDatabase extends DatabaseSync {
-  override prepare(sql: string): StatementSync {
-    const statement = super.prepare(sql);
-    const nativeIterate = statement.iterate;
-    Object.defineProperty(statement, 'iterate', {
-      value: (...parameters: Parameters<StatementSync['iterate']>) => {
-        const cursor = Reflect.apply(
-          nativeIterate,
-          statement,
-          parameters,
-        ) as ReturnType<StatementSync['iterate']>;
-        // The iterator itself owns the statement, rather than retaining every
-        // prepared query in a database-wide set. Concurrent prepare calls also
-        // retain independent native cursors and parameter bindings.
-        const iterator = Object.create(
-          Object.getPrototypeOf(cursor),
-        ) as ReturnType<StatementSync['iterate']>;
-        Object.defineProperties(iterator, {
-          owner: { value: statement },
-          next: { value: cursor.next.bind(cursor) },
-          [Symbol.iterator]: {
-            value() {
-              return this;
-            },
-          },
-          ...(cursor.return
-            ? { return: { value: cursor.return.bind(cursor) } }
-            : {}),
-          ...(cursor.throw
-            ? { throw: { value: cursor.throw.bind(cursor) } }
-            : {}),
-        });
-        return iterator;
-      },
-    });
-    return statement;
+type Sqlite = typeof import('node:sqlite');
+
+/**
+ * The host CLI also runs on Node versions without node:sqlite. Loading it on
+ * first use lets command modules load and report the runtime requirement.
+ */
+export function loadSqlite(load: (id: string) => unknown = require): Sqlite {
+  try {
+    return load('node:sqlite') as Sqlite;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ERR_UNKNOWN_BUILTIN_MODULE')
+      throw error;
+    throw new ContentError(
+      'UNSUPPORTED_NODE_VERSION',
+      `content:diff and content:apply require Node.js 22.13+ on the 22.x line, or Node.js 24+, for the built-in node:sqlite module. Current Node.js: ${process.version}.`,
+    );
   }
 }
+
+/** Native iterators on Node 22.13 do not keep their statement alive through GC. */
+const workingDatabase = ({ DatabaseSync }: Sqlite) =>
+  class WorkingDatabase extends DatabaseSync {
+    override prepare(sql: string): StatementSync {
+      const statement = super.prepare(sql);
+      const nativeIterate = statement.iterate;
+      Object.defineProperty(statement, 'iterate', {
+        value: (...parameters: Parameters<StatementSync['iterate']>) => {
+          const cursor = Reflect.apply(
+            nativeIterate,
+            statement,
+            parameters,
+          ) as ReturnType<StatementSync['iterate']>;
+          // The iterator itself owns the statement, rather than retaining every
+          // prepared query in a database-wide set. Concurrent prepare calls also
+          // retain independent native cursors and parameter bindings.
+          const iterator = Object.create(
+            Object.getPrototypeOf(cursor),
+          ) as ReturnType<StatementSync['iterate']>;
+          Object.defineProperties(iterator, {
+            owner: { value: statement },
+            next: { value: cursor.next.bind(cursor) },
+            [Symbol.iterator]: {
+              value() {
+                return this;
+              },
+            },
+            ...(cursor.return
+              ? { return: { value: cursor.return.bind(cursor) } }
+              : {}),
+            ...(cursor.throw
+              ? { throw: { value: cursor.throw.bind(cursor) } }
+              : {}),
+          });
+          return iterator;
+        },
+      });
+      return statement;
+    }
+  };
+let WorkingDatabase: ReturnType<typeof workingDatabase> | undefined;
 
 /** A one-run working database. Its directory is never a supported run input. */
 export class SnapshotStore {
@@ -74,6 +96,7 @@ export class SnapshotStore {
   private closed = false;
 
   constructor(directory?: string) {
+    WorkingDatabase ??= workingDatabase(loadSqlite());
     const parent = directory ?? tmpdir();
     mkdirSync(parent, { recursive: true });
     this.directory = mkdtempSync(join(parent, 'content-diff-'));
@@ -181,7 +204,11 @@ export class SnapshotStore {
       this.database.exec('COMMIT');
       return result;
     } catch (error) {
-      this.database.exec('ROLLBACK');
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        /* SQLite may already have rolled back, e.g. after SQLITE_FULL. */
+      }
       throw error;
     }
   }

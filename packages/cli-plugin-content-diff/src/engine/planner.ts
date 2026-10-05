@@ -15,6 +15,7 @@ import {
   provenFailures,
   suppressedDefaultValue,
 } from './planner-validity';
+import { compareIds } from './schema';
 import type { SnapshotStore } from './store';
 import type {
   Action,
@@ -1782,6 +1783,48 @@ class Planning {
             'parent',
           );
         }
+        // publication() moves existing records before other writes. A move must
+        // wait for every moved record on its desired ancestor path, not only a
+        // changed direct parent, or the new parent can still be a live
+        // descendant. Creates already have their desired parent, and the
+        // nearest moved ancestor waits for the next, so one edge suffices.
+        if (
+          entry.action === 'update' &&
+          entry.baseline?.parentId !== desired.parentId
+        ) {
+          const visited = new Set([entry.id]);
+          let ancestor = parent;
+          while (
+            ancestor &&
+            ancestor.action !== 'delete' &&
+            (ancestor.action !== 'skip' || ancestor.guard) &&
+            !visited.has(ancestor.id)
+          ) {
+            visited.add(ancestor.id);
+            const state = ['create', 'update'].includes(ancestor.action)
+              ? ancestor.desired
+              : this.store.getRecord('target', ancestor.id);
+            if (
+              ancestor.action === 'update' &&
+              ancestor.baseline?.parentId !== state?.parentId
+            ) {
+              this.graph.edge(
+                'publish',
+                'record',
+                entry.id,
+                'record',
+                ancestor.id,
+                'ancestor',
+              );
+              break;
+            }
+            ancestor = state?.parentId
+              ? (this.store.getPlan('record', state.parentId) as
+                  | RecordPlan
+                  | undefined)
+              : undefined;
+          }
+        }
       }
     }
     for (const entry of this.store.planEntries('record', 'create')) {
@@ -1832,7 +1875,11 @@ class Planning {
       else if (
         dependency &&
         ['create', 'update'].includes(dependency.action) &&
-        !this.store.getRecord('target', dependency.id)?.published
+        !this.store.getRecord('target', dependency.id)?.published &&
+        // Creating a record in a model without draft mode also publishes it,
+        // and the create phase completes before any publication starts.
+        (dependency.action !== 'create' ||
+          this.models.get(dependency.modelId)!.draftMode)
       )
         this.graph.edge(
           'publish',
@@ -2068,8 +2115,7 @@ class Planning {
     }
     return changes.sort(
       (a, b) =>
-        a.modelId.localeCompare(b.modelId) ||
-        a.fieldId.localeCompare(b.fieldId),
+        compareIds(a.modelId, b.modelId) || compareIds(a.fieldId, b.fieldId),
     );
   }
 

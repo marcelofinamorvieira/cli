@@ -122,9 +122,66 @@ export abstract class ContentCommand extends RedactedCmaClientCommand {
     };
   }
 
+  // cli-utils silences request logs for any command with an `output` flag,
+  // which content:diff uses for its bundle directory.
+  protected async buildBaseClientInitializationOptions(): Promise<
+    Partial<CmaClient.ClientConfigOptions> & { apiToken: string }
+  > {
+    const options = await super.buildBaseClientInitializationOptions();
+    const { flags: parsed } = await this.parse(this.ctor);
+    const flags = parsed as AuthenticationFlags;
+    const logLevel = flags['log-level'] ?? this.datoProfileConfig?.logLevel;
+    return {
+      ...options,
+      logLevel:
+        flags.json || !logLevel
+          ? CmaClient.LogLevel.NONE
+          : logLevelMap[logLevel],
+    };
+  }
+
+  // The host reports failures as an object dump on stdout. Under --json, emit
+  // a JSON error object instead, with the same exit status. Fields are picked
+  // explicitly: oclif's parse errors also carry the parsed flags, tokens
+  // included.
+  protected async catch(
+    error: Error & { exitCode?: number | undefined },
+  ): Promise<void> {
+    if (!this.jsonEnabled()) return super.catch(error);
+    this.credentialRedactor.redactError(error);
+    const { code, details, suggestions, keptForkEnvironmentId, oclif } =
+      error as Error & {
+        code?: string;
+        details?: Record<string, unknown>;
+        suggestions?: string[];
+        keptForkEnvironmentId?: string;
+        oclif?: { exit?: number };
+      };
+    process.exitCode ??= error.exitCode ?? oclif?.exit ?? 1;
+    this.logJson(
+      this.toErrorJson({
+        name: error.name,
+        message: error.message,
+        code: code ?? apiErrorCode(error),
+        details,
+        suggestions,
+        keptForkEnvironmentId,
+      }),
+    );
+  }
+
   protected progress(message: string): void {
     if (!this.jsonEnabled()) this.logToStderr(message);
   }
+}
+
+// CMA client errors carry their codes in the JSON:API errors array.
+function apiErrorCode(error: Error): string | undefined {
+  const { errors } = error as {
+    errors?: Array<{ attributes?: { code?: unknown } }>;
+  };
+  const code = Array.isArray(errors) ? errors[0]?.attributes?.code : undefined;
+  return typeof code === 'string' ? code : undefined;
 }
 
 export function concurrency(value: number): number {
