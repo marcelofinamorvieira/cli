@@ -15,7 +15,11 @@ import { ContentError } from '../../src/engine/errors';
 import * as planner from '../../src/engine/planner';
 import * as schema from '../../src/engine/schema';
 import type { SnapshotStore } from '../../src/engine/store';
-import type { PlanMetadata, SchemaState } from '../../src/engine/types';
+import type {
+  PlanMetadata,
+  RecordState,
+  SchemaState,
+} from '../../src/engine/types';
 import {
   concurrency,
   environmentId,
@@ -203,6 +207,121 @@ describe('content command integration', () => {
       });
       await assert.rejects(command.run(), /download failed/);
       assert.equal(existsSync(working.directory), false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('captures two projects at once, each into its own store, and stops both on failure', async () => {
+    replace(schema, 'assertApplyAccess', async () => undefined);
+    replace(
+      schema,
+      'fetchSchema',
+      async (_client: unknown, environmentId: string) =>
+        schemaState(environmentId),
+    );
+    const record = (id: string): RecordState => ({
+      id,
+      modelId: 'article-id',
+      current: {},
+      published: null,
+      currentVersion: '1',
+      publishedUpdatedAt: null,
+      createdAt: '2020-01-01T00:00:00.000Z',
+      firstPublishedAt: null,
+      parentId: null,
+      position: null,
+      stage: null,
+      schedules: { publication: null, unpublishing: null },
+      validity: { current: true, published: null },
+      hash: id,
+    });
+    let active = 0;
+    let maximum = 0;
+    const stores = new Map<string, SnapshotStore>();
+    let failDestination = false;
+    let sourceAborted = false;
+    replace(
+      capture,
+      'captureSnapshot',
+      async (args: Parameters<typeof capture.captureSnapshot>[0]) => {
+        active++;
+        maximum = Math.max(maximum, active);
+        stores.set(args.side, args.store);
+        try {
+          if (failDestination) {
+            if (args.side === 'target') throw new Error('destination failed');
+            await new Promise<void>((resolve) =>
+              args.options.signal!.addEventListener('abort', () => resolve(), {
+                once: true,
+              }),
+            );
+            sourceAborted = true;
+            throw new ContentError('INTERRUPTED', 'Interrupted.');
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          args.store.putRecord(args.side, record(`${args.side}-record`));
+        } finally {
+          active--;
+        }
+      },
+    );
+    replace(planner, 'createPlan', async (store: SnapshotStore) => {
+      // The destination was read into its own store and imported here.
+      assert.equal(store, stores.get('source'));
+      assert.notEqual(store, stores.get('target'));
+      assert.ok(store.getRecord('source', 'source-record'));
+      assert.ok(store.getRecord('target', 'target-record'));
+      throw new Error('stop after planning input');
+    });
+    const directory = await mkdtemp(join(tmpdir(), 'content-command-test-'));
+    try {
+      const endpoint = (environmentId: string) => ({
+        rootClient: {
+          environments: {
+            list: async () => [{ id: environmentId, meta: { primary: true } }],
+          },
+        },
+        buildEnvironmentClient: (id: string) => ({ id }),
+      });
+      const endpoints = {
+        'source-profile': endpoint('source'),
+        'destination-profile': endpoint('target'),
+      };
+      const command = Object.assign(
+        Object.create(ContentDiffCommand.prototype),
+        {
+          parse: async () => ({
+            flags: {
+              source: 'source',
+              destination: 'target',
+              'source-profile': 'source-profile',
+              'destination-profile': 'destination-profile',
+              output: join(directory, 'bundle'),
+              'item-types': 'all',
+              uploads: 'referenced',
+              concurrency: 4,
+              'chunk-bytes': 1024,
+              'include-deletions': false,
+              'allow-partial': false,
+              'allow-temporary-schema-changes': false,
+            },
+          }),
+          endpoint: async (profile: keyof typeof endpoints) =>
+            endpoints[profile],
+          progress: () => undefined,
+          jsonEnabled: () => true,
+        },
+      );
+      await assert.rejects(command.run(), /stop after planning input/);
+      assert.equal(maximum, 2);
+      for (const store of stores.values())
+        assert.equal(existsSync(store.directory), false);
+      failDestination = true;
+      await assert.rejects(command.run(), /destination failed/);
+      assert.equal(sourceAborted, true);
+      for (const store of stores.values())
+        assert.equal(existsSync(store.directory), false);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

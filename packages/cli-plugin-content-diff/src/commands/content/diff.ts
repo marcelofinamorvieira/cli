@@ -4,6 +4,10 @@ import { oclif } from '@datocms/cli-utils';
 import { writeBundle } from '../../engine/bundle';
 import { assertNotAborted } from '../../engine/cancellation';
 import { captureSnapshot } from '../../engine/capture';
+import {
+  lockEnvironment,
+  unlockEnvironment,
+} from '../../engine/environment-lock';
 import { ContentError } from '../../engine/errors';
 import { createPlan } from '../../engine/planner';
 import {
@@ -12,7 +16,7 @@ import {
   fetchSchema,
 } from '../../engine/schema';
 import { SnapshotStore } from '../../engine/store';
-import type { PlanCounts } from '../../engine/types';
+import type { PlanCounts, SchemaState, Side } from '../../engine/types';
 import {
   ContentCommand,
   concurrency,
@@ -166,43 +170,106 @@ export default class ContentDiffCommand extends ContentCommand {
     const modelIds = selectedModels(sourceSchema, flags['item-types']);
     assertNotAborted(signal);
     const store = new SnapshotStore();
+    const [sourceLocked, destinationLocked] = await Promise.all([
+      lockEnvironment(sourceClient, sourceEnvironmentId),
+      lockEnvironment(destinationClient, destinationEnvironmentId),
+    ]);
     try {
       // Full namespaces prove inbound dependencies and preservation. The model
       // selection below limits planned mutations, rather than capture authority.
-      this.progress(`Capturing source "${sourceEnvironmentId}".`);
-      await captureSnapshot({
-        client: sourceClient,
-        environmentId: sourceEnvironmentId,
-        schema: sourceSchema,
-        store,
-        side: 'source',
-        options: {
-          signal,
-          modelIds: sourceSchema.models
-            .filter((model) => !model.block)
-            .map((model) => model.id),
-          uploads: 'all',
-          concurrency: maximum,
-          progress: (message) => this.progress(message),
-        },
-      });
-      this.progress(`Capturing destination "${destinationEnvironmentId}".`);
-      await captureSnapshot({
-        client: destinationClient,
-        environmentId: destinationEnvironmentId,
-        schema: destinationSchema,
-        store,
-        side: 'target',
-        options: {
-          signal,
-          modelIds: destinationSchema.models
-            .filter((model) => !model.block)
-            .map((model) => model.id),
-          uploads: 'all',
-          concurrency: maximum,
-          progress: (message) => this.progress(message),
-        },
-      });
+      const capture = (
+        side: Side,
+        target: SnapshotStore,
+        captureSignal: AbortSignal,
+      ) => {
+        const [client, environment, schema, locked, label]: [
+          typeof sourceClient,
+          string,
+          SchemaState,
+          boolean,
+          string,
+        ] =
+          side === 'source'
+            ? [
+                sourceClient,
+                sourceEnvironmentId,
+                sourceSchema,
+                sourceLocked,
+                'Source',
+              ]
+            : [
+                destinationClient,
+                destinationEnvironmentId,
+                destinationSchema,
+                destinationLocked,
+                'Destination',
+              ];
+        this.progress(`Capturing ${label.toLowerCase()} "${environment}".`);
+        return captureSnapshot({
+          client,
+          environmentId: environment,
+          schema,
+          store: target,
+          side,
+          // A locked environment cannot change while it is read.
+          verify: !locked,
+          options: {
+            signal: captureSignal,
+            modelIds: schema.models
+              .filter((model) => !model.block)
+              .map((model) => model.id),
+            uploads: 'all',
+            concurrency: maximum,
+            progress: (message) => this.progress(`${label}: ${message}`),
+          },
+        });
+      };
+      if (destination === source) {
+        // One project shares one API rate limit, so reading both environments
+        // at once would only trade time for retries.
+        await capture('source', store, signal);
+        await capture('target', store, signal);
+      } else {
+        // Two projects have separate rate limits. Read both at once, each into
+        // its own store so neither writes tables the other is reading, and
+        // stop the other read as soon as one fails.
+        const destinationStore = new SnapshotStore();
+        const shared = new AbortController();
+        const forward = () => shared.abort();
+        signal.addEventListener('abort', forward, { once: true });
+        try {
+          const results = await Promise.allSettled(
+            (
+              [
+                ['source', store],
+                ['target', destinationStore],
+              ] as const
+            ).map(([side, target]) =>
+              capture(side, target, shared.signal).catch((error) => {
+                shared.abort();
+                throw error;
+              }),
+            ),
+          );
+          const failures = results.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+          );
+          if (failures.length)
+            throw (
+              failures.find(
+                (failure) =>
+                  !(
+                    failure instanceof ContentError &&
+                    failure.code === 'INTERRUPTED'
+                  ),
+              ) ?? failures[0]
+            );
+          store.importSide(destinationStore, 'target');
+        } finally {
+          signal.removeEventListener('abort', forward);
+          destinationStore.dispose();
+        }
+      }
       const metadata = await createPlan(
         store,
         sourceSchema,
@@ -249,6 +316,16 @@ export default class ContentDiffCommand extends ContentCommand {
       }
       return result;
     } finally {
+      await Promise.all([
+        sourceLocked &&
+          unlockEnvironment(sourceClient, sourceEnvironmentId).catch(
+            () => undefined,
+          ),
+        destinationLocked &&
+          unlockEnvironment(destinationClient, destinationEnvironmentId).catch(
+            () => undefined,
+          ),
+      ]);
       store.dispose();
     }
   }

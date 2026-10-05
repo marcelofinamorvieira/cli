@@ -1413,6 +1413,76 @@ describe('expanded capture and native payload codec', () => {
     );
   });
 
+  it('reads schedule details for a whole capture concurrently, not per 30-record batch', async () => {
+    // One scheduled record in each of three 30-record batches.
+    const records = Array.from({ length: 90 }, (_, index) => {
+      const record = rawRecord(identity(`s${index}`), { title: `${index}` });
+      if (index % 30 === 0)
+        (record.meta as Record<string, unknown>).publication_scheduled_at =
+          FUTURE;
+      return record;
+    });
+    const fixture = mockClient([model()], records);
+    let active = 0;
+    let maximum = 0;
+    Reflect.set(fixture.mock.items, 'rawCurrentVsPublishedState', async () => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      active--;
+      return {
+        data: {
+          relationships: {
+            scheduled_publication: {
+              data: { type: 'scheduled_publication', id: 'pub' },
+            },
+            scheduled_unpublishing: { data: null },
+          },
+        },
+        included: [
+          {
+            id: 'pub',
+            type: 'scheduled_publication',
+            attributes: {
+              publication_scheduled_at: FUTURE,
+              selective_publication: null,
+            },
+          },
+        ],
+      };
+    });
+    const store = new SnapshotStore();
+    try {
+      const schema = await fetchSchema(fixture.client, 'source');
+      await captureSnapshot({
+        client: fixture.client,
+        environmentId: 'source',
+        schema,
+        store,
+        side: 'source',
+        options: { modelIds: [MODEL], uploads: 'referenced', concurrency: 4 },
+        verify: false,
+      });
+      assert.equal(maximum, 3);
+      for (const index of [0, 30, 60])
+        assert.deepEqual(
+          store.getRecord('source', identity(`s${index}`))?.schedules,
+          {
+            publication: { at: FUTURE, selective: null },
+            unpublishing: null,
+          },
+        );
+      assert.equal(
+        store.database
+          .prepare('SELECT COUNT(*) AS count FROM capture_schedules')
+          .get()?.count,
+        0,
+      );
+    } finally {
+      store.dispose();
+    }
+  });
+
   it('captures exact private selective schedules and rejects incomplete or drifting state', async () => {
     const fixture = mockClient();
     const current = rawRecord();

@@ -25,6 +25,7 @@ import {
   recordGuard,
   recordHash,
 } from '../../src/engine/codec';
+import * as environmentLock from '../../src/engine/environment-lock';
 import { ContentError } from '../../src/engine/errors';
 import { fetchSchema } from '../../src/engine/schema';
 import { SnapshotStore } from '../../src/engine/store';
@@ -2698,6 +2699,87 @@ describe('apply executor with the SDK resource contract', () => {
     }
   });
 
+  it('reads a scheduled fork update without repeated checks', async () => {
+    const baseline = state(
+      { title: 'old' },
+      {
+        schedules: {
+          publication: { at: '2099-01-01T00:00:00.000Z', selective: null },
+          unpublishing: { at: '2099-03-01T00:00:00.000Z', locales: null },
+        },
+      },
+    );
+    const desired = state(
+      { title: 'new' },
+      {
+        schedules: {
+          publication: { at: '2099-02-01T00:00:00.000Z', selective: null },
+          unpublishing: { at: '2099-04-01T00:00:00.000Z', locales: null },
+        },
+      },
+    );
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const logs: string[] = [];
+    await applyBundle({
+      rootClient: mock.root,
+      buildEnvironmentClient: mock.client,
+      bundlePath,
+      options: { ...defaults, log: (message) => logs.push(message) },
+    });
+    // Was 30 reads and 3 double-checked captures: the second write pass, the
+    // repeated guards and the fork baseline's second read are gone.
+    assert.equal(mock.focusedReads.length, 18);
+    assert.equal(
+      logs.filter((message) => message === 'Checking capture consistency')
+        .length,
+      2,
+    );
+  });
+
+  it('skips other-writer checks while the written environment is locked', async () => {
+    const { lockEnvironment, unlockEnvironment } = environmentLock;
+    const unlocked: string[] = [];
+    Reflect.set(environmentLock, 'lockEnvironment', async () => true);
+    Reflect.set(
+      environmentLock,
+      'unlockEnvironment',
+      async (_client: unknown, environmentId: string) => {
+        unlocked.push(environmentId);
+      },
+    );
+    try {
+      const baseline = state({ title: 'old' });
+      const mock = sdk([baseline]);
+      const bundlePath = await bundle(directory, mock, [
+        plan(baseline, state({ title: 'new' })),
+      ]);
+      const logs: string[] = [];
+      await applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: {
+          ...defaults,
+          inPlace: true,
+          log: (message) => logs.push(message),
+        },
+      });
+      assert(!logs.includes('Checking capture consistency'));
+      assert(
+        !logs.includes('Verifying final content before restoring schedules.'),
+      );
+      assert.equal(
+        mock.environments.get('destination')!.get(recordId)!.current.title,
+        'new',
+      );
+      assert.deepEqual(unlocked, ['destination']);
+    } finally {
+      Reflect.set(environmentLock, 'lockEnvironment', lockEnvironment);
+      Reflect.set(environmentLock, 'unlockEnvironment', unlockEnvironment);
+    }
+  });
+
   it('refuses to start when a schedule falls due within the schedule window', async () => {
     const otherId = 'dddddddddddddddddddddd';
     const soon = new Date(Date.now() + 30 * 60_000).toISOString();
@@ -2774,6 +2856,12 @@ describe('apply executor with the SDK resource contract', () => {
         inPlace,
       );
       assert(logs.includes('Verifying final content and schedules.'));
+      // Destination and final checks read twice; the fork baseline once.
+      assert.equal(
+        logs.filter((message) => message === 'Checking capture consistency')
+          .length,
+        inPlace ? 3 : 2,
+      );
     }
   });
 

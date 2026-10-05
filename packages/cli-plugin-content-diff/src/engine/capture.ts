@@ -389,6 +389,42 @@ async function captureOnce(input: CaptureInput): Promise<void> {
         );
       }
     }
+    // Schedule details cost one request per scheduled record. Few records are
+    // scheduled, so inside the 30-row batches below they would run almost one
+    // at a time; read them all up front with the full concurrency instead.
+    db.exec(
+      'CREATE TEMP TABLE IF NOT EXISTS capture_schedules(side TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,id)) WITHOUT ROWID',
+    );
+    db.prepare('DELETE FROM capture_schedules WHERE side=?').run(side);
+    const scheduledIds = db
+      .prepare(
+        "SELECT id FROM capture_raw WHERE side=? AND slice='current' AND (json_extract(data,'$.meta.publication_scheduled_at') IS NOT NULL OR json_extract(data,'$.meta.unpublishing_scheduled_at') IS NOT NULL) ORDER BY id",
+      )
+      .all(side)
+      .map((row) => String(row.id));
+    const scheduledRow = db.prepare(
+      "SELECT data FROM capture_raw WHERE side=? AND slice='current' AND id=?",
+    );
+    const saveSchedules = db.prepare(
+      'INSERT INTO capture_schedules VALUES(?,?,?)',
+    );
+    await boundedWork(
+      scheduledIds,
+      concurrency,
+      async (id) => {
+        assertNotAborted(signal);
+        const current: unknown = JSON.parse(
+          String(scheduledRow.get(side, id)!.data),
+        );
+        const schedules = await readSchedules(client, current);
+        saveSchedules.run(side, id, JSON.stringify(schedules));
+      },
+      undefined,
+      signal,
+    );
+    const cachedSchedules = db.prepare(
+      'SELECT data FROM capture_schedules WHERE side=? AND id=?',
+    );
     const published = db.prepare(
       "SELECT data FROM capture_raw WHERE side=? AND slice='published' AND id=?",
     );
@@ -416,7 +452,10 @@ async function captureOnce(input: CaptureInput): Promise<void> {
             'CAPTURE_DRIFT',
             `Publication state changed for record ${row.id}.`,
           );
-        const schedules = await readSchedules(client, current);
+        const cached = cachedSchedules.get(side, String(row.id));
+        const schedules = cached
+          ? (JSON.parse(String(cached.data)) as Schedules)
+          : await readSchedules(client, current);
         assertNotAborted(signal);
         states.push(canonicalRecord(current, pub, schema, schedules));
       });
@@ -486,6 +525,10 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     assertNotAborted(signal);
   } finally {
     db.prepare('DELETE FROM capture_raw WHERE side=?').run(side);
+    db.exec(
+      'CREATE TEMP TABLE IF NOT EXISTS capture_schedules(side TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,id)) WITHOUT ROWID',
+    );
+    db.prepare('DELETE FROM capture_schedules WHERE side=?').run(side);
   }
 }
 

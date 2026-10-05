@@ -21,6 +21,7 @@ import {
   recordPayloadFields,
   unsupportedRecordPayloadKey,
 } from './codec';
+import { lockEnvironment, unlockEnvironment } from './environment-lock';
 import { ContentError } from './errors';
 import { collectionTransitionIssues, orderedCollectionWrites } from './planner';
 import {
@@ -152,6 +153,8 @@ interface Context {
   concurrency: number;
   mutations: number;
   writesPlanned: boolean;
+  /** The written environment is locked against other edits. */
+  locked: boolean;
   signal?: AbortSignal;
   log?: ApplyOptions['log'];
 }
@@ -588,6 +591,7 @@ async function updateRecord(
   context: Context,
   entry: RecordPlan,
   body: JsonObject,
+  guarded?: RecordState,
 ): Promise<RecordState> {
   const expected = context.store.getRecord('live', entry.id);
   if (
@@ -617,7 +621,10 @@ async function updateRecord(
         }
       : undefined,
   );
-  const live = await guardRecord(context, entry.id);
+  // A caller's guard read is still the latest read unless the ordering check
+  // read siblings in between.
+  const live =
+    guarded && !ordering ? guarded : await guardRecord(context, entry.id);
   if (!live) conflict('record', entry.id, 'missing before update');
   if (!live.currentVersion)
     throw new ContentError(
@@ -681,22 +688,24 @@ function intendSchedule(
     .run(JSON.stringify(schedules), id);
 }
 
+/** Writes fields if they differ and returns the record as last read. */
 async function writeFields(
   context: Context,
   entry: RecordPlan,
   fields: JsonObject,
-): Promise<void> {
+): Promise<RecordState> {
   const live = await guardRecord(context, entry.id);
   if (!live) conflict('record', entry.id, 'missing before writing fields');
-  if (equal(live.current, fields)) return;
-  await updateRecord(
+  if (equal(live.current, fields)) return live;
+  const verified = await updateRecord(
     context,
     entry,
     recordPayloadFields(fields, entry.modelId, context.schema),
+    live,
   );
-  const verified = context.store.getRecord('live', entry.id)!;
   if (!equal(verified.current, fields))
     conflict('record', entry.id, 'field payload did not converge');
+  return verified;
 }
 
 async function cancelSchedules(context: Context, id: string): Promise<void> {
@@ -715,8 +724,8 @@ async function cancelSchedules(context: Context, id: string): Promise<void> {
     if (live.schedules.publication)
       conflict('record', id, 'publication schedule was not canceled');
   }
+  // The record was read just above, by the guard or after the previous write.
   if (live.schedules.unpublishing) {
-    await guardRecord(context, id);
     const schedules = { ...live.schedules, unpublishing: null };
     intendSchedule(context, id, schedules);
     assertNotAborted(context.signal);
@@ -742,6 +751,7 @@ async function restoreSchedules(
   )
     return;
   futureSchedules(id, schedules);
+  let verified = false;
   if (schedules.publication) {
     let live = await guardRecord(context, id);
     if (!live) conflict('record', id, 'missing before scheduling publication');
@@ -789,10 +799,12 @@ async function restoreSchedules(
       ...current,
       schedules: intendedSchedules,
     });
+    verified = true;
   }
   if (schedules.unpublishing) {
     futureSchedules(id, schedules);
-    await guardRecord(context, id);
+    // rememberRecord has just read it after the publication schedule.
+    if (!verified) await guardRecord(context, id);
     const current = context.store.getRecord('live', id)!;
     const intendedSchedules = {
       ...current.schedules,
@@ -951,9 +963,7 @@ async function publication(
     return;
   }
   await dependencies(context, publicationPlan, true);
-  await writeFields(context, entry, published);
-  live = await guardRecord(context, entry.id);
-  if (!live) conflict('record', entry.id, 'missing before publication');
+  live = await writeFields(context, entry, published);
   if (!live.validity.current) {
     // The private validateExisting endpoint only checks a payload; it does not
     // persist a refreshed validity stamp. Save the same guarded content under
@@ -984,10 +994,7 @@ async function publication(
 async function current(context: Context, entry: RecordPlan): Promise<void> {
   const desired = entry.desired!;
   await dependencies(context, entry, false);
-  await writeFields(context, entry, desired.current);
-  const live = await guardRecord(context, entry.id);
-  if (!live)
-    conflict('record', entry.id, 'missing before lifecycle reconciliation');
+  const live = await writeFields(context, entry, desired.current);
   const model = context.schema.models.find((m) => m.id === entry.modelId)!;
   const body: JsonObject = {};
   if (!equal(metadata(live), metadata(desired))) body.meta = metadata(desired);
@@ -1603,6 +1610,7 @@ function validateBundlePreflight(context: Context): void {
 async function captureLive(
   context: Context,
   environmentId: string,
+  verify = true,
 ): Promise<void> {
   assertNotAborted(context.signal);
   context.store.clearSide('live');
@@ -1621,7 +1629,9 @@ async function captureLive(
       signal: context.signal,
       progress: context.log,
     },
-    verify: true,
+    // The second consistency read only detects other writers; a locked
+    // environment has none.
+    verify: verify && !context.locked,
   });
 }
 
@@ -1749,6 +1759,8 @@ export async function applyBundle(args: {
   let forkRequested = false;
   let context: Context | undefined;
   let changedSchema = false;
+  let destinationLocked = false;
+  let forkLocked = false;
   let startedWrites = false;
   let complete = false;
   const repairs: string[] = [];
@@ -1834,11 +1846,13 @@ export async function applyBundle(args: {
         'Applying in place to primary requires --allow-primary.',
       );
     }
+    destinationLocked = await lockEnvironment(targetClient, destinationId);
     context = {
       client: targetClient,
       store,
       manifest,
       schema,
+      locked: destinationLocked,
       bundlePath: args.bundlePath,
       concurrency: Math.max(
         1,
@@ -1889,6 +1903,8 @@ export async function applyBundle(args: {
       }
       environmentId = ownedFork;
       context.client = args.buildEnvironmentClient(environmentId);
+      forkLocked = await lockEnvironment(context.client, ownedFork);
+      context.locked = forkLocked;
       context.schema = await fetchSchema(context.client, environmentId);
       await assertApplyAccess(
         context.client,
@@ -1909,7 +1925,10 @@ export async function applyBundle(args: {
         );
       }
       context.log?.(`Verifying fork baseline in "${environmentId}".`);
-      await captureLive(context, environmentId);
+      // One read suffices: it is compared with the bundle and the destination,
+      // and anything written to the fork later fails the final verification,
+      // which keeps its second consistency read.
+      await captureLive(context, environmentId, false);
       validateBundlePreflight(context);
       verifyForkBaseline(context);
     }
@@ -2027,11 +2046,24 @@ export async function applyBundle(args: {
         .run(entry.id);
     }
     await reconcileCollectionOrdering(context);
-    // Deletions can shift positions. Reconcile after them and before the final
-    // full capture, preserving every managed and untouched sibling.
-    await recordPhase(context, ['create', 'update'], 'updateOrder', (entry) =>
-      current(context!, entry),
-    );
+    // Deletions and ordered writes can shift positions. Reconcile after them
+    // and before the final full capture, preserving every managed and
+    // untouched sibling. Without either, positions cannot have moved.
+    const ordered = context.schema.models
+      .filter((model) => model.sortable || model.tree)
+      .map((model) => model.id);
+    if (
+      store.database
+        .prepare(
+          `SELECT 1 FROM plan WHERE kind='record' AND (action='delete' OR (action IN ('create','update') AND model_id IN (${ordered
+            .map(() => '?')
+            .join(',')}))) LIMIT 1`,
+        )
+        .get(...ordered)
+    )
+      await recordPhase(context, ['create', 'update'], 'updateOrder', (entry) =>
+        current(context!, entry),
+      );
     if (changedSchema) {
       await temporarySchema(context, true);
       changedSchema = false;
@@ -2046,7 +2078,7 @@ export async function applyBundle(args: {
     // This detects observable concurrent edits; it does not make apply atomic.
     // In place, check the written content before arming schedules on it. A
     // fork that fails verification is deleted, so one final check suffices.
-    if (args.options.inPlace) {
+    if (args.options.inPlace && !context.locked) {
       context.log?.('Verifying final content before restoring schedules.');
       await captureLive(context, environmentId);
       verifyFinal(context, !context.writesPlanned);
@@ -2233,6 +2265,22 @@ export async function applyBundle(args: {
       Object.assign(failure, { keptForkEnvironmentId: ownedFork });
     throw failure;
   } finally {
+    // Locks are released even when cleanup failed; a failed release must not
+    // hide the run's own outcome.
+    if (forkLocked && ownedFork)
+      await unlockEnvironment(
+        args.buildEnvironmentClient(ownedFork),
+        ownedFork,
+      ).catch(() => undefined);
+    if (destinationLocked && context)
+      await unlockEnvironment(
+        args.buildEnvironmentClient(
+          args.options.destinationEnvironmentId ??
+            context.manifest.destination.environmentId,
+        ),
+        args.options.destinationEnvironmentId ??
+          context.manifest.destination.environmentId,
+      ).catch(() => undefined);
     // The bundle is an export and survives both success and failure. Only the
     // SQLite workspace owned by this execution is disposed here.
     store.dispose();
@@ -2338,6 +2386,7 @@ export async function repairBundle(args: {
         concurrency: 1,
         mutations: 0,
         writesPlanned: true,
+        locked: false,
         signal,
         log,
       };

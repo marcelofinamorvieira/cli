@@ -514,6 +514,35 @@ export class SnapshotStore {
     });
   }
 
+  /**
+   * Copies one captured side from another store, so captures of different
+   * projects can run in parallel without sharing tables while they write.
+   * The other store is closed first and is left for its owner to dispose.
+   */
+  importSide(other: SnapshotStore, side: Side): void {
+    other.close();
+    this.database.prepare('ATTACH DATABASE ? AS imported').run(other.filename);
+    try {
+      this.transaction(() => {
+        for (const table of [
+          'records',
+          'uploads',
+          'collections',
+          'refs',
+          'block_owners',
+          'unique_values',
+        ])
+          this.database
+            .prepare(
+              `INSERT INTO main.${table} SELECT * FROM imported.${table} WHERE side=?`,
+            )
+            .run(side);
+      });
+    } finally {
+      this.database.exec('DETACH DATABASE imported');
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.database.close();

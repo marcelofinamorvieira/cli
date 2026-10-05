@@ -17,7 +17,7 @@ datocms content:diff \
   --output=./content-bundle
 ```
 
-`--source` accepts an environment ID or `primary`. `--destination` defaults to `primary`. The output must be a new directory. Generation checks source and destination schema compatibility, captures their complete content namespaces, and rejects an inconsistent capture. `--item-types` limits changes to selected model API keys; other destination records provide dependency and preservation evidence.
+`--source` accepts an environment ID or `primary`. `--destination` defaults to `primary`. The output must be a new directory. Generation checks source and destination schema compatibility, captures their complete content namespaces, and rejects an inconsistent capture. When the source and destination are different projects, both are read at the same time. `--item-types` limits changes to selected model API keys; other destination records provide dependency and preservation evidence.
 
 | Flag | Default | Behavior |
 | --- | --- | --- |
