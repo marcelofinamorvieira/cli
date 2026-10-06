@@ -1,7 +1,7 @@
 import { dirname, resolve } from 'node:path';
 import type { ContentMigrationClient } from './content-migration-client';
 export type * from './content-migration-client';
-import { applyBundle } from './engine/apply';
+import { applyPlan } from './engine/apply';
 import { assertNotAborted } from './engine/cancellation';
 import { captureSnapshot } from './engine/capture';
 import { ContentError } from './engine/errors';
@@ -40,14 +40,14 @@ export interface ContentMigrationOptions {
 }
 
 export interface ContentMigrationDefinition {
-  version: 1;
+  readonly format: 'datocms-content-migration';
+  readonly version: 1;
   options: ContentMigrationOptions;
   run: (client: ContentMigrationClient, signal?: AbortSignal) => Promise<void>;
 }
 
-export type ContentMigration = ((client: Client) => Promise<void>) & {
-  contentMigration: ContentMigrationDefinition;
-};
+/** A declaration consumed by content:apply, not a native migration function. */
+export type ContentMigration = ContentMigrationDefinition;
 
 interface RecordingSession {
   signal: AbortSignal;
@@ -111,15 +111,16 @@ export function runMigrationPart(
 }
 
 /**
- * Declare content intent for content:apply. The callable export rejects other
- * runners before they can execute these operations directly against the CMA.
- * content:apply records the descriptor's calls locally, replans and guards them.
+ * Declare content intent for content:apply. The branded descriptor makes the
+ * execution contract explicit: calls are recorded locally, replanned and guarded.
+ * It is trusted executable code, not a native migration function or a sandbox.
  */
 export function defineContentMigration(
   options: ContentMigrationOptions,
   run: (client: ContentMigrationClient) => Promise<void>,
 ): ContentMigration {
   const definition: ContentMigrationDefinition = {
+    format: 'datocms-content-migration',
     version: 1,
     options,
     async run(client, signal) {
@@ -166,39 +167,39 @@ export function defineContentMigration(
       }
     },
   };
-  return Object.assign(
-    async (_client: Client): Promise<void> => {
-      throw new ContentError(
-        'CONTENT_APPLY_REQUIRED',
-        'Run this content migration with datocms content:apply <script.ts>. Native migrations:run does not support content migrations.',
-      );
-    },
-    { contentMigration: definition },
-  );
+  return definition;
 }
 
 export async function loadContentMigration(
   path: string,
   signal?: AbortSignal,
 ): Promise<ContentMigrationDefinition> {
-  const module = await loadMigrationModule<
-    ContentMigration | { default?: ContentMigration }
-  >(path, { signal });
-  const entry = typeof module === 'function' ? module : module.default;
-  const declaration = entry?.contentMigration;
+  const module = await loadMigrationModule<unknown>(path, { signal });
+  const declaration =
+    module && typeof module === 'object' && 'default' in module
+      ? module.default
+      : module;
   if (
-    typeof entry !== 'function' ||
-    declaration?.version !== 1 ||
+    !declaration ||
+    typeof declaration !== 'object' ||
+    !('format' in declaration) ||
+    declaration.format !== 'datocms-content-migration' ||
+    !('version' in declaration) ||
+    declaration.version !== 1 ||
+    !('run' in declaration) ||
     typeof declaration.run !== 'function' ||
+    !('options' in declaration) ||
     !declaration.options ||
+    typeof declaration.options !== 'object' ||
+    !('baseline' in declaration.options) ||
     typeof declaration.options.baseline !== 'string' ||
     !declaration.options.baseline
   )
     throw new ContentError(
       'INVALID_CONTENT_MIGRATION',
-      'Expected a default export created by defineContentMigration.',
+      'content:apply expects a default descriptor exported by defineContentMigration.',
     );
-  return declaration;
+  return declaration as ContentMigrationDefinition;
 }
 
 export interface ContentMigrationApplyArguments {
@@ -338,12 +339,12 @@ async function executeDefinition(
       }
     }
     assertNotAborted(options.signal);
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: args.rootClient,
       buildEnvironmentClient: args.buildEnvironmentClient,
-      bundlePath: directory,
+      artifactDirectory: directory,
       options: { ...options, schemaProjection: projection },
-      prepared: {
+      plan: {
         metadata,
         entries: () => store.planEntries(),
         snapshot: { store, environmentId, schemaHash: schema.hash },

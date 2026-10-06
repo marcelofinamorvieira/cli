@@ -37,6 +37,7 @@ import type {
   ModelSchema,
   SchemaState,
 } from '../../src/engine/types';
+import { withBulkSchema } from './bulk-schema-fixture';
 
 const identity = (name: string) =>
   createHash('sha256').update(name).digest('base64url').slice(0, 22);
@@ -232,6 +233,7 @@ function mockClient(
     uploads: { rawList: async () => response([]) },
     uploadCollections: { list: async () => [] },
   };
+  withBulkSchema(mock as unknown as Client);
   return { mock, client: mock as unknown as Client, calls };
 }
 
@@ -702,6 +704,7 @@ describe('expanded capture and native payload codec', () => {
 
   it('captures 30-record nested pages with backpressure and the complete unselected namespace', async () => {
     const other = model(identity('other'));
+    other.fields[0].id = identity('other-title');
     const records = Array.from({ length: 125 }, (_, index) =>
       rawRecord(identity(`r${index}`), {
         title: `record ${index}`,

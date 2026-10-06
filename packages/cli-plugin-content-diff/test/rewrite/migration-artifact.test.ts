@@ -40,10 +40,10 @@ import type {
   UploadState,
 } from '../../src/engine/types';
 import type { ContentMigrationClient } from '../../src/migration';
+import { fixtureId } from './fixture-id';
 
 const MODEL = 'aaaaaaaaaaaaaaaaaaaaaa';
-const id = (value: string) =>
-  createHash('sha256').update(value).digest('base64url').slice(0, 22);
+const id = fixtureId;
 const tracking = { apiKey: 'schema_migration', model: null };
 const options = {
   modelIds: [MODEL],

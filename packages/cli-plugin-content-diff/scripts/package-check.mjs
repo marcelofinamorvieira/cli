@@ -108,7 +108,9 @@ try {
     'schema',
     'capture',
     'planner',
-    'bundle',
+    'artifact-integrity',
+    'asset-download',
+    'portable-id',
     'apply',
   ]) {
     assert.ok(
@@ -130,7 +132,7 @@ try {
     assert.ok(help.includes(command), `compiled help is missing ${command}`);
   }
   console.log(
-    `Verified ${files.length} package files, both content commands, bundle engine modules, and credential exclusion without publishing.`,
+    `Verified ${files.length} package files, both content commands, artifact and plan engine modules, and credential exclusion without publishing.`,
   );
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

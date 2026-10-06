@@ -12,11 +12,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { CmaClient } from '@datocms/cli-utils';
 import { serializeRawItem } from '@datocms/rest-client-utils';
-import { applyBundle, repairBundle } from '../../src/engine/apply';
+import { applyPlan, repairPlan } from '../../src/engine/apply';
 import { stageBinary } from '../../src/engine/apply-binary';
 import { validateExecution } from '../../src/engine/apply-validation';
 import { batches, boundedWork } from '../../src/engine/apply-work';
-import { writeBundle } from '../../src/engine/bundle';
+import { fetchBinary, requiresBinary } from '../../src/engine/asset-download';
 import { captureSnapshot } from '../../src/engine/capture';
 import {
   canonicalCollection,
@@ -26,7 +26,6 @@ import {
   recordGuard,
   recordHash,
 } from '../../src/engine/codec';
-import * as environmentLock from '../../src/engine/environment-lock';
 import { ContentError } from '../../src/engine/errors';
 import { createPlan } from '../../src/engine/planner';
 import { fetchSchema } from '../../src/engine/schema';
@@ -40,10 +39,15 @@ import type {
   JsonValue,
   PlanCounts,
   PlanEntry,
+  PlanMetadata,
+  PreparedPlan,
   RecordPlan,
   RecordState,
   TemporarySchemaChange,
+  UploadPlan,
 } from '../../src/engine/types';
+import { withBulkSchema } from './bulk-schema-fixture';
+import { fixtureId } from './fixture-id';
 
 describe('apply bounded work and owned binary staging', () => {
   it('limits pulled work and serializes writes in the same ordered group', async () => {
@@ -860,7 +864,7 @@ function sdk(initial: RecordState[] = []) {
         request.queryParams as Parameters<Client['items']['rawList']>[0],
       );
     }) as Client['request'];
-    return result;
+    return withBulkSchema(result);
   }
   const root = {
     site: { find: async () => ({ ...site(), id: rootSiteId }) },
@@ -1387,13 +1391,15 @@ function withBlockField(
   return { defaults };
 }
 
-async function bundle(
+const preparedPlans = new Map<string, PreparedPlan>();
+
+async function preparedArtifact(
   directory: string,
   mock: ReturnType<typeof sdk>,
   entries: PlanEntry[],
   modelIds: string[] = [modelId],
   temporarySchemaChanges: TemporarySchemaChange[] = [],
-  fetchFn?: Parameters<typeof writeBundle>[0]['fetchFn'],
+  fetchFn?: typeof fetch,
 ): Promise<string> {
   const store = new SnapshotStore(directory);
   try {
@@ -1413,25 +1419,40 @@ async function bundle(
       ]),
     ) as PlanCounts;
     for (const entry of entries) counts[entry.kind][entry.action]++;
-    return await writeBundle({
-      fetchFn,
-      store,
-      outputPath: join(directory, 'bundle'),
-      metadata: {
-        source: { siteId: 'source-site', environmentId: 'source' },
-        destination: { siteId: 'site', environmentId: 'destination' },
-        schema,
-        options: {
-          modelIds,
-          uploads: 'all',
-          includeDeletions: true,
-          allowPartial: entries.some((entry) => entry.action === 'skip'),
-          allowTemporarySchemaChanges: temporarySchemaChanges.length > 0,
-        },
-        counts,
-        temporarySchemaChanges,
+    const artifactDirectory = join(directory, 'artifact');
+    mkdirSync(join(artifactDirectory, 'binaries'), { recursive: true });
+    for (const entry of store.planEntries('upload')) {
+      if (entry.kind === 'upload' && requiresBinary(entry)) {
+        entry.binary = await fetchBinary(
+          entry,
+          artifactDirectory,
+          fetchFn ?? fetch,
+          async () => undefined,
+          60_000,
+        );
+        store.putPlan(entry);
+      }
+    }
+    const metadata: PlanMetadata = {
+      source: { siteId: 'source-site', environmentId: 'source' },
+      destination: { siteId: 'site', environmentId: 'destination' },
+      schema,
+      options: {
+        modelIds,
+        uploads: 'all',
+        includeDeletions: true,
+        allowPartial: entries.some((entry) => entry.action === 'skip'),
+        allowTemporarySchemaChanges: temporarySchemaChanges.length > 0,
       },
+      counts,
+      temporarySchemaChanges,
+    };
+    const planned = [...store.planEntries()];
+    preparedPlans.set(artifactDirectory, {
+      metadata,
+      entries: () => structuredClone(planned),
     });
+    return artifactDirectory;
   } finally {
     store.dispose();
   }
@@ -1443,19 +1464,21 @@ describe('apply executor with the SDK resource contract', () => {
     directory = mkdtempSync(join(tmpdir(), 'apply-executor-test-'));
   });
   afterEach(() => {
+    preparedPlans.clear();
     rmSync(directory, { recursive: true, force: true });
   });
 
   it('uses an explicitly named fork and keeps the original destination intact', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: { ...defaults, forkName: 'content-review-42' },
     });
     assert.equal(result.environmentId, 'content-review-42');
@@ -1484,12 +1507,13 @@ describe('apply executor with the SDK resource contract', () => {
       { ...defaults, forkName: 'valid-name', inPlace: true },
     ]) {
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: () => {
             throw new Error('unexpected API client');
           },
-          bundlePath: 'missing',
+          artifactDirectory: 'missing',
+          plan: undefined as unknown as PreparedPlan,
           options,
         }),
         (error: unknown) =>
@@ -1503,15 +1527,16 @@ describe('apply executor with the SDK resource contract', () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
     mock.environments.set('existing-review', new Map());
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     for (const dryRun of [false, true]) {
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: { ...defaults, forkName: 'existing-review', dryRun },
         }),
         (error: unknown) =>
@@ -1525,7 +1550,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('never deletes a concurrent winner or an uncertain fork after a rejected creation request', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     for (const existsAfterFailure of [false, true]) {
@@ -1535,10 +1560,11 @@ describe('apply executor with the SDK resource contract', () => {
         throw new Error('fork request failed');
       });
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: { ...defaults, forkName: 'claimed-review' },
         }),
         (error: Error & { unconfirmedForkEnvironmentId?: string }) => {
@@ -1555,7 +1581,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('does not delete a replacement environment with the same name after owned creation', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     const fork = mock.root.environments.fork.bind(mock.root.environments);
@@ -1577,10 +1603,11 @@ describe('apply executor with the SDK resource contract', () => {
     });
     mock.fail(recordId);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, forkName: 'reused-review' },
       }),
       /ownership could not be proven/,
@@ -1593,7 +1620,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('retains an environment when a creation response omits its lifetime identity', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     const fork = mock.root.environments.fork.bind(mock.root.environments);
@@ -1606,10 +1633,11 @@ describe('apply executor with the SDK resource contract', () => {
       }),
     );
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, forkName: 'unconfirmed-review' },
       }),
       (error: unknown) =>
@@ -1640,23 +1668,20 @@ describe('apply executor with the SDK resource contract', () => {
         reasons: ['temporary validation'],
       },
     ];
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       [plan(baseline, state({ title: 'new' }))],
       [modelId],
       changes,
     );
-    const originalLock = environmentLock.lockEnvironment;
-    Reflect.set(environmentLock, 'lockEnvironment', async () => {
-      throw new Error('preview attempted a lock');
-    });
     try {
       for (const inPlace of [false, true]) {
-        const result = await applyBundle({
+        const result = await applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: {
             ...defaults,
             inPlace,
@@ -1677,7 +1702,6 @@ describe('apply executor with the SDK resource contract', () => {
         );
       }
     } finally {
-      Reflect.set(environmentLock, 'lockEnvironment', originalLock);
     }
   });
 
@@ -1707,7 +1731,7 @@ describe('apply executor with the SDK resource contract', () => {
       );
       const mock = sdk([baseline]);
       if (failure === 'primary') mock.setPrimary();
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, desired),
       ]);
       if (failure === 'baseline')
@@ -1723,10 +1747,11 @@ describe('apply executor with the SDK resource contract', () => {
           return result;
         };
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: {
             ...defaults,
             dryRun: true,
@@ -1751,7 +1776,7 @@ describe('apply executor with the SDK resource contract', () => {
       state({ title: `old ${index}` }, { id: String(index).padStart(22, '0') }),
     );
     const mock = sdk(originals);
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       originals.map((original) =>
@@ -1759,10 +1784,11 @@ describe('apply executor with the SDK resource contract', () => {
       ),
     );
     const progress: string[] = [];
-    await applyBundle({
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: {
         ...defaults,
         inPlace: true,
@@ -1782,7 +1808,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('does not report a failed record write as verified progress', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     mock.afterNextUpdate((record) => {
@@ -1790,10 +1816,11 @@ describe('apply executor with the SDK resource contract', () => {
     });
     const progress: string[] = [];
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: {
           ...defaults,
           inPlace: true,
@@ -1816,19 +1843,20 @@ describe('apply executor with the SDK resource contract', () => {
       const desired = [collectionState(a.id, 5), collectionState(b.id, 10)];
       const mock = sdk();
       const collections = withCollections(mock, [a, b]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         collectionPlan(a, desired[0]),
         collectionPlan(b, desired[1]),
       ]);
       if (drift) collections.states.get('destination')!.get(a.id)!.position = 2;
-      const execution = applyBundle({
+      const execution = applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       if (drift) {
-        await assert.rejects(execution, /bundled baseline/);
+        await assert.rejects(execution, /migration baseline/);
         assertNothingWritten(mock.events);
       } else {
         const result = await execution;
@@ -1876,11 +1904,12 @@ describe('apply executor with the SDK resource contract', () => {
     entries.push(
       collectionPlan(originals.find((state) => state.id === d)!, null),
     );
-    const bundlePath = await bundle(directory, mock, entries);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const written = collections.states.get(result.environmentId)!;
@@ -1925,16 +1954,17 @@ describe('apply executor with the SDK resource contract', () => {
     const shifted = collectionState(original.id, 2, null, original.label);
     const mock = sdk();
     const collections = withCollections(mock, [original, deleted]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       collectionPlan(original, shifted),
       collectionPlan(deleted, null),
       collectionPlan(null, parent),
       collectionPlan(null, child),
     ]);
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const actual = collections.states.get(result.environmentId)!;
@@ -1953,15 +1983,16 @@ describe('apply executor with the SDK resource contract', () => {
     const wantedA = collectionState(a.id, 1, b.id);
     const mock = sdk();
     const collections = withCollections(mock, [a, b, c]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       collectionPlan(a, wantedA),
       collectionPlan(b, b),
       collectionPlan(c, wantedC),
     ]);
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const actual = collections.states.get(result.environmentId)!;
@@ -1983,7 +2014,7 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const mock = sdk();
     const collections = withCollections(mock, originals);
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       originals.map((state, index) => collectionPlan(state, desired[index])),
@@ -1992,10 +2023,11 @@ describe('apply executor with the SDK resource contract', () => {
       collections.states.get('destination')!.get(originals[1].id)!.position = 8;
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /affected sibling changed during/,
@@ -2017,17 +2049,18 @@ describe('apply executor with the SDK resource contract', () => {
     const relabeled = collectionState(originals[2].id, 9, null, 'Renamed');
     const mock = sdk();
     const collections = withCollections(mock, originals);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       collectionPlan(originals[0], null),
       collectionPlan(originals[1], originals[1]),
       collectionPlan(originals[2], relabeled),
       collectionPlan(null, created),
     ]);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /cannot retain its exact intended position/i,
@@ -2092,11 +2125,16 @@ describe('apply executor with the SDK resource contract', () => {
                 ),
               ),
             ];
-      const bundlePath = await bundle(runDirectory, mock, entries);
-      const execution = applyBundle({
+      const artifactDirectory = await preparedArtifact(
+        runDirectory,
+        mock,
+        entries,
+      );
+      const execution = applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       if (outcome === 'safe-handoff') {
@@ -2126,15 +2164,16 @@ describe('apply executor with the SDK resource contract', () => {
     const b = collectionState('b'.repeat(22), 2);
     const mock = sdk();
     withCollections(mock, [a, b]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       collectionPlan(a, collectionState(a.id, 2)),
       collectionPlan(b, b),
     ]);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       (error) =>
@@ -2167,12 +2206,17 @@ describe('apply executor with the SDK resource contract', () => {
                 collectionPlan(a, collectionState(a.id, 1, b.id)),
                 collectionPlan(b, null),
               ];
-      const bundlePath = await bundle(runDirectory, mock, entries);
+      const artifactDirectory = await preparedArtifact(
+        runDirectory,
+        mock,
+        entries,
+      );
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: defaults,
         }),
         (error) =>
@@ -2209,15 +2253,16 @@ describe('apply executor with the SDK resource contract', () => {
       );
       const mock = sdk();
       const collections = withCollections(mock, originals);
-      const bundlePath = await bundle(
+      const artifactDirectory = await preparedArtifact(
         runDirectory,
         mock,
         originals.map((state, index) => collectionPlan(state, intended[index])),
       );
-      await applyBundle({
+      await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       if (move) assert(collections.filteredReads.length > 0);
@@ -2242,11 +2287,14 @@ describe('apply executor with the SDK resource contract', () => {
       },
     );
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.notEqual(result.environmentId, 'destination');
@@ -2273,16 +2321,19 @@ describe('apply executor with the SDK resource contract', () => {
       },
     );
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
     mock.afterNextUpdate((record) => {
       record.current.title = 'concurrent editor';
       record.currentVersion = String(Number(record.currentVersion) + 1);
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /changed during|did not converge/,
@@ -2306,16 +2357,19 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const desired = state({ title: 'reviewed' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
     mock.afterNextScheduleCancellation((record) => {
       record.current.title = 'concurrent editor';
       record.currentVersion = String(Number(record.currentVersion) + 1);
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       // The editor's content is not the original, so the original schedule is
@@ -2342,17 +2396,20 @@ describe('apply executor with the SDK resource contract', () => {
       },
     );
     const mock = sdk();
-    const bundlePath = await bundle(directory, mock, [plan(null, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(null, desired),
+    ]);
     mock.afterNextCreate((record) => {
       record.published = { title: 'concurrent publication' };
       record.validity.published = true;
       record.publishedUpdatedAt = '2020-01-02T00:00:00.000Z';
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /changed during/,
@@ -2368,11 +2425,14 @@ describe('apply executor with the SDK resource contract', () => {
     const desired = state({ title: 'new' }, { stage: 'review' });
     const mock = sdk();
     mock.withWorkflow();
-    const bundlePath = await bundle(directory, mock, [plan(null, desired)]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(null, desired),
+    ]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(
@@ -2404,13 +2464,14 @@ describe('apply executor with the SDK resource contract', () => {
       );
       const mock = sdk(create ? [] : [baseline]);
       mock.withoutDraftMode();
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(create ? null : baseline, desired),
       ]);
-      const result = await applyBundle({
+      const result = await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       const actual = mock.environments
@@ -2450,11 +2511,12 @@ describe('apply executor with the SDK resource contract', () => {
     const mock = sdk();
     mock.withoutDraftMode();
     mock.withLinks();
-    const bundlePath = await bundle(directory, mock, entries);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     for (const record of desired) {
@@ -2524,11 +2586,16 @@ describe('apply executor with the SDK resource contract', () => {
         }) as typeof client.items.publish;
         return client;
       };
-      const bundlePath = await bundle(runDirectory, mock, entries(provisional));
-      const run = applyBundle({
+      const artifactDirectory = await preparedArtifact(
+        runDirectory,
+        mock,
+        entries(provisional),
+      );
+      const run = applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: environmentClient,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       if (!provisional) {
@@ -2583,12 +2650,13 @@ describe('apply executor with the SDK resource contract', () => {
     });
     const mock = sdk();
     mock.withLinks();
-    const bundlePath = await bundle(directory, mock, entries);
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       (error: unknown) =>
@@ -2657,11 +2725,16 @@ describe('apply executor with the SDK resource contract', () => {
         preserved.safety.currentReferences = [recordId];
         entries.push(preserved);
       }
-      const bundlePath = await bundle(runDirectory, mock, entries);
-      const apply = applyBundle({
+      const artifactDirectory = await preparedArtifact(
+        runDirectory,
+        mock,
+        entries,
+      );
+      const apply = applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       if (action === 'external-delete') {
@@ -2694,11 +2767,12 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const mock = sdk(originals);
     mock.withDelayedUpdates();
-    const bundlePath = await bundle(directory, mock, entries);
-    await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(mock.stats.maximumUpdates, 2);
@@ -2721,7 +2795,7 @@ describe('apply executor with the SDK resource contract', () => {
     const collectionA = collectionState('e'.repeat(22), 1);
     const collectionB = collectionState('f'.repeat(22), 2);
     withCollections(mock, [collectionA, collectionB]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       updated,
       created,
       collectionPlan(collectionA, collectionState(collectionA.id, 2)),
@@ -2797,10 +2871,11 @@ describe('apply executor with the SDK resource contract', () => {
       return putPlan.call(this, entry);
     };
     try {
-      await applyBundle({
+      await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         // The full mode reruns the preflight on the fork as well.
         options: { ...defaults, verification: 'full' },
       });
@@ -2842,11 +2917,12 @@ describe('apply executor with the SDK resource contract', () => {
     const mock = sdk([a, b, taxonomy]);
     mock.withLinks();
     mock.withDelayedUpdates();
-    const bundlePath = await bundle(directory, mock, entries);
-    await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(mock.stats.maximumUpdates, 2);
@@ -2870,14 +2946,15 @@ describe('apply executor with the SDK resource contract', () => {
     const mock = sdk([owner, dependency]);
     mock.withLinks();
     mock.withDelayedUpdates();
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       ownerPlan,
       dependencyPlan,
     ]);
-    await applyBundle({
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(mock.stats.maximumUpdates, 1);
@@ -2901,11 +2978,12 @@ describe('apply executor with the SDK resource contract', () => {
         ),
       ),
     );
-    const bundlePath = await bundle(directory, mock, entries);
-    await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(mock.stats.maximumUpdates, 1);
@@ -2920,12 +2998,13 @@ describe('apply executor with the SDK resource contract', () => {
     const entries = [a, b].map((original) =>
       plan(original, state({ title: 'new' }, { id: original.id })),
     );
-    const bundlePath = await bundle(directory, mock, entries);
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       /injected update failure/,
@@ -2940,10 +3019,11 @@ describe('apply executor with the SDK resource contract', () => {
     controller.abort();
     const mock = sdk();
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath: join(directory, 'missing-bundle'),
+        artifactDirectory: join(directory, 'missing-artifact'),
+        plan: undefined as unknown as PreparedPlan,
         options: { ...defaults, signal: controller.signal },
       }),
       (error: unknown) =>
@@ -2955,16 +3035,17 @@ describe('apply executor with the SDK resource contract', () => {
   it('removes a fork whose submitted creation finishes after interruption', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     const controller = new AbortController();
     mock.afterNextFork(() => controller.abort());
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: {
           ...defaults,
           forkName: 'interrupted-review',
@@ -2985,7 +3066,7 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const mock = sdk(originals);
     mock.withDelayedUpdates();
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       originals.map((original) =>
@@ -2995,10 +3076,11 @@ describe('apply executor with the SDK resource contract', () => {
     const controller = new AbortController();
     mock.afterNextUpdate(() => controller.abort());
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, signal: controller.signal },
       }),
       (error: unknown) =>
@@ -3037,7 +3119,7 @@ describe('apply executor with the SDK resource contract', () => {
           reasons: ['temporary test validation'],
         },
       ];
-      const bundlePath = await bundle(
+      const artifactDirectory = await preparedArtifact(
         runDirectory,
         mock,
         [plan(baseline, state({ title: 'new' }))],
@@ -3049,10 +3131,11 @@ describe('apply executor with the SDK resource contract', () => {
         mock.afterNextScheduleCancellation(() => controller.abort());
       else mock.afterNextUpdate(() => controller.abort());
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: {
             ...defaults,
             inPlace: true,
@@ -3116,14 +3199,15 @@ describe('apply executor with the SDK resource contract', () => {
       const runDirectory = join(directory, verification);
       mkdirSync(runDirectory);
       const mock = sdk([baseline]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, desired),
       ]);
       const logs: string[] = [];
-      await applyBundle({
+      await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: {
           ...defaults,
           verification,
@@ -3155,7 +3239,7 @@ describe('apply executor with the SDK resource contract', () => {
       mkdirSync(runDirectory);
       const baseline = state({ title: 'old' });
       const mock = sdk([baseline]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, state({ title: 'new' })),
       ]);
       const order: string[] = [];
@@ -3192,10 +3276,11 @@ describe('apply executor with the SDK resource contract', () => {
           : environment;
       });
       const logs: string[] = [];
-      const result = await applyBundle({
+      const result = await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: {
           ...defaults,
           fastFork,
@@ -3219,7 +3304,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('reports a fork that DatoCMS removed while creating it as failed', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     const find = mock.root.environments.find.bind(mock.root.environments);
@@ -3233,10 +3318,11 @@ describe('apply executor with the SDK resource contract', () => {
       return find(id);
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       (error: unknown) =>
@@ -3253,7 +3339,7 @@ describe('apply executor with the SDK resource contract', () => {
       const baseline = state({ title: 'old' });
       const untouched = state({ title: 'untouched' }, { id: otherId });
       const mock = sdk([baseline, untouched]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, state({ title: 'new' })),
         { ...plan(untouched, untouched), action: 'noop' as const },
       ]);
@@ -3268,58 +3354,16 @@ describe('apply executor with the SDK resource contract', () => {
           record.hash = recordHash(record);
         }
       });
-      const run = applyBundle({
+      const run = applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       if (content)
         await assert.rejects(run, /final state differs|namespace changed/);
       else await run;
-    }
-  });
-
-  it('skips other-writer checks while the written environment is locked', async () => {
-    const { lockEnvironment, unlockEnvironment } = environmentLock;
-    const unlocked: string[] = [];
-    Reflect.set(environmentLock, 'lockEnvironment', async () => true);
-    Reflect.set(
-      environmentLock,
-      'unlockEnvironment',
-      async (_client: unknown, environmentId: string) => {
-        unlocked.push(environmentId);
-      },
-    );
-    try {
-      const baseline = state({ title: 'old' });
-      const mock = sdk([baseline]);
-      const bundlePath = await bundle(directory, mock, [
-        plan(baseline, state({ title: 'new' })),
-      ]);
-      const logs: string[] = [];
-      await applyBundle({
-        rootClient: mock.root,
-        buildEnvironmentClient: mock.client,
-        bundlePath,
-        options: {
-          ...defaults,
-          inPlace: true,
-          log: (message) => logs.push(message),
-        },
-      });
-      assert(!logs.includes('Checking capture consistency'));
-      assert(
-        !logs.includes('Verifying final content before restoring schedules.'),
-      );
-      assert.equal(
-        mock.environments.get('destination')!.get(recordId)!.current.title,
-        'new',
-      );
-      assert.deepEqual(unlocked, ['destination']);
-    } finally {
-      Reflect.set(environmentLock, 'lockEnvironment', lockEnvironment);
-      Reflect.set(environmentLock, 'unlockEnvironment', unlockEnvironment);
     }
   });
 
@@ -3342,15 +3386,16 @@ describe('apply executor with the SDK resource contract', () => {
       ...plan(unchanged, unchanged),
       action: 'noop' as const,
     };
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
       preserved,
     ]);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       (error: unknown) =>
@@ -3361,10 +3406,11 @@ describe('apply executor with the SDK resource contract', () => {
     assertNothingWritten(mock.events);
     // With the window disabled the run proceeds, and the unchanged record's
     // schedule is neither cancelled nor recreated.
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: { ...defaults, scheduleWindowMinutes: 0 },
     });
     assert.deepEqual(
@@ -3383,14 +3429,15 @@ describe('apply executor with the SDK resource contract', () => {
       mkdirSync(runDirectory);
       const baseline = state({ title: 'old' });
       const mock = sdk([baseline]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, state({ title: 'new' })),
       ]);
       const logs: string[] = [];
-      await applyBundle({
+      await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace, log: (message) => logs.push(message) },
       });
       // A failed fork is deleted, so it needs only the final verification.
@@ -3446,7 +3493,7 @@ describe('apply executor with the SDK resource contract', () => {
         reasons: ['temporary test validation'],
       },
     ];
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       ids.map((id) => plan(original(id), reviewed(id))),
@@ -3465,10 +3512,11 @@ describe('apply executor with the SDK resource contract', () => {
       record.hash = recordHash(record);
     }
     const repair = () =>
-      repairBundle({
+      repairPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { allowPrimary: false },
       });
     await assert.rejects(repair(), (error: unknown) => {
@@ -3524,15 +3572,16 @@ describe('apply executor with the SDK resource contract', () => {
   it('rejects another root project before a fork or content mutation', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     mock.wrongRootProject();
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       /project or schema/,
@@ -3543,20 +3592,21 @@ describe('apply executor with the SDK resource contract', () => {
   it('rejects stale full-content baselines before any content write', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     mock.environments
       .get('destination')!
       .set(recordId, state({ title: 'concurrent edit' }));
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
-      /bundled baseline/,
+      /migration baseline/,
     );
     assertNothingWritten(mock.events);
   });
@@ -3564,15 +3614,16 @@ describe('apply executor with the SDK resource contract', () => {
   it('requires explicit primary authorization for in-place mutation', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     mock.setPrimary();
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /allow-primary/,
@@ -3589,7 +3640,7 @@ describe('apply executor with the SDK resource contract', () => {
       mkdirSync(runDirectory);
       const baseline = state({ title: 'old' });
       const mock = sdk([baseline]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, state({ title: 'new' })),
       ]);
       const find = mock.root.environments.find;
@@ -3600,10 +3651,11 @@ describe('apply executor with the SDK resource contract', () => {
           : environment;
       }) as typeof find;
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: defaults,
         }),
         (error: unknown) =>
@@ -3625,7 +3677,7 @@ describe('apply executor with the SDK resource contract', () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
     mock.requireField();
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       [plan(baseline, state({ title: 'new' }))],
@@ -3633,10 +3685,11 @@ describe('apply executor with the SDK resource contract', () => {
       [change],
     );
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       (error: unknown) =>
@@ -3650,7 +3703,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('rejects a destination schema changed since generation before a fork or content mutation', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     mock.fieldStates.set('destination', {
@@ -3658,10 +3711,11 @@ describe('apply executor with the SDK resource contract', () => {
       defaultValue: null,
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       (error: unknown) =>
@@ -3676,7 +3730,7 @@ describe('apply executor with the SDK resource contract', () => {
       mkdirSync(runDirectory);
       const baseline = state({ title: 'old' });
       const mock = sdk([baseline]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, state({ title: 'new' })),
       ]);
       // A destination edit committed after its verified capture but before
@@ -3695,10 +3749,11 @@ describe('apply executor with the SDK resource contract', () => {
             'edited while forking';
       });
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: defaults,
         }),
         (error: unknown) =>
@@ -3715,16 +3770,17 @@ describe('apply executor with the SDK resource contract', () => {
   it('rejects a schema changed during writes before accepting the final content', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     const concurrent = { validators: { required: {} }, defaultValue: null };
     mock.afterNextUpdate(() => mock.fieldStates.set('destination', concurrent));
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       (error: unknown) =>
@@ -3740,15 +3796,16 @@ describe('apply executor with the SDK resource contract', () => {
       mkdirSync(runDirectory);
       const baseline = state({ title: 'old' });
       const mock = sdk([baseline]);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, state({ title: 'new' })),
       ]);
       mock.fail(recordId);
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: { ...defaults, forkName: 'failed-review', keepFailedFork },
         }),
         (error: Error & { keptForkEnvironmentId?: string }) => {
@@ -3770,7 +3827,7 @@ describe('apply executor with the SDK resource contract', () => {
         mock.events.some((event) => event.startsWith('delete-fork:')),
         !keepFailedFork,
       );
-      assert(existsSync(bundlePath));
+      assert(existsSync(artifactDirectory));
     }
   });
 
@@ -3786,12 +3843,15 @@ describe('apply executor with the SDK resource contract', () => {
         },
       },
     );
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       /no longer in the future/,
@@ -3822,11 +3882,14 @@ describe('apply executor with the SDK resource contract', () => {
       },
     );
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const written = mock.environments.get(result.environmentId)!.get(recordId)!;
@@ -3856,13 +3919,16 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const desired = state({ title: 'new' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
     mock.fail(recordId);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /injected update failure/,
@@ -3902,15 +3968,16 @@ describe('apply executor with the SDK resource contract', () => {
         },
       );
       const mock = sdk(baseline ? [baseline] : []);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, desired),
       ]);
       mock.failNextPublicationAfterWrite();
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: { ...defaults, inPlace: true },
         }),
         /uncertain schedule outcome.*left as they are/,
@@ -3944,13 +4011,16 @@ describe('apply executor with the SDK resource contract', () => {
       },
     );
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
     mock.failNextPublicationBeforeWrite();
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       (error: unknown) =>
@@ -3980,15 +4050,18 @@ describe('apply executor with the SDK resource contract', () => {
     const desired = state({ title: 'new' });
     const concurrent = { at: '2099-03-01T00:00:00.000Z', selective: null };
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
     mock.afterNextScheduleCancellation((record) => {
       record.schedules.publication = concurrent;
     });
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       }),
       /schedules changed concurrently/,
@@ -4013,11 +4086,17 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const entry = { ...plan(baseline, baseline), action: 'noop' as const };
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [entry], []);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(
+      directory,
+      mock,
+      [entry],
+      [],
+    );
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(result.mutations, 0);
@@ -4053,11 +4132,12 @@ describe('apply executor with the SDK resource contract', () => {
         },
       ],
     };
-    const bundlePath = await bundle(directory, mock, [entry]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [entry]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert.equal(result.partial, true);
@@ -4088,11 +4168,14 @@ describe('apply executor with the SDK resource contract', () => {
     );
     const mock = sdk(baseline);
     mock.setOrdered();
-    const bundlePath = await bundle(directory, mock, [plan(changed, desired)]);
-    await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(changed, desired),
+    ]);
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert(mock.focusedReads.length > 0);
@@ -4121,13 +4204,14 @@ describe('apply executor with the SDK resource contract', () => {
       );
       const changed = baseline[0];
       const mock = sdk(baseline);
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(changed, state({ title: 'edited' }, { id: changed.id })),
       ]);
-      await applyBundle({
+      await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       assert(
@@ -4176,11 +4260,16 @@ describe('apply executor with the SDK resource contract', () => {
         updated.safety.uploadReferences = [asset.id];
         entries.push(updated);
       }
-      const bundlePath = await bundle(runDirectory, mock, entries);
-      const execution = applyBundle({
+      const artifactDirectory = await preparedArtifact(
+        runDirectory,
+        mock,
+        entries,
+      );
+      const execution = applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true },
       });
       const result = await execution;
@@ -4228,7 +4317,7 @@ describe('apply executor with the SDK resource contract', () => {
       ),
     );
     changed.safety.uploadReferences = [asset.id];
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       unchanged,
       changed,
       asset,
@@ -4238,10 +4327,11 @@ describe('apply executor with the SDK resource contract', () => {
         .get('destination')!
         .get(recordId)!.validity.current = false;
     });
-    await applyBundle({
+    await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: { ...defaults, inPlace: true },
     });
     assert.deepEqual(
@@ -4326,7 +4416,7 @@ describe('apply executor with the SDK resource contract', () => {
           }) as unknown as Client['uploads']['update'];
           return client;
         };
-        const bundlePath = await bundle(
+        const artifactDirectory = await preparedArtifact(
           runDirectory,
           mock,
           [
@@ -4344,10 +4434,11 @@ describe('apply executor with the SDK resource contract', () => {
           [],
           async () => new Response(bytes),
         );
-        const execution = applyBundle({
+        const execution = applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: { ...defaults, inPlace: true },
         });
         if (outcome === 'after-response' || outcome === 'in-response') {
@@ -4424,7 +4515,7 @@ describe('apply executor with the SDK resource contract', () => {
           }) as unknown as Client['uploads']['update'];
           return client;
         };
-        const bundlePath = await bundle(
+        const artifactDirectory = await preparedArtifact(
           runDirectory,
           mock,
           [
@@ -4443,10 +4534,11 @@ describe('apply executor with the SDK resource contract', () => {
           async () => new Response(bytes),
         );
         const logs: string[] = [];
-        const execution = applyBundle({
+        const execution = applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: {
             ...defaults,
             inPlace: true,
@@ -4496,13 +4588,14 @@ describe('apply executor with the SDK resource contract', () => {
           unpublishing: null,
         },
       });
-      const bundlePath = await bundle(runDirectory, mock, [
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
         plan(baseline, desired),
       ]);
-      const result = await applyBundle({
+      const result = await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       assert.equal(
@@ -4541,11 +4634,12 @@ describe('apply executor with the SDK resource contract', () => {
         state(baseline[1].current, { id: baseline[1].id, position: 0 }),
       ),
     ];
-    const bundlePath = await bundle(directory, mock, entries);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, entries);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const written = mock.environments.get(result.environmentId)!;
@@ -4585,11 +4679,14 @@ describe('apply executor with the SDK resource contract', () => {
     });
     const desired = clone(mock.environments.get('source')!.get(a.id)!);
     assert.equal(desired.position, 2);
-    const bundlePath = await bundle(directory, mock, [plan(a, desired)]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(a, desired),
+    ]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const written = mock.environments.get(result.environmentId)!;
@@ -4603,7 +4700,7 @@ describe('apply executor with the SDK resource contract', () => {
   it('rejects a newly added destination identity before any content write', async () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [
+    const artifactDirectory = await preparedArtifact(directory, mock, [
       plan(baseline, state({ title: 'new' })),
     ]);
     mock.environments
@@ -4616,10 +4713,11 @@ describe('apply executor with the SDK resource contract', () => {
         ),
       );
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       /gained an identity/,
@@ -4661,12 +4759,15 @@ describe('apply executor with the SDK resource contract', () => {
       withBlockField(mock);
       const entry = plan(baseline, desired);
       entry.safety.blockIds = [String(block.id)];
-      const bundlePath = await bundle(runDirectory, mock, [entry]);
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
+        entry,
+      ]);
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: defaults,
         }),
         (error) =>
@@ -4682,8 +4783,8 @@ describe('apply executor with the SDK resource contract', () => {
       const publishedChanged = mode === 'changed';
       const runDirectory = join(directory, mode);
       mkdirSync(runDirectory);
-      const publishedBlock = blockValue('i'.repeat(22));
-      const draftBlock = blockValue('j'.repeat(22));
+      const publishedBlock = blockValue(fixtureId('published-block'));
+      const draftBlock = blockValue(fixtureId('draft-block'));
       const baseline = state(
         {
           title: 'Draft',
@@ -4716,11 +4817,14 @@ describe('apply executor with the SDK resource contract', () => {
         String(publishedBlock.id),
         String(draftBlock.id),
       ].sort();
-      const bundlePath = await bundle(runDirectory, mock, [entry]);
-      const result = await applyBundle({
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
+        entry,
+      ]);
+      const result = await applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       });
       const actual = mock.environments
@@ -4736,7 +4840,7 @@ describe('apply executor with the SDK resource contract', () => {
   });
 
   it('allows block recreation after unpublishing removes a published-only orphan', async () => {
-    const block = blockValue('i'.repeat(22));
+    const block = blockValue(fixtureId('published-block'));
     const baseline = state(
       { title: 'Draft', body: [] },
       {
@@ -4760,11 +4864,12 @@ describe('apply executor with the SDK resource contract', () => {
     withBlockField(mock);
     const entry = plan(baseline, desired);
     entry.safety.blockIds = [String(block.id)];
-    const bundlePath = await bundle(directory, mock, [entry]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [entry]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     const actual = mock.environments.get(result.environmentId)!.get(recordId)!;
@@ -4773,8 +4878,8 @@ describe('apply executor with the SDK resource contract', () => {
   });
 
   it('imports declared default suppression for a recreated block and restores the field afterward', async () => {
-    const published = blockValue('i'.repeat(22), 1);
-    const draft = blockValue('j'.repeat(22), null);
+    const published = blockValue(fixtureId('published-block'), 1);
+    const draft = blockValue(fixtureId('draft-block'), null);
     const baseline = state(
       { title: 'Draft', body: [published, draft] },
       {
@@ -4807,17 +4912,18 @@ describe('apply executor with the SDK resource contract', () => {
         ],
       },
     ];
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       [entry],
       [modelId],
       changes,
     );
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: { ...defaults, allowTemporarySchemaChanges: true },
     });
     const actual = mock.environments.get(result.environmentId)!.get(recordId)!;
@@ -4856,12 +4962,15 @@ describe('apply executor with the SDK resource contract', () => {
       withBlockField(mock, null, 'integer');
       const entry = plan(baseline, desired);
       entry.safety.blockIds = [String(block.id)];
-      const bundlePath = await bundle(runDirectory, mock, [entry]);
+      const artifactDirectory = await preparedArtifact(runDirectory, mock, [
+        entry,
+      ]);
       await assert.rejects(
-        applyBundle({
+        applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: defaults,
         }),
         (error) =>
@@ -4879,12 +4988,13 @@ describe('apply executor with the SDK resource contract', () => {
       ...entry.execution,
       creationFields: { title: 'unapproved intermediate' },
     };
-    const bundlePath = await bundle(directory, mock, [entry]);
+    const artifactDirectory = await preparedArtifact(directory, mock, [entry]);
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: defaults,
       }),
       /undeferred field/,
@@ -5075,7 +5185,7 @@ describe('apply executor with the SDK resource contract', () => {
       body: {
         en: [
           {
-            id: 'hhhhhhhhhhhhhhhhhhhhhh',
+            id: fixtureId('new-nested-block'),
             __itemTypeId: 'ffffffffffffffffffffff',
             attributes: { link: 'dddddddddddddddddddddd' },
           },
@@ -5137,7 +5247,7 @@ describe('apply executor with the SDK resource contract', () => {
         const baseline = state({ title: localized ? { en: 'old' } : 'old' });
         const mock = sdk([baseline]);
         mock.requireField(localized);
-        const bundlePath = await bundle(
+        const artifactDirectory = await preparedArtifact(
           runDirectory,
           mock,
           [plan(baseline, state({ title: localized ? { en: 'new' } : 'new' }))],
@@ -5145,10 +5255,11 @@ describe('apply executor with the SDK resource contract', () => {
           [change],
         );
         if (fail) mock.fail(recordId);
-        const execution = applyBundle({
+        const execution = applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath,
+          artifactDirectory,
+          plan: preparedPlans.get(artifactDirectory)!,
           options: {
             ...defaults,
             inPlace: true,
@@ -5173,7 +5284,7 @@ describe('apply executor with the SDK resource contract', () => {
     const baseline = state({ title: 'old' });
     const mock = sdk([baseline]);
     mock.requireField();
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       [plan(baseline, state({ title: 'new' }))],
@@ -5183,10 +5294,11 @@ describe('apply executor with the SDK resource contract', () => {
     mock.fail(recordId);
     mock.failRestoration();
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: {
           ...defaults,
           inPlace: true,
@@ -5217,7 +5329,7 @@ describe('apply executor with the SDK resource contract', () => {
     const mock = sdk(originals);
     // Only written records have their schedules cancelled. The first write
     // fails, so every record still has its original content to restore onto.
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       originals.map((original) =>
@@ -5227,10 +5339,11 @@ describe('apply executor with the SDK resource contract', () => {
     mock.fail(originals.map((original) => original.id).sort()[0]);
     mock.failAllPublicationCreates();
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, inPlace: true, concurrency: 1 },
       }),
       (error: unknown) => {
@@ -5280,17 +5393,18 @@ describe('apply executor with the SDK resource contract', () => {
     const mock = sdk([baseline, preserved]);
     mock.requireField();
     mock.revalidateOnRestoration();
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       [plan(baseline, desired)],
       [modelId],
       [change],
     );
-    const result = await applyBundle({
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: { ...defaults, allowTemporarySchemaChanges: true },
     });
     const written = mock.environments.get(result.environmentId)!;
@@ -5326,11 +5440,14 @@ describe('apply executor with the SDK resource contract', () => {
       },
     );
     const mock = sdk([baseline]);
-    const bundlePath = await bundle(directory, mock, [plan(baseline, desired)]);
-    const result = await applyBundle({
+    const artifactDirectory = await preparedArtifact(directory, mock, [
+      plan(baseline, desired),
+    ]);
+    const result = await applyPlan({
       rootClient: mock.root,
       buildEnvironmentClient: mock.client,
-      bundlePath,
+      artifactDirectory,
+      plan: preparedPlans.get(artifactDirectory)!,
       options: defaults,
     });
     assert(
@@ -5356,7 +5473,7 @@ describe('apply executor with the SDK resource contract', () => {
     const mock = sdk([baseline, preserved]);
     mock.requireField();
     mock.revalidateOnRestoration(true);
-    const bundlePath = await bundle(
+    const artifactDirectory = await preparedArtifact(
       directory,
       mock,
       [plan(baseline, state({ title: 'new' }))],
@@ -5364,10 +5481,11 @@ describe('apply executor with the SDK resource contract', () => {
       [change],
     );
     await assert.rejects(
-      applyBundle({
+      applyPlan({
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
-        bundlePath,
+        artifactDirectory,
+        plan: preparedPlans.get(artifactDirectory)!,
         options: { ...defaults, allowTemporarySchemaChanges: true },
       }),
       /final state differs/,
@@ -5483,11 +5601,11 @@ describe('prepared TypeScript snapshot reuse', () => {
         assetHook = hook;
       },
       apply(options: Partial<ApplyOptions> = {}) {
-        return applyBundle({
+        return applyPlan({
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
-          bundlePath: directory,
-          prepared,
+          artifactDirectory: directory,
+          plan: prepared,
           options: { ...defaults, ...options },
         });
       },

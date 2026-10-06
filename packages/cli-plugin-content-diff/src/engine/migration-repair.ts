@@ -1,6 +1,6 @@
 import { dirname, resolve } from 'node:path';
 import type { ContentMigrationDefinition } from '../migration';
-import { repairBundle } from './apply';
+import { repairPlan } from './apply';
 import { assertNotAborted } from './cancellation';
 import { captureSnapshot } from './capture';
 import { hashJson, recordGuard } from './codec';
@@ -300,16 +300,16 @@ export async function repairMigrationDefinition(args: {
       await assertSchemaEditAccess(client);
     assertNotAborted(options.signal);
     transferred = true;
-    return await repairBundle({
+    return await repairPlan({
       rootClient: args.rootClient,
       buildEnvironmentClient: args.buildEnvironmentClient,
-      bundlePath: directory,
+      artifactDirectory: directory,
       options: {
         ...options,
         destinationEnvironmentId: environmentId,
         schemaProjection: projection,
       },
-      prepared: {
+      plan: {
         metadata,
         entries: () => store.planEntries(),
         release: () => store.dispose(),

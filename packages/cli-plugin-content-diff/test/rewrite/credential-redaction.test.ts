@@ -1,10 +1,5 @@
 import assert from 'node:assert/strict';
-import {
-  CmaClient,
-  CmaClientCommand,
-  DatoConfigCommand,
-  DatoProfileConfigCommand,
-} from '@datocms/cli-utils';
+import { CmaClient, DatoConfigCommand } from '@datocms/cli-utils';
 import { describe, it } from 'mocha';
 import ContentDiffCommand from '../../src/commands/content/diff';
 import {
@@ -266,7 +261,9 @@ describe('profile authentication', () => {
           organizationId?: string,
         ) => {
           linked.push([siteId, organizationId]);
-          return siteId === 'linked-site' ? 'linked-token' : undefined;
+          if (siteId !== 'linked-site')
+            throw new Error('Linked project unavailable');
+          return 'linked-token';
         };
         const profileConfig = {
           siteId: 'linked-site',
@@ -299,12 +296,20 @@ describe('profile authentication', () => {
         assert.equal(
           (
             await resolveProfileApiToken({
-              profileConfig: { ...profileConfig, siteId: 'unlinked-site' },
+              profileConfig: { apiTokenEnvName: 'CONTENT_DIFF_TEST_TOKEN' },
               profileId: 'source',
               resolveLinkedSiteToken,
             })
           ).apiToken,
           'environment-token',
+        );
+        await assert.rejects(
+          resolveProfileApiToken({
+            profileConfig: { ...profileConfig, siteId: 'unlinked-site' },
+            profileId: 'source',
+            resolveLinkedSiteToken,
+          }),
+          /Linked project unavailable/,
         );
         assert.deepEqual(linked, [
           ['linked-site', 'linked-organization'],
@@ -314,13 +319,11 @@ describe('profile authentication', () => {
     );
   });
 
-  it('relies only on cli-utils internals that exist', () => {
-    for (const member of [
-      Reflect.get(CmaClientCommand.prototype, 'resolveTokenFromSiteId'),
-      Reflect.get(DatoConfigCommand.prototype, 'init'),
-      Reflect.get(DatoProfileConfigCommand.prototype, 'init'),
-    ])
-      assert.equal(typeof member, 'function');
+  it('extends the public configuration command directly', () => {
+    assert.equal(
+      Object.getPrototypeOf(Object.getPrototypeOf(ContentDiffCommand)),
+      DatoConfigCommand,
+    );
   });
 
   it('builds paired-profile endpoints with their own tokens and shared redaction', async () => {
@@ -351,7 +354,7 @@ describe('profile authentication', () => {
             parse: async () => ({
               flags: { 'log-level': json ? undefined : 'BODY', json },
             }),
-            resolveTokenFromSiteId: async (
+            linkedSiteToken: async (
               siteId: string,
               organizationId?: string,
             ) => {

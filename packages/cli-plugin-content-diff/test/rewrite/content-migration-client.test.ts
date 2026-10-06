@@ -9,7 +9,7 @@ import ts from 'typescript';
 const script = `
 import { defineContentMigration, runMigrationPart, type ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
 
-export default defineContentMigration({ baseline: './fixture.content' }, async (client) => {
+const migration = defineContentMigration({ baseline: './fixture.content' }, async (client) => {
   const created = await client.items.create({
     id: 'new-record', item_type: { id: 'model', type: 'item_type' },
     meta: { created_at: '2026-01-01T00:00:00Z', first_published_at: null, stage: null },
@@ -89,6 +89,14 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
   // @ts-expect-error The recorder methods cannot be replaced.
   client.items.update = client.items.update;
 });
+
+export default migration;
+const format: 'datocms-content-migration' = migration.format;
+const version: 1 = migration.version;
+// @ts-expect-error Content migration descriptors are not native runner functions.
+migration({});
+// @ts-expect-error The descriptor brand is fixed.
+migration.format = 'other';
 
 export async function generatedPart(client: ContentMigrationClient): Promise<void> {
   await client.items.update('record', { title: 'Part content' });

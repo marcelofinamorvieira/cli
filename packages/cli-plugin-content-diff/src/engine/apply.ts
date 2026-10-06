@@ -5,7 +5,6 @@ import { CmaClient } from '@datocms/cli-utils';
 import { stageBinary } from './apply-binary';
 import { validateExecution } from './apply-validation';
 import { batches, boundedWork } from './apply-work';
-import { readBundle } from './bundle';
 import { assertNotAborted } from './cancellation';
 import {
   assetDigest,
@@ -33,8 +32,7 @@ import {
   stateFingerprint,
   unsupportedRecordPayloadKey,
 } from './codec';
-import { lockEnvironment, unlockEnvironment } from './environment-lock';
-import { ContentError } from './errors';
+import { ContentError, type ContentFailureContext } from './errors';
 import { buildPlanPreview } from './migration-preview';
 import { collectionTransitionIssues, orderedCollectionWrites } from './planner';
 import {
@@ -53,6 +51,7 @@ import type {
   Kind,
   PlanEntry,
   PlanMetadata,
+  PreparedPlan,
   RecordGuard,
   RecordPlan,
   RecordState,
@@ -207,12 +206,10 @@ interface Context {
   manifest: PlanMetadata;
   schema: SchemaState;
   schemaProjection?: (schema: SchemaState) => SchemaState;
-  bundlePath: string;
+  artifactDirectory: string;
   concurrency: number;
   mutations: number;
   writesPlanned: boolean;
-  /** The written environment is locked against other edits. */
-  locked: boolean;
   verification: 'versions' | 'full';
   /** Repair can restore settings/schedules, but must never save record content. */
   repairOnly?: boolean;
@@ -1354,7 +1351,7 @@ async function upload(context: Context, entry: UploadPlan): Promise<void> {
     // The SDK performs its normal upload/job/retry handling. A globally unique
     // staging filename avoids the site-wide same-name upload request window.
     const staged = await stageBinary(
-      context.bundlePath,
+      context.artifactDirectory,
       context.store.directory,
       entry.binary,
       context.signal,
@@ -1368,7 +1365,7 @@ async function upload(context: Context, entry: UploadPlan): Promise<void> {
         { filename: `${randomUUID()}-${desired.filename}` },
       );
     } finally {
-      // The bundle retains the verified bytes. Remove each copy once its
+      // The companion retains the verified bytes. Remove each copy once its
       // upload settles, bounding staged disk use by the write concurrency.
       // A failed removal must not mask the upload result; disposal of the
       // working directory removes any remaining copy.
@@ -1580,7 +1577,7 @@ async function reconcileOrdering(context: Context): Promise<void> {
   }
 }
 
-function validateBundlePreflight(context: Context): void {
+function validatePlanPreflight(context: Context): void {
   for (const order of [
     'createOrder',
     'updateOrder',
@@ -1608,7 +1605,7 @@ function validateBundlePreflight(context: Context): void {
       conflict(
         kind,
         String(unexpected.id),
-        'destination namespace gained an identity since bundle generation',
+        'destination namespace gained an identity since migration generation',
       );
   }
   context.store.database.exec(
@@ -1647,7 +1644,7 @@ function validateBundlePreflight(context: Context): void {
       conflict(
         entry.kind,
         entry.id,
-        'skipped creation identity appeared since bundle generation',
+        'skipped creation identity appeared since migration generation',
       );
     } else if (
       entry.guard &&
@@ -1659,7 +1656,7 @@ function validateBundlePreflight(context: Context): void {
       conflict(
         entry.kind,
         entry.id,
-        'destination does not match the bundled baseline',
+        'destination does not match the migration baseline',
       );
     } else if (entry.action !== 'skip' && !entry.guard) {
       throw new ContentError(
@@ -1769,14 +1766,13 @@ async function captureLive(
       signal: context.signal,
       progress: context.log,
     },
-    // The consistency check only detects other writers; a locked environment
-    // has none. By version, it rereads only records whose version changed.
-    verify:
-      verify && !context.locked
-        ? context.verification === 'versions'
-          ? 'versions'
-          : true
-        : false,
+    // DatoCMS has no persistent sandbox freeze. By version, this consistency
+    // check rereads only records whose version changed.
+    verify: verify
+      ? context.verification === 'versions'
+        ? 'versions'
+        : true
+      : false,
   });
 }
 
@@ -1813,7 +1809,7 @@ function verifyFinal(
       conflict(
         entry.kind,
         entry.id,
-        'final state differs from the reviewed bundle',
+        'final state differs from the rebuilt migration plan',
       );
     }
     if (entry.kind === 'record' && state) {
@@ -1826,7 +1822,7 @@ function verifyFinal(
         conflict(
           'record',
           entry.id,
-          'final position differs from the reviewed bundle',
+          'final position differs from the rebuilt migration plan',
         );
       // Validity is a CMA-computed diagnostic. Restoring field settings queues
       // background validation, which can legitimately recompute grandfathered
@@ -2145,8 +2141,8 @@ async function verifyForkByVersions(context: Context): Promise<void> {
 
 /**
  * Final verification without rereading untouched records. Records the run
- * wrote are read in full and compared with the bundle. Every other record must
- * still have its baseline version, or else its full content must still equal
+ * wrote are read in full and compared with the rebuilt plan. Every other
+ * record must still have its baseline version, or its full content must equal
  * the baseline; no record may appear or disappear unexpectedly. Uploads and
  * collections are reread in full.
  */
@@ -2210,7 +2206,7 @@ async function verifyFinalByVersions(
         conflict(
           'record',
           id,
-          'destination namespace gained an identity since bundle generation',
+          'destination namespace gained an identity since migration generation',
         );
       if (stateFingerprint(baseline) !== fingerprint) changed.push(id);
     }
@@ -2249,7 +2245,7 @@ async function verifyFinalByVersions(
         'record',
         differing,
         store.getPlan('record', differing)
-          ? 'final state differs from the reviewed bundle'
+          ? 'final state differs from the rebuilt migration plan'
           : 'preserved destination namespace changed',
       );
     for (const entry of store.iteratePlan('record')) {
@@ -2259,13 +2255,13 @@ async function verifyFinalByVersions(
         conflict(
           'record',
           entry.id,
-          'final state differs from the reviewed bundle',
+          'final state differs from the rebuilt migration plan',
         );
       if (state.position !== (entry as RecordPlan).desired!.position)
         conflict(
           'record',
           entry.id,
-          'final position differs from the reviewed bundle',
+          'final position differs from the rebuilt migration plan',
         );
     }
     for (const table of ['uploads', 'collections'])
@@ -2282,22 +2278,12 @@ async function verifyFinalByVersions(
   }
 }
 
-export async function applyBundle(args: {
+export async function applyPlan(args: {
   rootClient: Client;
   buildEnvironmentClient: (environmentId: string) => Client;
-  bundlePath: string;
+  artifactDirectory: string;
   options: ApplyOptions;
-  /** A freshly replanned TypeScript migration; no persisted execution progress. */
-  prepared?: {
-    metadata: PlanMetadata;
-    entries: () => Iterable<PlanEntry>;
-    snapshot?: {
-      store: SnapshotStore;
-      environmentId: string;
-      schemaHash: string;
-    };
-    release?: () => void;
-  };
+  plan: PreparedPlan;
 }): Promise<ApplyOutcome> {
   const store = new SnapshotStore();
   let ownedFork: string | undefined;
@@ -2306,8 +2292,6 @@ export async function applyBundle(args: {
   let forkCreatedAt: string | undefined;
   let context: Context | undefined;
   let changedSchema = false;
-  let destinationLocked = false;
-  let forkLocked = false;
   let startedWrites = false;
   let complete = false;
   let reusedSnapshot = false;
@@ -2330,63 +2314,51 @@ export async function applyBundle(args: {
         'Apply concurrency must be a positive integer.',
       );
     }
-    args.options.log?.(
-      args.prepared
-        ? 'Validating the rebuilt migration plan.'
-        : 'Validating content bundle and asset checksums.',
-    );
-    const manifest: PlanMetadata = args.prepared
-      ? args.prepared.metadata
-      : await readBundle({
-          directory: args.bundlePath,
-          store,
-          signal: args.options.signal,
-        });
+    args.options.log?.('Validating the rebuilt migration plan.');
+    const manifest = args.plan.metadata;
     const destinationId =
       args.options.destinationEnvironmentId ??
       manifest.destination.environmentId;
-    if (args.prepared) {
-      try {
-        store.transaction(() => {
-          for (const entry of args.prepared!.entries()) {
-            assertNotAborted(args.options.signal);
-            store.putPlan(entry);
-          }
-        });
-        const snapshot = args.prepared.snapshot;
-        if (
-          snapshot &&
-          (args.options.verification ?? 'versions') === 'versions'
-        ) {
-          if (
-            snapshot.environmentId !== destinationId ||
-            snapshot.schemaHash !== manifest.schema.hash
-          )
-            throw new ContentError(
-              'DESTINATION_MISMATCH',
-              'Prepared snapshot belongs to another environment or schema.',
-            );
-          // importSide closes the source database. Finish reading plan entries
-          // first, copy the original target side, and only then release it.
-          store.importSide(snapshot.store, 'target');
-          store.transaction(() => {
-            for (const table of [
-              'records',
-              'uploads',
-              'collections',
-              'refs',
-              'block_owners',
-              'unique_values',
-            ])
-              store.database.exec(
-                `UPDATE ${table} SET side='live' WHERE side='target'`,
-              );
-          });
-          reusedSnapshot = true;
+    try {
+      store.transaction(() => {
+        for (const entry of args.plan.entries()) {
+          assertNotAborted(args.options.signal);
+          store.putPlan(entry);
         }
-      } finally {
-        args.prepared.release?.();
+      });
+      const snapshot = args.plan.snapshot;
+      if (
+        snapshot &&
+        (args.options.verification ?? 'versions') === 'versions'
+      ) {
+        if (
+          snapshot.environmentId !== destinationId ||
+          snapshot.schemaHash !== manifest.schema.hash
+        )
+          throw new ContentError(
+            'DESTINATION_MISMATCH',
+            'Prepared snapshot belongs to another environment or schema.',
+          );
+        // importSide closes the source database. Finish reading plan entries
+        // first, copy the original target side, and only then release it.
+        store.importSide(snapshot.store, 'target');
+        store.transaction(() => {
+          for (const table of [
+            'records',
+            'uploads',
+            'collections',
+            'refs',
+            'block_owners',
+            'unique_values',
+          ])
+            store.database.exec(
+              `UPDATE ${table} SET side='live' WHERE side='target'`,
+            );
+        });
+        reusedSnapshot = true;
       }
+    } finally {
+      args.plan.release?.();
     }
     assertNotAborted(args.options.signal);
     const targetClient = args.buildEnvironmentClient(destinationId);
@@ -2403,7 +2375,7 @@ export async function applyBundle(args: {
     ) {
       throw new ContentError(
         'DESTINATION_MISMATCH',
-        'Destination project or schema does not match the bundle.',
+        'Destination project or schema does not match the migration.',
       );
     }
     if (
@@ -2412,7 +2384,7 @@ export async function applyBundle(args: {
     ) {
       throw new ContentError(
         'TEMPORARY_SCHEMA_CHANGES_REQUIRED',
-        'This bundle requires --allow-temporary-schema-changes.',
+        'This migration requires --allow-temporary-schema-changes.',
       );
     }
     if (manifest.temporarySchemaChanges.length)
@@ -2456,17 +2428,14 @@ export async function applyBundle(args: {
         );
       if (!args.options.dryRun) ownedFork = requestedName;
     }
-    if (!args.options.dryRun)
-      destinationLocked = await lockEnvironment(targetClient, destinationId);
     context = {
       client: targetClient,
       store,
       manifest,
       schema,
       schemaProjection: args.options.schemaProjection,
-      locked: destinationLocked,
       verification: args.options.verification ?? 'versions',
-      bundlePath: args.bundlePath,
+      artifactDirectory: args.artifactDirectory,
       concurrency: Math.max(
         1,
         Math.min(16, Math.floor(args.options.concurrency ?? 4)),
@@ -2492,7 +2461,7 @@ export async function applyBundle(args: {
       assertNotAborted(context.signal);
       // DatoCMS copies the environment in the background. Request the fork
       // first so the copy overlaps the destination check below; the fork is
-      // compared with the bundle and that check once both have finished.
+      // compared with the migration baseline and that check once both have finished.
       context.log?.(
         `Creating destination fork "${ownedFork}"${
           args.options.fastFork ? ' with a fast fork' : ''
@@ -2524,7 +2493,7 @@ export async function applyBundle(args: {
     context.log?.(`Verifying destination baseline in "${destinationId}".`);
     if (reusedSnapshot) await verifyPreparedBaseline(context, destinationId);
     else await captureLive(context, destinationId);
-    validateBundlePreflight(context);
+    validatePlanPreflight(context);
     if (context.writesPlanned)
       assertScheduleWindow(context, args.options.scheduleWindowMinutes ?? 120);
     if (args.options.dryRun) {
@@ -2554,8 +2523,6 @@ export async function applyBundle(args: {
       }
       environmentId = ownedFork;
       context.client = args.buildEnvironmentClient(environmentId);
-      forkLocked = await lockEnvironment(context.client, ownedFork);
-      context.locked = forkLocked;
       context.schema = await fetchSchema(
         context.client,
         environmentId,
@@ -2580,14 +2547,14 @@ export async function applyBundle(args: {
         );
       }
       context.log?.(`Verifying fork baseline in "${environmentId}".`);
-      if (context.verification === 'versions' && !context.locked) {
+      if (context.verification === 'versions') {
         await verifyForkByVersions(context);
       } else {
-        // One read suffices: it is compared with the bundle and the
+        // One read suffices: it is compared with the migration baseline and the
         // destination, and anything written to the fork later fails the final
         // verification, which keeps its consistency check.
         await captureLive(context, environmentId, false);
-        validateBundlePreflight(context);
+        validatePlanPreflight(context);
         verifyForkBaseline(context);
       }
     }
@@ -2777,7 +2744,7 @@ export async function applyBundle(args: {
     // fork that fails verification is deleted, so one final check suffices.
     if (context.verification === 'versions' && rewritesAssetUrls(context))
       context.verification = 'full';
-    if (args.options.inPlace && !context.locked) {
+    if (args.options.inPlace) {
       context.log?.('Verifying final content before restoring schedules.');
       if (context.verification === 'versions')
         await verifyFinalByVersions(context, !context.writesPlanned);
@@ -2794,7 +2761,7 @@ export async function applyBundle(args: {
     // Schedules are writes too. Verify exact dates and all content again after
     // restoring them, using a second independently checked complete capture.
     context.log?.('Verifying final content and schedules.');
-    if (context.verification === 'versions' && !context.locked)
+    if (context.verification === 'versions')
       await verifyFinalByVersions(context, true);
     else {
       await captureLive(context, environmentId);
@@ -2967,8 +2934,6 @@ export async function applyBundle(args: {
       args.options.log?.(
         `Fork request for "${ownedFork}" did not return confirmed ownership; no environment cleanup was attempted.`,
       );
-      if (error instanceof Error)
-        Object.assign(error, { unconfirmedForkEnvironmentId: ownedFork });
     }
     const failure = repairFailureCount
       ? new ContentError(
@@ -2987,34 +2952,19 @@ export async function applyBundle(args: {
           },
         )
       : error;
-    // Progress output can be off (for example under --json), so a retained
-    // fork is also named on the reported failure.
-    if (
-      ownedFork &&
-      forkConfirmed &&
-      args.options.keepFailedFork &&
-      failure instanceof Error
-    )
-      Object.assign(failure, { keptForkEnvironmentId: ownedFork });
+    // Report ownership information on the final error, including when cleanup
+    // failures wrap the initial request error and progress output is disabled.
+    if (failure instanceof Error) {
+      const context: ContentFailureContext = {};
+      if (ownedFork && forkRequested && !forkConfirmed)
+        context.unconfirmedForkEnvironmentId = ownedFork;
+      if (ownedFork && forkConfirmed && args.options.keepFailedFork)
+        context.keptForkEnvironmentId = ownedFork;
+      Object.assign(failure, context);
+    }
     throw failure;
   } finally {
-    // Locks are released even when cleanup failed; a failed release must not
-    // hide the run's own outcome.
-    if (forkLocked && ownedFork)
-      await unlockEnvironment(
-        args.buildEnvironmentClient(ownedFork),
-        ownedFork,
-      ).catch(() => undefined);
-    if (destinationLocked && context)
-      await unlockEnvironment(
-        args.buildEnvironmentClient(
-          args.options.destinationEnvironmentId ??
-            context.manifest.destination.environmentId,
-        ),
-        args.options.destinationEnvironmentId ??
-          context.manifest.destination.environmentId,
-      ).catch(() => undefined);
-    // The bundle is an export and survives both success and failure. Only the
+    // The migration is an export and survives both success and failure. Only the
     // SQLite workspace owned by this execution is disposed here.
     store.dispose();
     context?.progress?.flush();
@@ -3029,21 +2979,17 @@ const scheduled = (schedules: Schedules | undefined): boolean =>
 /**
  * Puts back what an interrupted or killed in-place apply left behind: the
  * original field settings, and schedules that were cancelled but never
- * recreated. Nothing is resumed, and only the bundle and the live environment
+ * recreated. Nothing is resumed, and only the reconstructed plan and the live environment
  * are read. A record whose content is still the original gets its original
- * schedules back, one whose content matches the bundle gets the bundle's
+ * schedules back, one whose content matches the planned state gets its
  * schedules, and anything else is left as it is and reported.
  */
-export async function repairBundle(args: {
+export async function repairPlan(args: {
   rootClient: Client;
   buildEnvironmentClient: (environmentId: string) => Client;
-  bundlePath: string;
+  artifactDirectory: string;
   options: RepairOptions;
-  prepared?: {
-    metadata: PlanMetadata;
-    entries: () => Iterable<PlanEntry>;
-    release?: () => void;
-  };
+  plan: PreparedPlan;
 }): Promise<RepairResult> {
   const store = new SnapshotStore();
   const problems: string[] = [];
@@ -3054,25 +3000,17 @@ export async function repairBundle(args: {
   };
   try {
     const { signal, log } = args.options;
-    log?.(
-      args.prepared
-        ? 'Validating the reconstructed migration repair plan.'
-        : 'Validating content bundle and asset checksums.',
-    );
-    const manifest: PlanMetadata = args.prepared
-      ? args.prepared.metadata
-      : await readBundle({ directory: args.bundlePath, store, signal });
-    if (args.prepared) {
-      try {
-        store.transaction(() => {
-          for (const entry of args.prepared!.entries()) {
-            assertNotAborted(signal);
-            store.putPlan(entry);
-          }
-        });
-      } finally {
-        args.prepared.release?.();
-      }
+    log?.('Validating the reconstructed migration repair plan.');
+    const manifest = args.plan.metadata;
+    try {
+      store.transaction(() => {
+        for (const entry of args.plan.entries()) {
+          assertNotAborted(signal);
+          store.putPlan(entry);
+        }
+      });
+    } finally {
+      args.plan.release?.();
     }
     const environmentId =
       args.options.destinationEnvironmentId ??
@@ -3085,7 +3023,7 @@ export async function repairBundle(args: {
     if (rootSite.id !== manifest.destination.siteId)
       throw new ContentError(
         'DESTINATION_MISMATCH',
-        'Destination project does not match the bundle.',
+        'Destination project does not match the migration.',
       );
     if (environment.meta.read_only_mode || environment.meta.status !== 'ready')
       throw new ContentError(
@@ -3129,21 +3067,20 @@ export async function repairBundle(args: {
     if (schema.siteId !== manifest.destination.siteId)
       throw new ContentError(
         'DESTINATION_MISMATCH',
-        'Destination project does not match the bundle.',
+        'Destination project does not match the migration.',
       );
     if (schema.hash !== manifest.schema.hash) {
-      problem('Schema differs from the bundle; schedules were not checked');
+      problem('Schema differs from the migration; schedules were not checked');
     } else {
       const context: Context = {
         client,
         store,
         manifest,
         schema,
-        bundlePath: args.bundlePath,
+        artifactDirectory: args.artifactDirectory,
         concurrency: 1,
         mutations: 0,
         writesPlanned: true,
-        locked: false,
         verification: 'full',
         repairOnly: true,
         signal,
@@ -3205,7 +3142,7 @@ export async function repairBundle(args: {
               )
                 continue;
               problem(
-                `Record ${id}: content matches neither the original nor the bundle, so its schedules were left as they are (original: ${describeSchedules(
+                `Record ${id}: content matches neither the original nor the planned state, so its schedules were left as they are (original: ${describeSchedules(
                   entry.guard?.schedules ?? emptySchedules,
                 )})`,
               );

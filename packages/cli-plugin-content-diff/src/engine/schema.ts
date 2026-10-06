@@ -1,3 +1,4 @@
+import type { CmaClient } from '@datocms/cli-utils';
 import {
   assertIntegerFieldPrecision,
   assertMetadataIntegerPrecision,
@@ -42,61 +43,108 @@ export async function fetchSchema(
   environmentId: string,
   project?: (schema: SchemaState) => SchemaState,
 ): Promise<SchemaState> {
-  const [site, models, workflows] = await Promise.all([
-    client.site.find(),
-    client.itemTypes.list(),
+  // Every consistency check makes a fresh bulk read. A retained SDK schema
+  // cache would hide concurrent changes or our temporary field settings.
+  const results = await Promise.allSettled([
+    client.site.rawFind({ include: 'item_types,item_types.fields' }),
     client.workflows.list(),
   ]);
-  const normalized: ModelSchema[] = [];
-  let next = 0;
-  // Schema requests are bounded too, although schema size is independent of the
-  // number of records. Drain the active workers before returning an error.
-  const workers = await Promise.allSettled(
-    Array.from({ length: Math.min(5, models.length) }, async () => {
-      while (next < models.length) {
-        const model = models[next++];
-        const fields = await client.fields.list(model.id);
-        normalized.push({
-          id: model.id,
-          apiKey: model.api_key,
-          name: model.name,
-          block: model.modular_block,
-          singleton: model.singleton,
-          sortable: model.sortable,
-          tree: model.tree,
-          draftMode: model.draft_mode_active,
-          saveInvalidDrafts: model.draft_saving_active,
-          allLocalesRequired: model.all_locales_required,
-          workflowId: referenceId(model.workflow),
-          fields: fields
-            .map((field) => {
-              const shape = {
-                apiKey: field.api_key,
-                type: field.field_type,
-                localized: field.localized,
-              };
-              assertIntegerFieldPrecision(shape, field.default_value, model.id);
-              assertMetadataIntegerPrecision(
-                field.validators,
-                `Validators for ${model.id}.${field.api_key}`,
-              );
-              return {
-                id: field.id,
-                ...shape,
-                validators: jsonObject(field.validators),
-                defaultValue:
-                  field.default_value === undefined
-                    ? null
-                    : json(field.default_value),
-              };
-            })
-            .sort((a, b) => compareIds(a.id, b.id)),
-        });
-      }
-    }),
+  if (results[0].status === 'rejected') throw results[0].reason;
+  if (results[1].status === 'rejected') throw results[1].reason;
+  const response = results[0].value;
+  const workflows = results[1].value;
+  const site = {
+    ...response.data.attributes,
+    id: response.data.id,
+    meta: response.data.meta,
+  };
+  const included = response.included ?? [];
+  const models = included.filter(
+    (entry): entry is CmaClient.RawApiTypes.ItemType =>
+      entry.type === 'item_type',
   );
-  for (const worker of workers)
-    if (worker.status === 'rejected') throw worker.reason;
+  const fields = included.filter(
+    (entry): entry is CmaClient.RawApiTypes.Field => entry.type === 'field',
+  );
+  const modelIds = new Set(models.map((model) => model.id));
+  const fieldIds = new Set(fields.map((field) => field.id));
+  const expectedModels = response.data.relationships.item_types.data;
+  const invalid = (message: string): never => {
+    throw new ContentError('INVALID_SCHEMA', message);
+  };
+  if (modelIds.size !== models.length || fieldIds.size !== fields.length)
+    invalid('Bulk schema contains duplicate model or field identities.');
+  if (
+    expectedModels.length !== models.length ||
+    expectedModels.some((model) => !modelIds.has(model.id)) ||
+    new Set(expectedModels.map((model) => model.id)).size !==
+      expectedModels.length
+  )
+    invalid('Bulk schema does not include every declared model.');
+  const fieldsByModel = new Map<string, CmaClient.RawApiTypes.Field[]>();
+  for (const field of fields) {
+    const owner = field.relationships.item_type.data.id;
+    if (!modelIds.has(owner))
+      invalid(`Bulk schema field ${field.id} has an unknown model.`);
+    const group = fieldsByModel.get(owner) ?? [];
+    group.push(field);
+    fieldsByModel.set(owner, group);
+  }
+  const normalized: ModelSchema[] = models.map((resource) => {
+    const model = resource.attributes;
+    const fields = fieldsByModel.get(resource.id) ?? [];
+    const expected = resource.relationships.fields.data;
+    const actual = new Set(fields.map((field) => field.id));
+    if (
+      expected.length !== fields.length ||
+      expected.some((field) => !actual.has(field.id)) ||
+      new Set(expected.map((field) => field.id)).size !== expected.length
+    )
+      invalid(
+        `Bulk schema does not include every declared field of model ${resource.id}.`,
+      );
+    return {
+      id: resource.id,
+      apiKey: model.api_key,
+      name: model.name,
+      block: model.modular_block,
+      singleton: model.singleton,
+      sortable: model.sortable,
+      tree: model.tree,
+      draftMode: model.draft_mode_active,
+      saveInvalidDrafts: model.draft_saving_active,
+      allLocalesRequired: model.all_locales_required,
+      workflowId: referenceId(resource.relationships.workflow.data),
+      fields: fields
+        .map((resource) => {
+          const field = resource.attributes;
+          const shape = {
+            apiKey: field.api_key,
+            type: field.field_type,
+            localized: field.localized,
+          };
+          assertIntegerFieldPrecision(
+            shape,
+            field.default_value,
+            resource.relationships.item_type.data.id,
+          );
+          assertMetadataIntegerPrecision(
+            field.validators,
+            `Validators for ${resource.relationships.item_type.data.id}.${field.api_key}`,
+          );
+          return {
+            id: resource.id,
+            ...shape,
+            validators: jsonObject(field.validators),
+            defaultValue:
+              field.default_value === undefined
+                ? null
+                : json(field.default_value),
+          };
+        })
+        .sort((a, b) => compareIds(a.id, b.id)),
+    };
+  });
   const semantics: JsonObject = {
     timezone: string(site.timezone, 'site timezone'),
   };

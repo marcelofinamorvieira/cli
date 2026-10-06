@@ -15,14 +15,13 @@ import { setImmediate, setTimeout } from 'node:timers/promises';
 import { format, resolveConfig } from 'prettier';
 import { boundedWork } from './apply-work';
 import {
-  fetchBinary,
   jsonlValues,
   readSmallFile,
-  requiresBinary,
   validateSchedules,
   validateState,
   verifyBinary,
-} from './bundle';
+} from './artifact-integrity';
+import { fetchBinary, requiresBinary } from './asset-download';
 import { assertNotAborted } from './cancellation';
 import { hashJson, object, recordGuard, recordPayloadFields } from './codec';
 import { ContentError } from './errors';
@@ -36,9 +35,9 @@ import type { MigrationTrackingBinding } from './migration-schema';
 import { schemaHash } from './schema';
 import type { SnapshotStore } from './store';
 import type {
+  ArtifactChunk,
+  ArtifactChunkIndex,
   BinaryFile,
-  BundleChunk,
-  BundleChunkIndex,
   CollectionPlan,
   CollectionState,
   JsonObject,
@@ -66,7 +65,7 @@ export interface BaselineManifest
   sourceTracking: MigrationTrackingBinding;
   destinationTracking: MigrationTrackingBinding;
   targetCounts: Record<Kind, number>;
-  chunks: BundleChunkIndex;
+  chunks: ArtifactChunkIndex;
 }
 
 interface BaselineEntry {
@@ -176,7 +175,7 @@ function initTables(store: SnapshotStore): void {
 }
 
 class RowWriter {
-  readonly index: BundleChunkIndex = {
+  readonly index: ArtifactChunkIndex = {
     file: 'chunks.jsonl',
     sha256: '',
     bytes: 0,
@@ -186,7 +185,7 @@ class RowWriter {
   private readonly indexHash = createHash('sha256');
   private current?: {
     handle: FileHandle;
-    descriptor: BundleChunk;
+    descriptor: ArtifactChunk;
     hash: ReturnType<typeof createHash>;
   };
   constructor(
@@ -878,6 +877,7 @@ export async function writeMigration(args: {
   fetchFn?: typeof fetch;
 }): Promise<string> {
   const { store, metadata, signal } = args;
+  assertNotAborted(signal);
   const maximum = args.chunkBytes ?? DEFAULT_MIGRATION_CHUNK_BYTES;
   if (!count(maximum) || maximum < 1 || maximum > MAX_MIGRATION_CHUNK_BYTES)
     invalid(
@@ -1269,7 +1269,7 @@ export async function loadBaseline(
         !digest(candidate.sha256)
       )
         invalid('Invalid or unordered baseline chunk descriptor.');
-      const chunk = candidate as unknown as BundleChunk;
+      const chunk = candidate as unknown as ArtifactChunk;
       for await (const row of jsonlValues(
         root,
         chunk,
@@ -1310,9 +1310,15 @@ export async function loadBaseline(
     assertNotAborted(signal);
     store.database.exec('RELEASE migration_baseline_load');
   } catch (error) {
-    store.database.exec(
-      'ROLLBACK TO migration_baseline_load; RELEASE migration_baseline_load',
-    );
+    // SQLite can roll back the entire transaction on SQLITE_FULL. Keep that
+    // original error rather than replacing it with a missing-savepoint error.
+    try {
+      store.database.exec(
+        'ROLLBACK TO migration_baseline_load; RELEASE migration_baseline_load',
+      );
+    } catch {
+      // The owning snapshot is disposed by the caller after this failure.
+    }
     throw error;
   }
   return manifest;

@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import {
   mkdir,
@@ -35,9 +34,9 @@ import {
   type ContentMigration,
   applyContentMigration,
 } from '../../src/migration';
+import { fixtureId } from './fixture-id';
 
-const id = (name: string) =>
-  createHash('sha256').update(name).digest('base64url').slice(0, 22);
+const id = fixtureId;
 const FAQ = id('runtime-faq');
 const PAGE = id('runtime-page');
 const CHANGED = id('runtime-changed');
@@ -305,15 +304,12 @@ function harness(test: Fixture) {
   );
   replace(
     execution,
-    'applyBundle',
-    async (args: Parameters<typeof execution.applyBundle>[0]) => {
-      assert.ok(
-        args.prepared,
-        'public runtime must replan executed TypeScript',
-      );
+    'applyPlan',
+    async (args: Parameters<typeof execution.applyPlan>[0]) => {
+      assert.ok(args.plan, 'public runtime must replan executed TypeScript');
       events.push('apply');
       plans.push({
-        entries: [...args.prepared.entries()],
+        entries: [...args.plan.entries()],
         options: args.options,
       });
       if (args.options.dryRun) {
@@ -323,15 +319,15 @@ function harness(test: Fixture) {
             previewStore.putPlan(entry);
           return buildPlanPreview(
             previewStore,
-            args.prepared.metadata,
+            args.plan.metadata,
             'destination',
           );
         } finally {
-          args.prepared.release?.();
+          args.plan.release?.();
           previewStore.dispose();
         }
       }
-      args.prepared.release?.();
+      args.plan.release?.();
       return {
         environmentId: args.options.inPlace
           ? args.options.destinationEnvironmentId ?? 'destination'
@@ -558,45 +554,21 @@ describe('generated TypeScript public runtime integration', () => {
     assert.equal(run.counts().writes, 0);
   });
 
-  it('rejects native runner invocation before client access and still supports content:apply', async () => {
+  it('exports a non-callable descriptor and executes it through content:apply', async () => {
     const test = await fixture();
     const run = harness(test);
     const module = await loadMigrationModule<{ default: ContentMigration }>(
       test.output,
     );
-    await assert.rejects(
-      module.default(
-        new Proxy({} as Client, {
-          get() {
-            assert.fail(
-              'unsupported native invocation must not access the client',
-            );
-          },
-        }),
-      ),
-      (error: unknown) => {
-        assert.equal(
-          (error as { code: string }).code,
-          'CONTENT_APPLY_REQUIRED',
-        );
-        assert.match(
-          (error as Error).message,
-          /datocms content:apply <script.ts>/,
-        );
-        assert.match(
-          (error as Error).message,
-          /migrations:run does not support/,
-        );
-        return true;
-      },
-    );
+    assert.equal(typeof module.default, 'object');
+    assert.equal(module.default.format, 'datocms-content-migration');
     assert.deepEqual(run.counts(), {
       schemaCalls: 0,
       captureCalls: 0,
       writes: 0,
     });
     assert.equal(run.plans.length, 0);
-    assert.equal(module.default.contentMigration.version, 1);
+    assert.equal(module.default.version, 1);
     await run.run();
     assert.deepEqual(run.events, ['schema', 'capture', 'apply']);
     assert.equal(run.plans[0].options.inPlace, false);

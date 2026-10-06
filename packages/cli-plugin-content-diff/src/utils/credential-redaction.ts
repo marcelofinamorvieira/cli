@@ -11,9 +11,9 @@ const CLIENT_REDACTED_VALUE = /^\s*\[REDACTED\b/u;
  * Collects every API token a command authenticates with and scrubs those
  * tokens from CMA request logs and surfaced errors.
  *
- * At --log-level=BODY_AND_HEADERS the CMA client prints the Authorization
- * header verbatim, response bodies can echo credentials back, and uncaught API
- * errors are dumped together with their request headers. Tokens are matched
+ * The CMA client masks Authorization headers but can retain a token suffix;
+ * response bodies can echo credentials, and uncaught API errors include their
+ * request headers. This layer removes those remaining disclosures. Tokens match
  * when output is produced, so a token registered for one client is also
  * removed from output produced by every other client of the same command.
  */
@@ -93,6 +93,42 @@ export class CredentialRedactor {
    */
   redactError(error: unknown): void {
     this.redactObject(error, new WeakSet<object>());
+  }
+
+  /** Copy report data before redaction, including frozen errors and details. */
+  redactJsonValue(value: unknown): unknown {
+    const visited = new WeakSet<object>();
+    const copy = (current: unknown): unknown => {
+      if (typeof current === 'string') return this.redact(current);
+      if (current === null || typeof current !== 'object') return current;
+      if (visited.has(current)) return '[Circular]';
+      visited.add(current);
+      try {
+        if (Array.isArray(current)) return current.map(copy);
+        const entries: Array<[string, unknown]> = [];
+        for (const [key, descriptor] of Object.entries(
+          Object.getOwnPropertyDescriptors(current),
+        )) {
+          // Do not execute getters or a custom toJSON while reporting failure.
+          if (!descriptor.enumerable || !('value' in descriptor)) continue;
+          const entry = descriptor.value;
+          if (typeof entry === 'function' || typeof entry === 'symbol')
+            continue;
+          entries.push([
+            this.redact(key),
+            AUTHORIZATION_HEADER_NAME.test(key) && typeof entry === 'string'
+              ? redactAuthorizationValue(entry)
+              : typeof entry === 'bigint'
+                ? String(entry)
+                : copy(entry),
+          ]);
+        }
+        return Object.fromEntries(entries);
+      } finally {
+        visited.delete(current);
+      }
+    };
+    return copy(value);
   }
 
   private redactObject(value: unknown, visited: WeakSet<object>): void {

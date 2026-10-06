@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,9 +20,10 @@ import type {
 } from '../../src/engine/types';
 import type { ContentMigrationClient } from '../../src/migration';
 import type { ContentMigrationDefinition } from '../../src/migration';
+import { withBulkSchema } from './bulk-schema-fixture';
+import { fixtureId } from './fixture-id';
 
-const id = (value: string) =>
-  createHash('sha256').update(value).digest('base64url').slice(0, 22);
+const id = fixtureId;
 const MODEL = id('repair-model');
 const TITLE = id('repair-title');
 const A = id('repair-a');
@@ -333,6 +333,7 @@ function sdk(schemaState: SchemaState, states: RecordState[]) {
       },
     },
   } as unknown as Client;
+  withBulkSchema(client);
   return {
     client,
     liveSchema,
@@ -390,7 +391,12 @@ describe('TypeScript migration repair', () => {
   function definition(
     run: ContentMigrationDefinition['run'],
   ): ContentMigrationDefinition {
-    return { version: 1, options: { baseline: './repair.content' }, run };
+    return {
+      format: 'datocms-content-migration',
+      version: 1,
+      options: { baseline: './repair.content' },
+      run,
+    };
   }
   async function replay(client: ContentMigrationClient, title = 'Desired') {
     await client.items.update(A, { title });

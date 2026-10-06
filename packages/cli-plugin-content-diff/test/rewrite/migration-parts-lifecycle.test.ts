@@ -46,7 +46,7 @@ describe('content migration part lifecycle', () => {
       },
     );
     await assert.rejects(
-      migration.contentMigration.run(
+      migration.run(
         client((...args) => {
           calls.push(args);
         }),
@@ -80,7 +80,7 @@ describe('content migration part lifecycle', () => {
         throw original;
       },
     );
-    const result = migration.contentMigration.run(recording);
+    const result = migration.run(recording);
     const failed = assert.rejects(
       result,
       (error: unknown) => error === original,
@@ -113,7 +113,7 @@ describe('content migration part lifecycle', () => {
       },
     );
     await assert.rejects(
-      migration.contentMigration.run(
+      migration.run(
         client(() => {
           events.push('prefix');
         }),
@@ -144,7 +144,7 @@ describe('content migration part lifecycle', () => {
         await runMigrationPart(recording, next);
       },
     );
-    await migration.contentMigration.run(recording);
+    await migration.run(recording);
     assert.deepEqual(calls, ['one', 'two']);
     await assert.rejects(
       runMigrationPart(recording, filename()),
@@ -177,7 +177,7 @@ describe('content migration part lifecycle', () => {
         await runMigrationPart(recording, filename());
       },
     );
-    const result = migration.contentMigration.run(recording, controller.signal);
+    const result = migration.run(recording, controller.signal);
     const failed = assert.rejects(
       result,
       (error: unknown) => error === interruption,

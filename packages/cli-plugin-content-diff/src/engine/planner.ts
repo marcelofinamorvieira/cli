@@ -16,6 +16,7 @@ import {
   provenFailures,
   suppressedDefaultValue,
 } from './planner-validity';
+import { isPortableCreationId } from './portable-id';
 import { compareIds } from './schema';
 import type { SnapshotStore } from './store';
 import type {
@@ -40,7 +41,6 @@ import type {
   TemporarySchemaChange,
 } from './types';
 
-const PORTABLE_ID = /^[A-Za-z0-9_-]{22}$/;
 const MUTATIONS = new Set<Action>(['create', 'update', 'delete']);
 
 function blankCounts(): PlanCounts {
@@ -618,7 +618,7 @@ class Planning {
             'UNSUPPORTED_COLLECTION_POSITION',
             `Collection ${id} has no authoritative integer position.`,
           );
-        if (action === 'create' && !PORTABLE_ID.test(id))
+        if (action === 'create' && !isPortableCreationId(id))
           this.unsafe(
             kind,
             id,
@@ -660,7 +660,7 @@ class Planning {
           'MISSING_CONCURRENCY_VERSION',
           `Record ${plan.id} has no destination current version for an optimistic update guard.`,
         );
-      if (plan.action === 'create' && !PORTABLE_ID.test(plan.id))
+      if (plan.action === 'create' && !isPortableCreationId(plan.id))
         this.unsafe(
           'record',
           plan.id,
@@ -690,7 +690,7 @@ class Planning {
             `SELECT 1 FROM block_owners WHERE side='target' AND block_id=? LIMIT 1`,
           )
           .get(owner.blockId);
-        if (!exists && !PORTABLE_ID.test(owner.blockId))
+        if (!exists && !isPortableCreationId(owner.blockId))
           this.unsafe(
             'record',
             plan.id,
@@ -2539,7 +2539,7 @@ export function recordBlockTransitionIssue(
     for (const wanted of owners(fields).values()) {
       const existing = currentOwners.get(wanted.blockId);
       if (!existing && !publishedOwners.has(wanted.blockId)) {
-        if (!PORTABLE_ID.test(wanted.blockId))
+        if (!isPortableCreationId(wanted.blockId))
           return {
             code: 'UNSUPPORTED_LEGACY_BLOCK_ID',
             message: `Record ${entry.id} must recreate block ${wanted.blockId} while writing ${phase}, but its identity cannot be used for a new block.`,

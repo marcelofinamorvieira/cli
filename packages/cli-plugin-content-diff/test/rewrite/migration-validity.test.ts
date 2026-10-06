@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { canonicalFields, hashJson, recordHash } from '../../src/engine/codec';
@@ -17,9 +16,9 @@ import type {
   RecordState,
   SchemaState,
 } from '../../src/engine/types';
+import { fixtureId } from './fixture-id';
 
-const id = (value: string) =>
-  createHash('sha256').update(value).digest('base64url').slice(0, 22);
+const id = fixtureId;
 const MODEL = id('validation-model');
 const BLOCK = id('validation-block');
 const A = id('validation-a');

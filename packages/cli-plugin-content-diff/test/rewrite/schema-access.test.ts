@@ -14,6 +14,7 @@ import type {
   RecordState,
   SchemaState,
 } from '../../src/engine/types';
+import { withBulkSchema } from './bulk-schema-fixture';
 
 const MODEL = 'aaaaaaaaaaaaaaaaaaaaaa';
 const WORKFLOW = 'bbbbbbbbbbbbbbbbbbbbbb';
@@ -271,7 +272,7 @@ function defaultSchemaClient(
   type = 'integer',
   validators: JsonObject = {},
 ): Client {
-  return {
+  return withBulkSchema({
     site: {
       find: async () => ({
         id: 'site',
@@ -317,7 +318,7 @@ function defaultSchemaClient(
       ],
     },
     workflows: { list: async () => [] },
-  } as unknown as Client;
+  } as unknown as Client);
 }
 
 const unsupportedInteger = (error: unknown) =>

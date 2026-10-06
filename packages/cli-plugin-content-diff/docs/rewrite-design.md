@@ -14,7 +14,7 @@ Generated code imports the precise public `ContentMigrationClient` interface for
 
 ## Generation
 
-1. Resolve endpoint profiles, project/environment identities, and schemas. Exclude only the configured, validated native migration-tracking model; retain its exact identity or recorded absence.
+1. Resolve endpoint profiles through public CLI config/credential utilities and the Dashboard SDK. Read each schema freshly through `site.rawFind` with models and fields included, plus workflows; reject missing, duplicate or wrongly owned included resources. Retain canonical normalization, precision checks and hash projection. Resolve project/environment identities and schemas. Exclude only the configured, validated native migration-tracking model; retain its exact identity or recorded absence.
 2. Capture complete managed namespaces into temporary SQLite, including fully expanded current and published blocks, schedules, assets, and folders. Selected models limit changes, not preservation or dependency proofs. Separate projects can be read concurrently; environments in one project share its API rate limit.
 3. Verify capture consistency. Pass the tracking-schema projection through all consistency rereads, not only the initial schema fetch.
 4. Build the indexed dependency, uniqueness, ordering, publication, and temporary-schema plan. Reject unsafe changes unless a proven isolated partial closure is authorized.
@@ -30,16 +30,16 @@ The default TypeScript part target is 1 MiB. Never split a CMA operation. One la
 
 1. Load the trusted TypeScript definition and verify its companion metadata and asset checksums.
 2. Verify destination project/schema binding and primary authorization. Capture the current destination and compare every managed identity with the immutable baseline, including content outside the selected models.
-3. Invoke the script with a recording CMA facade inside a temporary SQLite transaction. Supported calls mutate a local intended namespace initialized from the destination; they do not discover intent by submitting remote writes. Unmentioned records and omitted update fields remain preserved. Creates require explicit portable IDs. Unsupported operations and attempts to leave the selected model scope fail closed.
+3. Invoke the script with a recording CMA facade inside a temporary SQLite transaction. Supported calls mutate a local intended namespace initialized from the destination; they do not discover intent by submitting remote writes. Unmentioned records and omitted update fields remain preserved. Creates require explicit canonical UUIDv4 identities checked with the public CMA SDK validator, including new/recreated nested blocks. Numeric legacy IDs remain excluded from new creations. Unsupported operations and attempts to leave the selected model scope fail closed.
 4. Resolve validity for every intended current/published slice. Exact captured source evidence can be reused only when record ID, slice, and field hash match. Unknown edited values use native non-mutating validation endpoints. Refuse validation that depends on future/new references, changed assets, structural failures, or defaults that would substitute different values. Do not invent validity. Unchanged generated cycles retain their exact source evidence.
 5. Rebuild the plan from the executed TypeScript, including dependencies, publication cycles, ordering, deletions, temporary rules, and binary bindings. Generation-time choices are not an executable desired-state override. The generation deletion flag controls emitted calls; explicit supported deletes in edited TypeScript become intended deletions when replanned.
 6. Pass the fresh plan to the guarded executor. Verify the destination/fork, perform dependency-ordered writes with focused guards, restore schedules and temporary settings, then verify the complete intended namespace.
 
-`content:apply --dry-run` follows this same path through full baseline, permission, schema, dependency and schedule preflight, then returns before environment locks, fork creation or any plugin-owned remote write. It returns entity counts, changed model/resource groups and temporary field-change count; SQL aggregates keep preview memory proportional to schema size. Native validation requests remain read-only with respect to content, and trusted user code can have independent side effects. Preview reserves nothing; a later apply repeats preflight.
+`content:apply --dry-run` follows this same path through full baseline, permission, schema, dependency and schedule preflight, then returns before fork creation or any plugin-owned remote write. It returns entity counts, changed model/resource groups and temporary field-change count; SQL aggregates keep preview memory proportional to schema size. Native validation requests remain read-only with respect to content, and trusted user code can have independent side effects. Preview reserves nothing; a later apply repeats preflight.
 
-The public `applyContentMigration` and `repairContentMigration` take the script path, root client, environment-client factory, and explicit execution options. They share the original executor through an internal prepared-plan adapter. Internal JSON plan rows are temporary derived state, not saved execution progress or public input.
+The public `applyContentMigration` and `repairContentMigration` take the script path, root client, environment-client factory, and explicit execution options. They invoke `applyPlan` and `repairPlan` through one mandatory `PreparedPlan` contract containing metadata, streamed entries, optional verified snapshot and a release callback. There is no legacy serialized mutation-plan reader or writer. Internal SQLite plan rows are temporary derived state, not saved execution progress or public input.
 
-DatoCMS has no persistent public sandbox write freeze. Maintenance mode applies only to primary and does not provide a transaction. Keep the comments explaining this beside capture, prewrite, and schedule-restoration checks. Competing writers must be stopped; observed-conflict checks cannot remove the race between a read and its following write.
+DatoCMS has no persistent public sandbox write freeze. There is no speculative lock interface or alternative verification path for an unavailable capability. Maintenance mode applies only to primary and does not provide a transaction. Keep the comments explaining this beside capture, prewrite, and schedule-restoration checks. Competing writers must be stopped; observed-conflict checks cannot remove the race between a read and its following write.
 
 `versions` verification uses current versions and published-version timestamps to avoid redundant reads. Full verification rereads complete records. Managed schema changes and plugin-controlled upload rewrites receive additional checks, but external in-place rewrites can evade version-only comparison. Full reads strengthen verification without freezing the environment.
 
@@ -47,7 +47,7 @@ DatoCMS has no persistent public sandbox write freeze. Maintenance mode applies 
 
 The plugin must work with the unmodified DatoCMS CLI and shared utilities. It registers only `content:diff` and `content:apply`, with no native command overrides, runtime patches or content-specific host contracts. The native schema migration runner remains separate.
 
-`content:apply` owns the complete content lifecycle: environment authorization, fork creation, cooperative cancellation, verification and failed-fork cleanup. Generated default exports carry the content definition; direct function invocation refuses with an instruction to use `content:apply`. The plugin does not write native migration receipts or maintain a pending-script queue.
+`content:apply` owns the complete content lifecycle: environment authorization, fork creation, cooperative cancellation, verification and failed-fork cleanup. Generated default exports are branded content definitions rather than functions pretending to be native migrations. The content loader validates that descriptor; the native schema runner cannot execute it. The plugin does not write native migration receipts or maintain a pending-script queue.
 
 Tracking-model projection requires canonical schema and the exact identity recorded at generation. A newly introduced, replaced or missing tracking model is rejected. Existing schema migration receipts remain outside content synchronization. Complete required schema changes before generating content; changes to captured schema or content invalidate the baseline.
 
@@ -57,7 +57,7 @@ The plugin runtime must resolve as a project dependency from the generated scrip
 
 Use Node's built-in SQLite on Node 22.13+ or Node 24+, bounded record batches of at most 30, streaming metadata, indexed lookups, and iterative graph algorithms. Reuse the CMA client's authentication, retry, serialization, and async-job handling. Parallelize independent work only; serialize dependent writes and writes affecting the same ordered sibling group.
 
-A fresh CommonJS wrapper without `require.cache` entries did not prove bounded memory: local measurements found retained compiled code across large parts. Large generated parts therefore run in disposable workers. Each worker forwards awaited CMA-shaped calls to the parent's recorder, with at most one handler active, and is terminated after the part completes. The small primary module is loaded once. Worker isolation controls compilation lifetime; it is not a security boundary.
+TypeScript loading uses the public `tsx/cjs/api`, with normal project config/helper resolution and source maps. The entrypoint cache entry is evicted to observe edits. Imported dependencies retain normal caching; worker processes own and release the complete module/transform state of each part. A fresh CommonJS wrapper without `require.cache` entries did not prove bounded memory: local measurements found retained compiled code across large parts. Large generated parts therefore run in disposable Node worker processes. Thread termination left esbuild child processes accumulating until the main CLI exited; process boundaries release those compiler descendants after each part. Each process forwards awaited CMA-shaped calls to the parent's recorder, with at most one handler active, and exits after the part completes; the parent awaits its exit before continuing. The small primary module is loaded once. Process isolation controls compilation lifetime; it is not a security boundary.
 
 Generation and execution are one-shot. No pause/resume, checkpoints, persisted temporary database, or recovery cursor is accepted. Remove owned SQLite and staging files on completion or failure. Keep complete scripts and companions. Cooperative signals drain submitted work and perform cleanup; forced process termination cannot.
 
@@ -79,12 +79,13 @@ Repair must refuse missing original evidence, unrelated schema changes, changed 
 | `engine/migration-artifact` | TypeScript emission, immutable baseline storage, binaries, integrity, and atomic staging. |
 | `engine/migration-intent`, `migration-validity` | Recording facade, local simulation, exact evidence, and native validation of unknown edits. |
 | `content-migration-client`, `engine/migration-preview` | Accurate authoring types and bounded read-only preview summaries. |
-| `engine/migration-loader` | Trusted TypeScript loading, source locations, disposable parts, and recording IPC. |
+| `engine/migration-loader` | Public tsx loading, source locations, disposable part processes, and recording IPC. |
+| `engine/artifact-integrity`, `asset-download` | Shared baseline/binary validation and original-byte downloads. |
 | `engine/migration-schema` | Explicit native tracking-model identity and schema projection. |
 | `engine/migration-repair` | Original-namespace reconstruction and fresh repair planning. |
 | `engine/apply*` | Guarded fork/in-place execution, restoration, verification, and cleanup. |
 | `migration` | Public generated-script definition and plugin-owned execution. |
-| `commands/content` | Profiles, flags, naming, interruptions, and terminal/JSON output. |
+| `commands/content`, `utils/profile-auth`, `utils/content-command` | Public CLI config/credential adapters, flags, naming, interruptions, sanitized terminal/JSON errors and logging. |
 
 Tests must execute real generated TypeScript, edit its payloads, and show that replanning follows those edits. Include inline and worker parts, unchanged namespace preservation, source-evidence cycles, unsupported edits, corrupted companions, project/primary guards, plugin-only invocation boundaries, repair refusals, interruption, cleanup, and package resolution. Retain meaningful failures while investigating them.
 

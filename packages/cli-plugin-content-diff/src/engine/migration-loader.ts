@@ -1,9 +1,8 @@
+import { spawn } from 'node:child_process';
 import { open } from 'node:fs/promises';
-import { SourceMap, createRequire } from 'node:module';
-import { dirname, resolve } from 'node:path';
-import { compileFunction } from 'node:vm';
-import { Worker } from 'node:worker_threads';
-import * as ts from 'typescript';
+import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
+import { require as tsxRequire } from 'tsx/cjs/api';
 import { assertNotAborted } from './cancellation';
 import { ContentError } from './errors';
 import { MAX_MIGRATION_FILE_BYTES } from './migration-limits';
@@ -79,64 +78,11 @@ async function sourceFile(
 }
 
 /**
- * Source maps stay local to this compilation, rather than entering Node's
- * process-wide source-map/module caches with every generated part.
- */
-function mapError(
-  error: unknown,
-  filename: string,
-  sourceMap: SourceMap,
-): void {
-  if (!(error instanceof Error) || !error.stack) return;
-  const escaped = filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  error.stack = error.stack.replace(
-    new RegExp(`${escaped}:(\\d+):(\\d+)`, 'g'),
-    (location, line: string, column: string) => {
-      const entry = sourceMap.findEntry(Number(line) - 1, Number(column) - 1);
-      return 'originalLine' in entry
-        ? `${filename}:${entry.originalLine + 1}:${entry.originalColumn + 1}`
-        : location;
-    },
-  );
-}
-
-function mappedFunction(
-  original: (...args: unknown[]) => unknown,
-  filename: string,
-  sourceMap: SourceMap,
-): (...args: unknown[]) => Promise<unknown> {
-  const wrapped = async (...args: unknown[]) => {
-    try {
-      return await original(...args);
-    } catch (error) {
-      mapError(error, filename, sourceMap);
-      throw error;
-    }
-  };
-  // Preserve runtime markers attached by defineContentMigration, including
-  // non-enumerable and symbol properties. Function internals stay on the wrapper.
-  for (const key of Reflect.ownKeys(original)) {
-    if (
-      typeof key === 'string' &&
-      ['length', 'name', 'prototype', 'arguments', 'caller'].includes(key)
-    )
-      continue;
-    Object.defineProperty(
-      wrapped,
-      key,
-      Object.getOwnPropertyDescriptor(original, key)!,
-    );
-  }
-  return wrapped;
-}
-
-/**
- * Load trusted migration code into a fresh CommonJS scope. This is not a
- * security sandbox: filesystem, network, and normal dependency imports are
- * available. Dependencies use ordinary Node resolution/caching; the migration
- * file itself is never registered in require.cache. V8 may nevertheless retain
- * compiled code in this isolate. Use this for the small primary entrypoint;
- * large generated parts use executeRecordedMigrationPart in disposable workers.
+ * Load trusted code through the same public tsx API as native migrations.
+ * tsx owns TypeScript imports, project configuration and source maps. The small
+ * entrypoint is evicted after loading so edits are observed on the next run;
+ * dependencies retain ordinary module semantics. Large generated parts use
+ * disposable processes, which release compiler services, modules and source maps.
  */
 export async function loadMigrationModule<T = unknown>(
   path: string,
@@ -150,75 +96,17 @@ export async function loadMigrationModule<T = unknown>(
       'Migration file size limit must be a positive safe integer.',
     );
   const filename = resolve(path);
-  const source = await sourceFile(filename, maximum, options.signal);
-  // .mts/.mjs otherwise override CommonJS in transpileModule. The compiler's
-  // synthetic suffix does not affect dependency resolution or error filenames.
-  const result = ts.transpileModule(source, {
-    fileName: `${filename}.ts`,
-    reportDiagnostics: true,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2022,
-      module: ts.ModuleKind.CommonJS,
-      esModuleInterop: true,
-      sourceMap: true,
-      inlineSources: false,
-    },
-  });
-  const diagnostics = result.diagnostics?.filter(
-    (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
-  );
-  if (diagnostics?.length) {
-    const messages = diagnostics.map((diagnostic) => {
-      const position =
-        diagnostic.file && diagnostic.start !== undefined
-          ? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
-          : undefined;
-      return `${filename}${
-        position ? `:${position.line + 1}:${position.character + 1}` : ''
-      }: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, ' ')}`;
-    });
-    throw new ContentError('INVALID_MIGRATION', messages.join('\n'));
-  }
+  await sourceFile(filename, maximum, options.signal);
   assertNotAborted(options.signal);
-  const sourceMap = new SourceMap(JSON.parse(result.sourceMapText!));
-  const module = { exports: {} as unknown };
+  const moduleId = tsxRequire.resolve(filename, __filename);
+  delete tsxRequire.cache[moduleId];
   try {
-    const evaluate = compileFunction(
-      result.outputText.replace(/\n\/\/# sourceMappingURL=.*(?:\r?\n)?$/, ''),
-      ['exports', 'require', 'module', '__filename', '__dirname'],
-      { filename },
-    );
-    evaluate(
-      module.exports,
-      createRequire(filename),
-      module,
-      filename,
-      dirname(filename),
-    );
-  } catch (error) {
-    mapError(error, filename, sourceMap);
-    throw error;
+    const loaded = tsxRequire(filename, __filename) as T;
+    assertNotAborted(options.signal);
+    return loaded;
+  } finally {
+    delete tsxRequire.cache[moduleId];
   }
-  assertNotAborted(options.signal);
-  if (typeof module.exports === 'function') {
-    module.exports = mappedFunction(
-      module.exports as (...args: unknown[]) => unknown,
-      filename,
-      sourceMap,
-    );
-  } else if (
-    module.exports &&
-    typeof module.exports === 'object' &&
-    'default' in module.exports &&
-    typeof module.exports.default === 'function'
-  ) {
-    module.exports.default = mappedFunction(
-      module.exports.default as (...args: unknown[]) => unknown,
-      filename,
-      sourceMap,
-    );
-  }
-  return module.exports as T;
 }
 
 /** Load and await a small trusted module in the current isolate. */
@@ -275,8 +163,8 @@ function receivedError(value: Record<string, unknown>): Error {
 // releases compiler and module memory; it does not restrict access to secrets,
 // files, processes, or the network. Only the recording client crosses this IPC.
 const recordingWorker = `
-const { parentPort, workerData } = require('node:worker_threads');
-const { executeMigrationPart } = require(workerData.loader);
+const { executeMigrationPart } = require(process.argv[1]);
+const workerData = JSON.parse(process.argv[2]);
 const pending = new Map();
 let nextId = 0;
 let tail = Promise.resolve();
@@ -287,7 +175,7 @@ const errorValue = (error) => ({
   stack: error instanceof Error ? error.stack : undefined,
   code: error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined,
 });
-parentPort.on('message', (message) => {
+process.on('message', (message) => {
   const item = pending.get(message.id);
   if (!item) return;
   pending.delete(message.id);
@@ -300,7 +188,7 @@ const invoke = (resource, method, args) => {
   const result = tail.then(() => new Promise((resolve, reject) => {
     const id = ++nextId;
     pending.set(id, { resolve, reject });
-    parentPort.postMessage({ type: 'call', id, call: { resource, method, args } });
+    process.send({ type: 'call', id, call: { resource, method, args } }, (error) => { if (error) { pending.delete(id); reject(error); } });
   }));
   tail = result.catch((error) => { firstError ??= error; });
   return result;
@@ -316,21 +204,31 @@ const client = new Proxy({}, {
     });
   },
 });
+const complete = (message) => new Promise((resolve, reject) => {
+  process.send(message, (error) => {
+    if (process.connected) process.disconnect();
+    if (error) reject(error); else resolve();
+  });
+});
 (async () => {
   try {
     await executeMigrationPart(workerData.path, [client], { maxBytes: workerData.maxBytes });
     await tail;
     if (firstError) throw firstError;
-    parentPort.postMessage({ type: 'complete' });
+    await complete({ type: 'complete' });
   } catch (error) {
     await tail;
-    parentPort.postMessage({ type: 'failure', error: errorValue(error) });
+    await complete({ type: 'failure', error: errorValue(error) });
   }
-})();
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+  if (process.connected) process.disconnect();
+});
 `;
 
 /**
- * Compile and execute one generated part in a disposable isolate. Each awaited
+ * Compile and execute one generated part in a disposable Node process. Each awaited
  * client.resource.method(...args) is recorded by the parent and receives its
  * returned value. At most one handler runs at once, even for Promise.all calls.
  * Completion and cancellation both drain submitted handlers before teardown.
@@ -342,31 +240,59 @@ export async function executeRecordedMigrationPart(
 ): Promise<void> {
   assertNotAborted(options.signal);
   const execArgv: string[] = [];
-  // Repository tests execute this source via ts-node. Published packages only
-  // contain compiled .js, so production workers need no TypeScript require hook.
+  // Repository tests load this source; published workers receive compiled JS.
+  // Resolve outside any scoped tsx namespace so --require receives a file path.
   if (__filename.endsWith('.ts'))
-    execArgv.push(
-      '--require',
-      require.resolve('ts-node/register/transpile-only'),
-    );
-  const worker = new Worker(recordingWorker, {
-    eval: true,
-    execArgv,
-    workerData: {
-      loader: __filename,
-      path: resolve(path),
-      maxBytes: options.maxBytes,
+    execArgv.push('--require', createRequire(__filename).resolve('tsx/cjs'));
+  // tsx uses esbuild's synchronous compiler worker and service subprocess.
+  // Disposing a Node worker thread strands that service as a zombie until the
+  // CLI exits. A process boundary releases the complete compiler process tree.
+  const worker = spawn(
+    process.execPath,
+    [
+      ...execArgv,
+      '--eval',
+      recordingWorker,
+      __filename,
+      JSON.stringify({ path: resolve(path), maxBytes: options.maxBytes }),
+    ],
+    {
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      serialization: 'advanced',
     },
-  });
+  );
   await new Promise<void>((resolveCompletion, rejectCompletion) => {
     let finishing = false;
+    let closed = false;
     let inFlight: Promise<void> | undefined;
-    const finish = async (error?: unknown) => {
+    const exited = new Promise<void>((resolveExit) => {
+      worker.once('close', () => {
+        closed = true;
+        resolveExit();
+      });
+    });
+    const waitForExit = (milliseconds: number) =>
+      new Promise<void>((resolveWait) => {
+        const timer = setTimeout(resolveWait, milliseconds);
+        void exited.then(() => {
+          clearTimeout(timer);
+          resolveWait();
+        });
+      });
+    const finish = async (error?: unknown, graceful = false) => {
       if (finishing) return;
       finishing = true;
       options.signal?.removeEventListener('abort', onAbort);
       await inFlight;
-      await worker.terminate();
+      // Successful parts disconnect their IPC channel and exit naturally,
+      // allowing Node to close the compiler's own workers and subprocesses.
+      if (graceful && !closed) await waitForExit(1000);
+      if (!closed) {
+        worker.kill('SIGTERM');
+        await waitForExit(1000);
+      }
+      if (!closed) worker.kill('SIGKILL');
+      await exited;
       if (error !== undefined) rejectCompletion(error);
       else resolveCompletion();
     };
@@ -377,37 +303,45 @@ export async function executeRecordedMigrationPart(
         void finish(error);
       }
     };
+    const reply = (message: unknown) => {
+      if (finishing || !worker.connected) return;
+      worker.send(message as object, (error) => {
+        if (error && !finishing) void finish(error);
+      });
+    };
     options.signal?.addEventListener('abort', onAbort, { once: true });
-    worker.on('message', (message) => {
-      if (finishing) return;
-      if (message.type === 'complete') void finish();
+    worker.on('message', (value) => {
+      if (finishing || !value || typeof value !== 'object') return;
+      const message = value as {
+        type?: string;
+        id?: number;
+        call?: RecordedMigrationCall;
+        error?: Record<string, unknown>;
+      };
+      if (message.type === 'complete') void finish(undefined, true);
       else if (message.type === 'failure')
-        void finish(receivedError(message.error));
+        void finish(receivedError(message.error!), true);
       else if (message.type === 'call') {
         // Install the pending promise before a handler can synchronously abort.
         inFlight = Promise.resolve().then(async () => {
           try {
-            const result = await onCall(message.call);
-            if (!finishing) worker.postMessage({ id: message.id, result });
+            const result = await onCall(message.call!);
+            reply({ id: message.id, result });
           } catch (error) {
-            if (!finishing)
-              worker.postMessage({
-                id: message.id,
-                error: transferError(error),
-              });
+            reply({ id: message.id, error: transferError(error) });
           }
         });
       }
     });
     worker.once('error', (error) => void finish(error));
-    worker.once('exit', (code) => {
+    worker.once('close', (code, signal) => {
       if (!finishing)
         void finish(
           new ContentError(
             'MIGRATION_WORKER_EXIT',
-            `Migration part exited before completing (${code}): ${resolve(
-              path,
-            )}`,
+            `Migration part exited before completing (${
+              code ?? signal
+            }): ${resolve(path)}`,
           ),
         );
     });

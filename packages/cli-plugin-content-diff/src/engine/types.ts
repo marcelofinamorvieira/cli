@@ -1,4 +1,5 @@
 import type { CmaClient } from '@datocms/cli-utils';
+import type { SnapshotStore } from './store';
 
 export type Client = CmaClient.Client;
 export type JsonPrimitive = string | number | boolean | null;
@@ -203,22 +204,28 @@ export interface PlanMetadata {
   counts: PlanCounts;
   temporarySchemaChanges: TemporarySchemaChange[];
 }
-export interface BundleChunk {
+export interface ArtifactChunk {
   file: string;
   sha256: string;
   bytes: number;
   entries: number;
 }
-export interface BundleChunkIndex {
+export interface ArtifactChunkIndex {
   file: 'chunks.jsonl';
   sha256: string;
   bytes: number;
   count: number;
 }
-export interface BundleManifest extends PlanMetadata {
-  format: 'datocms-content-bundle/1';
-  createdAt: string;
-  chunks: BundleChunkIndex;
+/** A fresh plan rebuilt from TypeScript; never saved execution progress. */
+export interface PreparedPlan {
+  metadata: PlanMetadata;
+  entries: () => Iterable<PlanEntry>;
+  snapshot?: {
+    store: SnapshotStore;
+    environmentId: string;
+    schemaHash: string;
+  };
+  release?: () => void;
 }
 export interface CaptureOptions {
   /** Exclude only explicitly verified migration-tracking metadata. */

@@ -4,10 +4,6 @@ import { oclif } from '@datocms/cli-utils';
 import { camelCase } from 'lodash';
 import { assertNotAborted } from '../../engine/cancellation';
 import { captureSnapshot } from '../../engine/capture';
-import {
-  lockEnvironment,
-  unlockEnvironment,
-} from '../../engine/environment-lock';
 import { ContentError } from '../../engine/errors';
 import { writeMigration } from '../../engine/migration-artifact';
 import {
@@ -243,10 +239,6 @@ export default class ContentDiffCommand extends ContentCommand {
     const modelIds = selectedModels(sourceSchema, flags['item-types']);
     assertNotAborted(signal);
     const store = new SnapshotStore();
-    const [sourceLocked, destinationLocked] = await Promise.all([
-      lockEnvironment(sourceClient, sourceEnvironmentId),
-      lockEnvironment(destinationClient, destinationEnvironmentId),
-    ]);
     try {
       // Full namespaces prove inbound dependencies and preservation. The model
       // selection below limits planned mutations, rather than capture authority.
@@ -255,26 +247,18 @@ export default class ContentDiffCommand extends ContentCommand {
         target: SnapshotStore,
         captureSignal: AbortSignal,
       ) => {
-        const [client, environment, schema, locked, label]: [
+        const [client, environment, schema, label]: [
           typeof sourceClient,
           string,
           SchemaState,
-          boolean,
           string,
         ] =
           side === 'source'
-            ? [
-                sourceClient,
-                sourceEnvironmentId,
-                sourceSchema,
-                sourceLocked,
-                'Source',
-              ]
+            ? [sourceClient, sourceEnvironmentId, sourceSchema, 'Source']
             : [
                 destinationClient,
                 destinationEnvironmentId,
                 destinationSchema,
-                destinationLocked,
                 'Destination',
               ];
         this.progress(`Capturing ${label.toLowerCase()} "${environment}".`);
@@ -284,12 +268,9 @@ export default class ContentDiffCommand extends ContentCommand {
           schema,
           store: target,
           side,
-          // A locked environment cannot change while it is read.
-          verify: locked
-            ? false
-            : flags.verification === 'versions'
-              ? 'versions'
-              : true,
+          // DatoCMS cannot freeze sandbox environments, so every capture must
+          // recheck consistency before its state is used to generate a migration.
+          verify: flags.verification === 'versions' ? 'versions' : true,
           options: {
             schemaProjection: (rawSchema) =>
               projectMigrationSchema(
@@ -403,16 +384,6 @@ export default class ContentDiffCommand extends ContentCommand {
       }
       return result;
     } finally {
-      await Promise.all([
-        sourceLocked &&
-          unlockEnvironment(sourceClient, sourceEnvironmentId).catch(
-            () => undefined,
-          ),
-        destinationLocked &&
-          unlockEnvironment(destinationClient, destinationEnvironmentId).catch(
-            () => undefined,
-          ),
-      ]);
       store.dispose();
     }
   }

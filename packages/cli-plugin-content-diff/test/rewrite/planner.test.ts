@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { collectionHash, hashJson, recordHash } from '../../src/engine/codec';
 import { ContentError } from '../../src/engine/errors';
 import { createPlan, orderedCollectionWrites } from '../../src/engine/planner';
@@ -21,9 +20,9 @@ import type {
   SchemaState,
   UploadState,
 } from '../../src/engine/types';
+import { fixtureId } from './fixture-id';
 
-const id = (name: string) =>
-  createHash('sha256').update(name).digest('base64url').slice(0, 22);
+const id = fixtureId;
 const MODEL = id('model');
 const TITLE = id('title');
 const LINK = id('link');
@@ -527,6 +526,112 @@ describe('indexed rewrite planner', () => {
         assert.equal(store.getPlan('record', C)?.action, 'create');
         assert.equal(metadata.counts.record.skip, 2);
         assert.equal(metadata.counts.record.create, 1);
+      },
+    );
+  });
+
+  it('rejects malformed record, block, upload and folder creation identities', async () => {
+    const blockSchema = schema([
+      model({
+        fields: [
+          field({ id: BLOCK_FIELD, apiKey: 'block', type: 'single_block' }),
+        ],
+      }),
+      model({ id: BLOCK_MODEL, apiKey: 'block', block: true }),
+    ]);
+    for (const invalidId of ['A'.repeat(22), '0000000000000000000123']) {
+      await assert.rejects(fixture([record(invalidId)], []), unsafe);
+      await assert.rejects(
+        fixture(
+          [
+            record(A, {
+              block: {
+                id: invalidId,
+                __itemTypeId: BLOCK_MODEL,
+                attributes: { title: 'nested' },
+              },
+            }),
+          ],
+          [],
+          blockSchema,
+        ),
+        unsafe,
+      );
+      const store = new SnapshotStore();
+      try {
+        store.putUpload('source', upload(invalidId));
+        await assert.rejects(
+          createPlan(store, schema(), schema(), options({ uploads: 'all' })),
+          unsafe,
+        );
+      } finally {
+        store.dispose();
+      }
+      await assert.rejects(
+        collectionFixture([collection(invalidId)], []),
+        unsafe,
+      );
+    }
+  });
+
+  it('retains legacy identities when updating or deleting existing entities', async () => {
+    await fixture(
+      [record('123', { title: 'updated' })],
+      [record('123')],
+      schema(),
+      options(),
+      (store) => {
+        assert.equal(store.getPlan('record', '123')?.action, 'update');
+      },
+    );
+    await fixture(
+      [],
+      [record('123')],
+      schema(),
+      options({ includeDeletions: true }),
+      (store) => {
+        assert.equal(store.getPlan('record', '123')?.action, 'delete');
+      },
+    );
+    await collectionFixture(
+      [collection('123', null, 1, 'updated')],
+      [collection('123')],
+      {},
+      (store) => {
+        assert.equal(store.getPlan('collection', '123')?.action, 'update');
+      },
+    );
+    const store = new SnapshotStore();
+    try {
+      const baseline = upload('123');
+      const desired = { ...baseline, filename: 'renamed.png', hash: 'changed' };
+      store.putUpload('target', baseline);
+      store.putUpload('source', desired);
+      await createPlan(store, schema(), schema(), options({ uploads: 'all' }));
+      assert.equal(store.getPlan('upload', '123')?.action, 'update');
+    } finally {
+      store.dispose();
+    }
+    const blockSchema = schema([
+      model({
+        fields: [
+          field({ id: BLOCK_FIELD, apiKey: 'block', type: 'single_block' }),
+        ],
+      }),
+      model({ id: BLOCK_MODEL, apiKey: 'block', block: true }),
+    ]);
+    const block = (title: string) => ({
+      id: '123',
+      __itemTypeId: BLOCK_MODEL,
+      attributes: { title },
+    });
+    await fixture(
+      [record(A, { block: block('updated') })],
+      [record(A, { block: block('old') })],
+      blockSchema,
+      options(),
+      (store) => {
+        assert.equal(store.getPlan('record', A)?.action, 'update');
       },
     );
   });

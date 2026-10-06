@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { runInNewContext } from 'node:vm';
 import {
   canonicalFields,
@@ -26,9 +25,9 @@ import type {
   SchemaState,
 } from '../../src/engine/types';
 import type { ContentMigrationClient } from '../../src/migration';
+import { fixtureId } from './fixture-id';
 
-const id = (name: string) =>
-  createHash('sha256').update(name).digest('base64url').slice(0, 22);
+const id = fixtureId;
 const MODEL = id('intent-model');
 const BLOCK = id('intent-block');
 const A = id('intent-a');

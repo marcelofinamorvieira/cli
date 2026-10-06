@@ -1,19 +1,25 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, it } from 'mocha';
+import { require as tsxRequire } from 'tsx/cjs/api';
 import {
   executeMigrationPart,
   executeRecordedMigrationPart,
   loadMigrationModule,
 } from '../../src/engine/migration-loader';
+import { loadContentMigration } from '../../src/migration';
 
 describe('trusted TypeScript migration loader', () => {
   let directory: string;
 
   beforeEach(async () => {
-    directory = await mkdtemp(join(tmpdir(), 'content-migration-loader-'));
+    directory = await realpath(
+      await mkdtemp(join(tmpdir(), 'content-migration-loader-')),
+    );
   });
 
   afterEach(async () => {
@@ -55,7 +61,10 @@ describe('trusted TypeScript migration loader', () => {
     ]);
     assert.equal(require.cache[filename], undefined);
     // Ordinary imported dependencies intentionally retain standard semantics.
-    const helperPath = await realpath(join(directory, 'helper.cjs'));
+    const helperPath = tsxRequire.resolve(
+      join(directory, 'helper.cjs'),
+      __filename,
+    );
     assert.ok(require.cache[helperPath]);
     delete require.cache[helperPath];
   });
@@ -104,32 +113,126 @@ describe('trusted TypeScript migration loader', () => {
     });
   });
 
-  it('maps synchronous initialization and awaited failures to source lines', async () => {
+  it('maps initialization, inline descriptor callbacks and awaited part failures to source lines', async () => {
     const initialization = join(directory, 'initialization.ts');
+    const execution = join(directory, 'execution.ts');
+    const inline = join(directory, 'inline.ts');
     await writeFile(
       initialization,
       'interface Ignored { value: number }\nthrow new Error("initialization failed");\nexport default async () => {};\n',
     );
-    await assert.rejects(
-      loadMigrationModule(initialization),
-      (error: Error) => {
-        assert.match(error.stack!, /initialization\.ts:2:\d+/);
-        return true;
-      },
-    );
-    const execution = join(directory, 'execution.ts');
     await writeFile(
       execution,
       'interface Ignored { value: number }\nexport default async function(): Promise<void> {\n  await Promise.resolve();\n  throw new Error("execution failed");\n}\n',
     );
-    await assert.rejects(
-      executeMigrationPart(execution, []),
-      (error: Error) => {
-        assert.match(error.message, /execution failed/);
-        assert.match(error.stack!, /execution\.ts:4:\d+/);
-        return true;
-      },
+    await writeFile(
+      inline,
+      `import { defineContentMigration } from ${JSON.stringify(
+        resolve(__dirname, '../../src/migration.ts'),
+      )};
+interface Ignored { value: number }
+export default defineContentMigration({ baseline: './fixture.content' }, async () => {
+  await Promise.resolve();
+  throw new Error('inline failed');
+});`,
     );
+    // Exercise native tsx source maps without the test runner's ts-node stack hook.
+    const script = `
+      const { loadMigrationModule, executeMigrationPart } = require(${JSON.stringify(
+        resolve(__dirname, '../../src/engine/migration-loader.ts'),
+      )});
+      const { loadContentMigration } = require(${JSON.stringify(
+        resolve(__dirname, '../../src/migration.ts'),
+      )});
+      (async () => {
+        for (const work of [
+          () => loadMigrationModule(${JSON.stringify(initialization)}),
+          () => executeMigrationPart(${JSON.stringify(execution)}, []),
+          async () => (await loadContentMigration(${JSON.stringify(inline)})).run({}),
+        ]) { try { await work(); } catch (error) { console.log(error.stack); } }
+      })().catch(error => { console.error(error); process.exitCode = 1; });`;
+    const result = await promisify(execFile)(process.execPath, [
+      '--require',
+      require.resolve('tsx/cjs'),
+      '-e',
+      script,
+    ]);
+    assert.match(result.stdout, /initialization\.ts:2:\d+/);
+    assert.match(result.stdout, /execution\.ts:4:\d+/);
+    assert.match(result.stdout, /inline\.ts:5:\d+/);
+  });
+
+  it('loads TypeScript helpers through project path aliases in both module modes', async () => {
+    for (const mode of ['commonjs', 'module']) {
+      const root = join(directory, mode);
+      await mkdir(join(root, 'helpers'), { recursive: true });
+      await writeFile(
+        join(root, 'package.json'),
+        JSON.stringify({ type: mode }),
+      );
+      await writeFile(
+        join(root, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: '.',
+            paths: { '@helpers/*': ['./helpers/*'] },
+          },
+        }),
+      );
+      await writeFile(
+        join(root, 'helpers/value.ts'),
+        'export interface Value { label: string }; export const value: Value = { label: "typed helper" };',
+      );
+      const filename = join(root, 'migration.ts');
+      await writeFile(
+        filename,
+        'import { value, type Value } from "@helpers/value"; export default async (): Promise<Value> => value;',
+      );
+      // Like the native CLI, tsx resolves configuration from the project cwd.
+      const script = `
+        const assert = require('node:assert/strict');
+        const { writeFile } = require('node:fs/promises');
+        const { executeMigrationPart, executeRecordedMigrationPart } = require(${JSON.stringify(
+          resolve(__dirname, '../../src/engine/migration-loader.ts'),
+        )});
+        const filename = ${JSON.stringify(filename)};
+        (async () => {
+          assert.deepEqual(await executeMigrationPart(filename, []), { label: 'typed helper' });
+          await writeFile(filename, 'import { value } from "@helpers/value"; export default async () => ({ ...value, edited: true });');
+          assert.deepEqual(await executeMigrationPart(filename, []), { label: 'typed helper', edited: true });
+          await writeFile(filename, 'import { value } from "@helpers/value"; export default async (client) => { await client.items.update("record", value); };');
+          const calls = [];
+          await executeRecordedMigrationPart(filename, (call) => { calls.push(call); });
+          assert.deepEqual(calls, [{ resource: 'items', method: 'update', args: ['record', { label: 'typed helper' }] }]);
+          console.log('project aliases and fresh migration edits passed');
+        })().catch(error => { console.error(error); process.exitCode = 1; });`;
+      const result = await promisify(execFile)(
+        process.execPath,
+        ['--require', require.resolve('tsx/cjs'), '-e', script],
+        { cwd: root },
+      );
+      assert.match(
+        result.stdout,
+        /project aliases and fresh migration edits passed/,
+      );
+    }
+  });
+
+  it('requires an explicitly branded content descriptor before accepting its callback', async () => {
+    const filename = join(directory, 'migration.ts');
+    for (const declaration of [
+      'async () => {}',
+      '{}',
+      '{ format: "other", version: 1, options: { baseline: "baseline" }, run() {} }',
+      '{ format: "datocms-content-migration", version: 2, options: { baseline: "baseline" }, run() {} }',
+      '{ format: "datocms-content-migration", version: 1, options: { baseline: "" }, run() {} }',
+    ]) {
+      await writeFile(filename, `export default ${declaration};`);
+      await assert.rejects(
+        loadContentMigration(filename),
+        /content:apply expects a default descriptor/,
+      );
+    }
   });
 
   it('rejects non-callable parts, invalid UTF-8, and invalid size limits', async () => {
@@ -236,6 +339,69 @@ describe('trusted TypeScript migration loader', () => {
       { resource: 'items', method: 'publish', args: ['created-id'] },
     ]);
     assert.equal(require.cache[filename], undefined);
+  });
+
+  it('releases each part process and its compiler descendants before the next part', async function () {
+    if (process.platform === 'win32') this.skip();
+    const filename = join(directory, 'process-lifecycle.ts');
+    await writeFile(
+      filename,
+      `import { execFileSync } from 'node:child_process';
+export default async (client) => {
+  const children = execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,comm='], { encoding: 'utf8' })
+    .split('\\n').map(line => line.trim().split(/\\s+/))
+    .filter(row => Number(row[1]) === process.pid && row.slice(2).join(' ').includes('esbuild'))
+    .map(row => Number(row[0]));
+  await client.probe.observe({ pid: process.pid, children });
+};`,
+    );
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+        throw error;
+      }
+    };
+    for (let index = 0; index < 3; index++) {
+      let observed: { pid: number; children: number[] } | undefined;
+      await executeRecordedMigrationPart(filename, (call) => {
+        observed = call.args[0] as typeof observed;
+      });
+      assert(observed);
+      assert.notEqual(observed.pid, process.pid);
+      assert.equal(alive(observed.pid), false);
+      assert(
+        observed.children.length > 0,
+        'the real compiler process must be observed',
+      );
+      const deadline = Date.now() + 3000;
+      while (observed.children.some(alive) && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(observed.children.some(alive), false);
+    }
+  });
+
+  it('bounds cleanup of a completed part that leaves handles and ignores termination', async () => {
+    const filename = join(directory, 'lingering.ts');
+    await writeFile(
+      filename,
+      `export default async (client) => {
+      process.on('SIGTERM', () => {});
+      setInterval(() => {}, 1000);
+      await client.probe.observe(process.pid);
+    };`,
+    );
+    let pid = 0;
+    await executeRecordedMigrationPart(filename, (call) => {
+      pid = call.args[0] as number;
+    });
+    assert(pid > 0);
+    assert.throws(
+      () => process.kill(pid, 0),
+      (error: NodeJS.ErrnoException) => error.code === 'ESRCH',
+    );
   });
 
   it('propagates worker source locations and recorder failures', async () => {

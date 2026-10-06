@@ -1,9 +1,12 @@
-import type { ProfileConfig } from '@datocms/cli-utils';
+import { type ProfileConfig, readCredentials } from '@datocms/cli-utils';
+import * as DashboardClient from '@datocms/dashboard-client';
+import { ContentError } from '../engine/errors';
+import type { CredentialRedactor } from './credential-redaction';
 
 export type ResolveLinkedSiteToken = (
   siteId: string,
   organizationId?: string,
-) => Promise<string | undefined>;
+) => Promise<string>;
 
 export function profileApiTokenEnvironmentName(
   profileId: string,
@@ -39,18 +42,101 @@ export async function resolveProfileApiToken({
   }
 
   if (profileConfig.siteId) {
-    const linkedSiteToken = await resolveLinkedSiteToken(
-      profileConfig.siteId,
-      profileConfig.organizationId,
-    );
-
-    if (linkedSiteToken) {
-      return { apiToken: linkedSiteToken, environmentName };
-    }
+    // A linked profile must either resolve or fail. Falling back to an
+    // environment token after an OAuth failure could target another project.
+    return {
+      apiToken: await resolveLinkedSiteToken(
+        profileConfig.siteId,
+        profileConfig.organizationId,
+      ),
+      environmentName,
+    };
   }
 
   return {
     apiToken: process.env[environmentName],
     environmentName,
   };
+}
+
+/** Public SDK adapter shared by single-project and paired-profile commands. */
+export async function resolveLinkedSiteToken(
+  {
+    siteId,
+    organizationId,
+    redactor,
+  }: {
+    siteId: string;
+    organizationId?: string;
+    redactor: CredentialRedactor;
+  },
+  dependencies: {
+    readCredentials: typeof readCredentials;
+    buildClient: typeof DashboardClient.buildClient;
+  } = { readCredentials, buildClient: DashboardClient.buildClient },
+): Promise<string> {
+  const credentials = await dependencies.readCredentials();
+  if (!credentials)
+    throw authenticationError(
+      'OAUTH_CREDENTIALS_MISSING',
+      'Project is linked but no OAuth credentials found.',
+      [
+        'Run "datocms login" to authenticate',
+        'Provide an explicit endpoint API token to override the linked project',
+      ],
+    );
+  const client = dependencies.buildClient(
+    redactor.protectClientOptions({
+      apiToken: credentials.apiToken,
+      ...(credentials.dashboardBaseUrl
+        ? { baseUrl: credentials.dashboardBaseUrl }
+        : {}),
+      ...(organizationId ? { organization: organizationId } : {}),
+    }),
+  );
+  let site: Awaited<ReturnType<typeof client.sites.find>>;
+  try {
+    site = await client.sites.find(siteId);
+  } catch (error) {
+    if (
+      error instanceof DashboardClient.ApiError &&
+      error.findError('INVALID_AUTHORIZATION_HEADER')
+    )
+      throw authenticationError(
+        'OAUTH_CREDENTIALS_INVALID',
+        'Your OAuth token is invalid or has been revoked.',
+        [
+          'Run "datocms login" to re-authenticate',
+          'Provide an explicit endpoint API token to override the linked project',
+        ],
+      );
+    throw authenticationError(
+      'LINKED_PROJECT_UNAVAILABLE',
+      `Could not access linked project (ID: ${siteId}). It may have been deleted, moved, or no longer be accessible with your OAuth permissions.`,
+      [
+        'Run "datocms login" to re-authenticate with updated permissions',
+        'Run "datocms link" to re-link to a project',
+        'Provide an explicit endpoint API token to override the linked project',
+      ],
+    );
+  }
+  if (!site.access_token)
+    throw authenticationError(
+      'LINKED_PROJECT_TOKEN_MISSING',
+      `Could not retrieve an API token for project "${site.name}" (ID: ${siteId}). You may not have access to this project.`,
+      [
+        'Run "datocms link" to re-link to a project',
+        'Provide an explicit endpoint API token to override the linked project',
+      ],
+    );
+  redactor.register(site.access_token);
+  return site.access_token;
+}
+
+function authenticationError(
+  code: string,
+  message: string,
+  suggestions: string[],
+): ContentError {
+  return Object.assign(new ContentError(code, message), { suggestions });
 }
