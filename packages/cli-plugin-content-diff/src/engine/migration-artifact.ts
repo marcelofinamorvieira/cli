@@ -12,6 +12,7 @@ import {
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { setImmediate, setTimeout } from 'node:timers/promises';
+import { format, resolveConfig } from 'prettier';
 import { boundedWork } from './apply-work';
 import {
   fetchBinary,
@@ -259,16 +260,34 @@ function checkedScript(source: string): string {
   return source;
 }
 
-/** Bound code generation by one part; never build a project-sized AST/string. */
+/** Match schema generation: project configuration, then Prettier defaults. */
+async function formatScript(source: string, filepath: string): Promise<string> {
+  checkedScript(source);
+  try {
+    const options = await resolveConfig(filepath);
+    return await format(source, { ...options, filepath, parser: 'typescript' });
+  } catch {
+    // User configuration can require incompatible plugins/options. Keep the
+    // generated migration usable with the bundled TypeScript formatter.
+    return format(source, { filepath, parser: 'typescript' });
+  }
+}
+
+interface ScriptStatement {
+  main: string;
+  part: string;
+}
+
+/** Bound code generation and formatting by one part, never the whole project. */
 class ScriptWriter {
-  private body = '';
-  private partBody = '';
+  private statements: ScriptStatement[] = [];
   private bodyBytes = 0;
   private parts = 0;
   private calls = 0;
   constructor(
     private directory: string,
     private companionName: string,
+    private outputPath: string,
     private maximum: number,
     private signal?: AbortSignal,
   ) {}
@@ -283,51 +302,95 @@ class ScriptWriter {
         'MIGRATION_FILE_TOO_LARGE',
         `One generated operation exceeds ${MAX_MIGRATION_CHUNK_BYTES} bytes. A TypeScript file must fit within 16 MiB including headers.`,
       );
-    if (this.body && this.bodyBytes + length > this.maximum)
+    if (this.statements.length && this.bodyBytes + length > this.maximum)
       await this.flushPart();
-    this.body += statement;
-    this.partBody += partStatement;
+    this.statements.push({ main: statement, part: partStatement });
     this.bodyBytes += length;
     if (++this.calls % 30 === 0) await setImmediate();
   }
-  private async flushPart() {
-    if (!this.body) return;
-    this.parts++;
-    await mkdir(join(this.directory, 'parts'), { recursive: true });
-    await writeFile(
-      join(
-        this.directory,
-        'parts',
-        `${String(this.parts).padStart(6, '0')}.ts`,
-      ),
-      checkedScript(
-        `import { join } from 'node:path';\nimport type { Client } from 'datocms/lib/cma-client-node';\n\nexport default async function(client: Client): Promise<void> {\n${this.partBody}\n}\n`,
-      ),
-      { flag: 'wx', mode: 0o600, signal: this.signal },
+  private async writePart(statements: ScriptStatement[]): Promise<void> {
+    assertNotAborted(this.signal);
+    const name = `${String(this.parts + 1).padStart(6, '0')}.ts`;
+    const source = `import { join } from 'node:path';
+import type { ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
+
+export default async function(client: ContentMigrationClient): Promise<void> {
+${statements.map((statement) => statement.part).join('')}
+}
+`;
+    const formatted = await formatScript(
+      source,
+      join(dirname(this.outputPath), this.companionName, 'parts', name),
     );
-    this.body = '';
-    this.partBody = '';
+    // Formatting can expand indentation/line breaks. Split between operations
+    // again after formatting, allowing one indivisible operation per part.
+    if (
+      statements.length > 1 &&
+      Buffer.byteLength(formatted) > this.maximum + 1024
+    ) {
+      const middle = Math.ceil(statements.length / 2);
+      await this.writePart(statements.slice(0, middle));
+      await this.writePart(statements.slice(middle));
+      return;
+    }
+    checkedScript(formatted);
+    await mkdir(join(this.directory, 'parts'), { recursive: true });
+    await writeFile(join(this.directory, 'parts', name), formatted, {
+      flag: 'wx',
+      mode: 0o600,
+      signal: this.signal,
+    });
+    this.parts++;
+  }
+  private async flushPart() {
+    if (!this.statements.length) return;
+    await this.writePart(this.statements);
+    this.statements = [];
     this.bodyBytes = 0;
   }
+  private mainSource(allowTemporarySchemaChanges: boolean): string {
+    const body = this.parts
+      ? `  // Parts execute sequentially and are released before loading the next.
+  for (let part = 1; part <= ${this.parts}; part++) {
+    await runMigrationPart(client, join(__dirname, ${JSON.stringify(
+      this.companionName,
+    )}, 'parts', String(part).padStart(6, '0') + '.ts'));
+  }
+`
+      : this.statements.map((statement) => statement.main).join('');
+    return `import { join } from 'node:path';
+import type { ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
+import { defineContentMigration${this.parts ? ', runMigrationPart' : ''} } from '@datocms/cli-plugin-content-diff/migration';
+
+// Run this file with datocms content:apply.
+// Review and edit these CMA operations. The runtime rebuilds their safe execution plan.
+export default defineContentMigration(
+  { baseline: join(__dirname, ${JSON.stringify(
+    this.companionName,
+  )}), allowTemporarySchemaChanges: ${allowTemporarySchemaChanges} },
+  async (client: ContentMigrationClient): Promise<void> => {
+${body || '  // No content changes.\n'}  },
+);
+`;
+  }
   async finish(allowTemporarySchemaChanges: boolean): Promise<string> {
-    let body = this.body;
-    if (this.parts) {
-      await this.flushPart();
-      body = `  // Parts execute sequentially and are released before loading the next.\n  for (let part = 1; part <= ${
-        this.parts
-      }; part++) {\n    await runMigrationPart(client, join(__dirname, ${JSON.stringify(
-        this.companionName,
-      )}, 'parts', String(part).padStart(6, '0') + '.ts'));\n  }\n`;
-    }
-    return checkedScript(
-      `import { join } from 'node:path';\nimport type { Client } from 'datocms/lib/cma-client-node';\nimport { defineContentMigration${
-        this.parts ? ', runMigrationPart' : ''
-      } } from '@datocms/cli-plugin-content-diff/migration';\n\n// Run this file with datocms content:apply.\n// Review and edit these CMA operations. The runtime rebuilds their safe execution plan.\nexport default defineContentMigration(\n  { baseline: join(__dirname, ${JSON.stringify(
-        this.companionName,
-      )}), allowTemporarySchemaChanges: ${allowTemporarySchemaChanges} },\n  async (client: Client): Promise<void> => {\n${
-        body || '  // No content changes.\n'
-      }  },\n);\n`,
+    if (this.parts) await this.flushPart();
+    let source = await formatScript(
+      this.mainSource(allowTemporarySchemaChanges),
+      this.outputPath,
     );
+    if (
+      !this.parts &&
+      this.statements.length > 1 &&
+      Buffer.byteLength(source) > this.maximum + 1024
+    ) {
+      await this.flushPart();
+      source = await formatScript(
+        this.mainSource(allowTemporarySchemaChanges),
+        this.outputPath,
+      );
+    }
+    return checkedScript(source);
   }
   async asset(statement: (path: string) => string, file: string) {
     await this.add(
@@ -339,6 +402,49 @@ class ScriptWriter {
       statement(`join(__dirname, '..', ${JSON.stringify(file)})`),
     );
   }
+}
+
+/** Display captured labels only, bounded and escaped so content cannot add code. */
+function commentLabel(value: string): string {
+  const shortened = value.length > 120 ? `${value.slice(0, 120)}…` : value;
+  return JSON.stringify(shortened)
+    .replace(/\*\//g, '*\\/')
+    .replace(/[\u2028\u2029]/g, (character) =>
+      character === '\u2028' ? '\\u2028' : '\\u2029',
+    );
+}
+function comment(action: string, subject: string, statement: string): string {
+  return `  // ${action}: ${subject}.\n${statement}`;
+}
+function recordLabel(
+  id: string,
+  modelId: string,
+  schema: PlanMetadata['schema'],
+  state?: RecordState | null,
+): string {
+  const model = schema.models.find((candidate) => candidate.id === modelId);
+  let title: string | undefined;
+  for (const key of ['title', 'name']) {
+    const field = model?.fields.find(
+      (candidate) => candidate.apiKey === key && candidate.type === 'string',
+    );
+    if (!field) continue;
+    const value = state?.current[key];
+    if (typeof value === 'string') title = value;
+    else if (field.localized && object(value))
+      for (const locale of schema.locales) {
+        if (typeof value[locale] === 'string' && value[locale]) {
+          title = value[locale];
+          break;
+        }
+      }
+    if (title) break;
+  }
+  return `${
+    model
+      ? `${commentLabel(model.name)} (${commentLabel(model.apiKey)})`
+      : commentLabel(modelId)
+  } record ${commentLabel(id)}${title ? `, ${commentLabel(title)}` : ''}`;
 }
 
 function changedFields(
@@ -390,8 +496,16 @@ async function emitRecord(
   entry: RecordPlan,
   schema: PlanMetadata['schema'],
 ) {
+  const label = recordLabel(
+    entry.id,
+    entry.modelId,
+    schema,
+    entry.desired ?? entry.baseline,
+  );
+  const add = (action: string, statement: string) =>
+    writer.add(comment(action, label, statement));
   if (entry.action === 'delete') {
-    await writer.add(call('items.destroy', entry.id));
+    await add('Delete record', call('items.destroy', entry.id));
     return;
   }
   if (!entry.desired || !['create', 'update'].includes(entry.action)) return;
@@ -409,7 +523,8 @@ async function emitRecord(
   const initial = publish ? desired.published! : desired.current;
   if (entry.action === 'create') {
     const { stage: _stage, ...creationMetadata } = metadata;
-    await writer.add(
+    await add(
+      'Create record',
       call('items.create', {
         id: entry.id,
         item_type: { id: desired.modelId, type: 'item_type' },
@@ -430,14 +545,16 @@ async function emitRecord(
         ? initialStage.id
         : null;
     if (desired.stage !== createdStage)
-      await writer.add(
+      await add(
+        'Set workflow stage',
         call('items.update', entry.id, { meta: { stage: desired.stage } }),
       );
     current = initial;
   } else if (publish) {
     const fields = changedFields(current, desired.published!);
     if (Object.keys(fields).length || Object.keys(metadata).length)
-      await writer.add(
+      await add(
+        'Update published fields',
         call('items.update', entry.id, {
           ...payloadPatch(fields, desired.modelId, schema),
           ...(Object.keys(metadata).length ? { meta: metadata } : {}),
@@ -446,13 +563,15 @@ async function emitRecord(
     current = desired.published;
   }
   if (publish)
-    await writer.add(
+    await add(
+      'Publish record',
       `  await client.items.publish(${JSON.stringify(
         entry.id,
       )}, undefined, { recursive: false });\n\n`,
     );
   if (model.draftMode && before?.published && desired.published === null)
-    await writer.add(
+    await add(
+      'Unpublish record',
       `  await client.items.unpublish(${JSON.stringify(
         entry.id,
       )}, undefined, { recursive: false });\n\n`,
@@ -462,7 +581,10 @@ async function emitRecord(
     Object.keys(fields).length ||
     (entry.action !== 'create' && !publish && Object.keys(metadata).length)
   )
-    await writer.add(
+    await add(
+      publish
+        ? 'Restore newer draft fields'
+        : 'Update record fields and metadata',
       call('items.update', entry.id, {
         ...payloadPatch(fields, desired.modelId, schema),
         ...(entry.action !== 'create' &&
@@ -479,7 +601,11 @@ async function emitRecord(
     const oldSchedule = before?.schedules[key] ?? null;
     const schedule = desired.schedules[key];
     if (hashJson(oldSchedule) === hashJson(schedule)) continue;
-    if (oldSchedule) await writer.add(call(`${resource}.destroy`, entry.id));
+    if (oldSchedule)
+      await add(
+        `Remove ${key} schedule`,
+        call(`${resource}.destroy`, entry.id),
+      );
     if (schedule) {
       const payload =
         key === 'publication'
@@ -498,7 +624,10 @@ async function emitRecord(
               unpublishing_scheduled_at: schedule.at,
               content_in_locales: desired.schedules.unpublishing!.locales,
             };
-      await writer.add(call(`${resource}.create`, entry.id, payload));
+      await add(
+        `Set ${key} schedule`,
+        call(`${resource}.create`, entry.id, payload),
+      );
     }
   }
 }
@@ -521,23 +650,32 @@ async function emitScript(
     if (!plan.desired || !['create', 'update'].includes(plan.action)) continue;
     const desired = plan.desired;
     await writer.add(
-      call(
-        `uploadCollections.${plan.action === 'create' ? 'create' : 'update'}`,
-        ...(plan.action === 'create' ? [] : [plan.id]),
-        {
-          ...(plan.action === 'create' ? { id: plan.id } : {}),
-          label: desired.label,
-          parent: desired.parentId
-            ? { id: desired.parentId, type: 'upload_collection' }
-            : null,
-          position: desired.position,
-        },
+      comment(
+        plan.action === 'create'
+          ? 'Create asset folder'
+          : 'Update asset folder',
+        `${commentLabel(desired.label)} (${commentLabel(plan.id)})`,
+        call(
+          `uploadCollections.${plan.action === 'create' ? 'create' : 'update'}`,
+          ...(plan.action === 'create' ? [] : [plan.id]),
+          {
+            ...(plan.action === 'create' ? { id: plan.id } : {}),
+            label: desired.label,
+            parent: desired.parentId
+              ? { id: desired.parentId, type: 'upload_collection' }
+              : null,
+            position: desired.position,
+          },
+        ),
       ),
     );
   }
   for (const entry of store.iteratePlan('upload')) {
     const plan = entry as UploadPlan;
     if (!plan.desired || !['create', 'update'].includes(plan.action)) continue;
+    const label = `${commentLabel(plan.desired.filename)} (${commentLabel(
+      plan.id,
+    )})`;
     const body: JsonObject = {
       ...plan.desired.attributes,
       upload_collection: plan.desired.collectionId
@@ -558,31 +696,66 @@ async function emitScript(
         );
         await writer.asset(
           (local) =>
-            `  await client.uploads.createFromLocalFile({\n    localPath: ${local},\n${encoded.slice(
-              2,
-            )});\n\n`,
+            comment(
+              'Create asset',
+              label,
+              `  await client.uploads.createFromLocalFile({\n    localPath: ${local},\n${encoded.slice(
+                2,
+              )});\n\n`,
+            ),
           asset.binary.file,
         );
       } else {
         const encoded = migrationLiteral(body, 1);
         await writer.asset(
           (local) =>
-            `  // The runtime stages this verified local binary before the CMA replacement.\n  await client.uploads.update(${JSON.stringify(
-              plan.id,
-            )}, {\n    path: ${local},\n${encoded.slice(
-              2,
-            )}, { replace_strategy: 'create_new_url' });\n\n`,
+            comment(
+              'Replace asset binary and metadata',
+              label,
+              `  // The runtime stages this verified local binary before the CMA replacement.\n  await client.uploads.update(${JSON.stringify(
+                plan.id,
+              )}, {\n    path: ${local},\n${encoded.slice(
+                2,
+              )}, { replace_strategy: 'create_new_url' });\n\n`,
+            ),
           asset.binary.file,
         );
       }
-    } else await writer.add(call('uploads.update', plan.id, body));
+    } else
+      await writer.add(
+        comment(
+          'Update asset metadata',
+          label,
+          call('uploads.update', plan.id, body),
+        ),
+      );
   }
   for (const entry of store.iteratePlan('record'))
     await emitRecord(writer, entry as RecordPlan, metadata.schema);
-  for (const entry of store.iteratePlan('upload', 'delete'))
-    await writer.add(call('uploads.destroy', entry.id));
-  for (const entry of store.iteratePlan('collection', 'delete'))
-    await writer.add(call('uploadCollections.destroy', entry.id));
+  for (const entry of store.iteratePlan('upload', 'delete')) {
+    const plan = entry as UploadPlan;
+    await writer.add(
+      comment(
+        'Delete asset',
+        `${commentLabel(plan.baseline?.filename ?? '')} (${commentLabel(
+          plan.id,
+        )})`,
+        call('uploads.destroy', entry.id),
+      ),
+    );
+  }
+  for (const entry of store.iteratePlan('collection', 'delete')) {
+    const plan = entry as CollectionPlan;
+    await writer.add(
+      comment(
+        'Delete asset folder',
+        `${commentLabel(plan.baseline?.label ?? '')} (${commentLabel(
+          plan.id,
+        )})`,
+        call('uploadCollections.destroy', entry.id),
+      ),
+    );
+  }
 
   // Reconcile complete affected groups, including unchanged siblings whose
   // positions can shift as explicit create/update/delete intent is recorded.
@@ -661,22 +834,30 @@ async function emitScript(
         .iterate()) {
         if (row.kind === 'collection')
           await writer.add(
-            call('uploadCollections.update', row.id, {
-              parent: row.parent_id
-                ? { id: row.parent_id, type: 'upload_collection' }
-                : null,
-              position: row.position,
-            }),
+            comment(
+              `Restore asset folder order (pass ${pass + 1}/2)`,
+              commentLabel(String(row.id)),
+              call('uploadCollections.update', row.id, {
+                parent: row.parent_id
+                  ? { id: row.parent_id, type: 'upload_collection' }
+                  : null,
+                position: row.position,
+              }),
+            ),
           );
         else {
           const model = metadata.schema.models.find(
             (candidate) => candidate.id === row.model_id,
           )!;
           await writer.add(
-            call('items.update', row.id, {
-              ...(model.tree ? { parent_id: row.parent_id } : {}),
-              position: row.position,
-            }),
+            comment(
+              `Restore record order (pass ${pass + 1}/2)`,
+              recordLabel(String(row.id), model.id, metadata.schema),
+              call('items.update', row.id, {
+                ...(model.tree ? { parent_id: row.parent_id } : {}),
+                position: row.position,
+              }),
+            ),
           );
         }
       }
@@ -842,6 +1023,7 @@ export async function writeMigration(args: {
     const scriptWriter = new ScriptWriter(
       staging,
       companionName,
+      output,
       maximum,
       signal,
     );

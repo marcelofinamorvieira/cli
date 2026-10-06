@@ -874,6 +874,7 @@ function sdk(initial: RecordState[] = []) {
             read_only_mode: false,
             primary: id === 'destination' && primary,
             forked_from: id === 'destination' ? null : 'destination',
+            created_at: '2026-01-01T00:00:00.000Z',
           },
         };
       },
@@ -890,7 +891,13 @@ function sdk(initial: RecordState[] = []) {
         );
         afterNextFork?.();
         afterNextFork = undefined;
-        return { id: body.id, meta: { read_only_mode: false } };
+        return {
+          id: body.id,
+          meta: {
+            read_only_mode: false,
+            created_at: '2026-01-01T00:00:00.000Z',
+          },
+        };
       },
       destroy: async (id: string) => {
         events.push(`delete-fork:${id}`);
@@ -1437,6 +1444,367 @@ describe('apply executor with the SDK resource contract', () => {
   });
   afterEach(() => {
     rmSync(directory, { recursive: true, force: true });
+  });
+
+  it('uses an explicitly named fork and keeps the original destination intact', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    const result = await applyBundle({
+      rootClient: mock.root,
+      buildEnvironmentClient: mock.client,
+      bundlePath,
+      options: { ...defaults, forkName: 'content-review-42' },
+    });
+    assert.equal(result.environmentId, 'content-review-42');
+    assert.equal(
+      mock.environments.get('destination')!.get(recordId)!.current.title,
+      'old',
+    );
+    assert.equal(
+      mock.environments.get('content-review-42')!.get(recordId)!.current.title,
+      'new',
+    );
+  });
+
+  it('rejects empty or invalid fork names and in-place combinations before any API call', async () => {
+    const mock = sdk();
+    for (const options of [
+      ...[
+        '',
+        'Capital',
+        'two words',
+        'under_score',
+        '../escape',
+        'line\nname',
+        'trailing\n',
+      ].map((forkName) => ({ ...defaults, forkName })),
+      { ...defaults, forkName: 'valid-name', inPlace: true },
+    ]) {
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: () => {
+            throw new Error('unexpected API client');
+          },
+          bundlePath: 'missing',
+          options,
+        }),
+        (error: unknown) =>
+          error instanceof ContentError && error.code === 'INVALID_FORK_NAME',
+      );
+    }
+    assert.deepEqual(mock.events, []);
+  });
+
+  it('refuses a name already in use without touching that environment', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    mock.environments.set('existing-review', new Map());
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    for (const dryRun of [false, true]) {
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: { ...defaults, forkName: 'existing-review', dryRun },
+        }),
+        (error: unknown) =>
+          error instanceof ContentError && error.code === 'FORK_ID_COLLISION',
+      );
+      assert(mock.environments.has('existing-review'));
+      assert.deepEqual(mock.events, []);
+    }
+  });
+
+  it('never deletes a concurrent winner or an uncertain fork after a rejected creation request', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    for (const existsAfterFailure of [false, true]) {
+      Reflect.set(mock.root.environments, 'fork', async () => {
+        if (existsAfterFailure)
+          mock.environments.set('claimed-review', new Map());
+        throw new Error('fork request failed');
+      });
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: { ...defaults, forkName: 'claimed-review' },
+        }),
+        (error: Error & { unconfirmedForkEnvironmentId?: string }) => {
+          assert.match(error.message, /fork request failed/);
+          assert.equal(error.unconfirmedForkEnvironmentId, 'claimed-review');
+          return true;
+        },
+      );
+      assert.equal(mock.environments.has('claimed-review'), existsAfterFailure);
+      assert.deepEqual(mock.events, []);
+    }
+  });
+
+  it('does not delete a replacement environment with the same name after owned creation', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    const fork = mock.root.environments.fork.bind(mock.root.environments);
+    const find = mock.root.environments.find.bind(mock.root.environments);
+    Reflect.set(
+      mock.root.environments,
+      'fork',
+      async (...args: Parameters<typeof fork>) => ({
+        ...(await fork(...args)),
+        meta: { created_at: '2026-01-01T00:00:00.000Z' },
+      }),
+    );
+    Reflect.set(mock.root.environments, 'find', async (id: string) => {
+      const found = await find(id);
+      return {
+        ...found,
+        meta: { ...found.meta, created_at: '2026-01-02T00:00:00.000Z' },
+      };
+    });
+    mock.fail(recordId);
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: { ...defaults, forkName: 'reused-review' },
+      }),
+      /ownership could not be proven/,
+    );
+    assert(mock.environments.has('reused-review'));
+    assert(!mock.events.some((event) => event.startsWith('delete-fork:')));
+    assert(!mock.events.some((event) => event.startsWith('update:')));
+  });
+
+  it('retains an environment when a creation response omits its lifetime identity', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    const fork = mock.root.environments.fork.bind(mock.root.environments);
+    Reflect.set(
+      mock.root.environments,
+      'fork',
+      async (...args: Parameters<typeof fork>) => ({
+        ...(await fork(...args)),
+        meta: {},
+      }),
+    );
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: { ...defaults, forkName: 'unconfirmed-review' },
+      }),
+      (error: unknown) =>
+        error instanceof ContentError && error.code === 'FORK_VERIFY_FAILED',
+    );
+    assert(mock.environments.has('unconfirmed-review'));
+    assert.deepEqual(mock.events, ['fork:unconfirmed-review']);
+  });
+
+  it('previews schema, content and schedule changes without locks or any mutation', async () => {
+    const baseline = state(
+      { title: 'old' },
+      {
+        schedules: {
+          publication: { at: '2099-01-01T00:00:00.000Z', selective: null },
+          unpublishing: null,
+        },
+      },
+    );
+    const mock = sdk([baseline]);
+    mock.requireField();
+    const changes: TemporarySchemaChange[] = [
+      {
+        fieldId: 'cccccccccccccccccccccc',
+        modelId,
+        original: { validators: { required: {} }, defaultValue: 'automatic' },
+        temporary: { validators: {}, defaultValue: null },
+        reasons: ['temporary validation'],
+      },
+    ];
+    const bundlePath = await bundle(
+      directory,
+      mock,
+      [plan(baseline, state({ title: 'new' }))],
+      [modelId],
+      changes,
+    );
+    const originalLock = environmentLock.lockEnvironment;
+    Reflect.set(environmentLock, 'lockEnvironment', async () => {
+      throw new Error('preview attempted a lock');
+    });
+    try {
+      for (const inPlace of [false, true]) {
+        const result = await applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: {
+            ...defaults,
+            inPlace,
+            dryRun: true,
+            allowTemporarySchemaChanges: true,
+          },
+        });
+        assert('dryRun' in result && result.dryRun);
+        assert.equal(result.mutations, 0);
+        assert.equal(result.counts.record.update, 1);
+        assert.equal(result.temporarySchemaChanges, 1);
+        assert.equal(result.groups[0].model?.apiKey, 'page');
+        assert.deepEqual(mock.events, []);
+        assert.equal(mock.environments.size, 1);
+        assert.deepEqual(
+          mock.environments.get('destination')!.get(recordId),
+          baseline,
+        );
+      }
+    } finally {
+      Reflect.set(environmentLock, 'lockEnvironment', originalLock);
+    }
+  });
+
+  it('preview preserves the same baseline, permission and schedule refusals without writes', async () => {
+    for (const failure of [
+      'baseline',
+      'schema permission',
+      'primary',
+      'schedule',
+    ]) {
+      const runDirectory = join(directory, failure.replace(' ', '-'));
+      mkdirSync(runDirectory);
+      const baseline = state({ title: 'old' });
+      const desired = state(
+        { title: 'new' },
+        failure === 'schedule'
+          ? {
+              schedules: {
+                publication: {
+                  at: new Date(Date.now() + 60_000).toISOString(),
+                  selective: null,
+                },
+                unpublishing: null,
+              },
+            }
+          : {},
+      );
+      const mock = sdk([baseline]);
+      if (failure === 'primary') mock.setPrimary();
+      const bundlePath = await bundle(runDirectory, mock, [
+        plan(baseline, desired),
+      ]);
+      if (failure === 'baseline')
+        mock.environments.get('destination')!.get(recordId)!.current.title =
+          'someone else';
+      const client = mock.client;
+      if (failure === 'schema permission')
+        mock.client = (id) => {
+          const result = client(id);
+          Reflect.set(result.users, 'findMe', async () => {
+            throw new Error('permission denied');
+          });
+          return result;
+        };
+      await assert.rejects(
+        applyBundle({
+          rootClient: mock.root,
+          buildEnvironmentClient: mock.client,
+          bundlePath,
+          options: {
+            ...defaults,
+            dryRun: true,
+            inPlace: failure === 'primary',
+          },
+        }),
+        failure === 'baseline'
+          ? /baseline/
+          : failure === 'schedule'
+            ? /schedule window/
+            : failure === 'primary'
+              ? /allow-primary/
+              : /permission denied/,
+      );
+      assert.deepEqual(mock.events, []);
+      assert.equal(mock.environments.size, 1);
+    }
+  });
+
+  it('groups actual verified writes by model and phase without per-record messages or no-op progress', async () => {
+    const originals = Array.from({ length: 120 }, (_, index) =>
+      state({ title: `old ${index}` }, { id: String(index).padStart(22, '0') }),
+    );
+    const mock = sdk(originals);
+    const bundlePath = await bundle(
+      directory,
+      mock,
+      originals.map((original) =>
+        plan(original, state({ title: 'new' }, { id: original.id })),
+      ),
+    );
+    const progress: string[] = [];
+    await applyBundle({
+      rootClient: mock.root,
+      buildEnvironmentClient: mock.client,
+      bundlePath,
+      options: {
+        ...defaults,
+        inPlace: true,
+        log: (message) => {
+          if (message.includes('completed and verified')) {
+            assert(mock.events.some((event) => event.startsWith('update:')));
+            progress.push(message);
+          }
+        },
+      },
+    });
+    assert.deepEqual(progress, [
+      'update records / current state / "Page" (page): 120 completed and verified.',
+    ]);
+  });
+
+  it('does not report a failed record write as verified progress', async () => {
+    const baseline = state({ title: 'old' });
+    const mock = sdk([baseline]);
+    const bundlePath = await bundle(directory, mock, [
+      plan(baseline, state({ title: 'new' })),
+    ]);
+    mock.afterNextUpdate((record) => {
+      record.current.title = 'concurrent';
+    });
+    const progress: string[] = [];
+    await assert.rejects(
+      applyBundle({
+        rootClient: mock.root,
+        buildEnvironmentClient: mock.client,
+        bundlePath,
+        options: {
+          ...defaults,
+          inPlace: true,
+          log: (message) => progress.push(message),
+        },
+      }),
+      /changed during|did not converge/,
+    );
+    assert(
+      !progress.some((message) => message.includes('completed and verified')),
+    );
   });
 
   it('copies sparse collection positions and rejects position-only baseline drift', async () => {
@@ -2597,13 +2965,17 @@ describe('apply executor with the SDK resource contract', () => {
         rootClient: mock.root,
         buildEnvironmentClient: mock.client,
         bundlePath,
-        options: { ...defaults, signal: controller.signal },
+        options: {
+          ...defaults,
+          forkName: 'interrupted-review',
+          signal: controller.signal,
+        },
       }),
       (error: unknown) =>
         error instanceof ContentError && error.code === 'INTERRUPTED',
     );
     assert.equal(mock.environments.size, 1);
-    assert(mock.events.some((event) => event.startsWith('delete-fork:')));
+    assert(mock.events.includes('delete-fork:interrupted-review'));
     assert(!mock.events.some((event) => event.startsWith('update:')));
   });
 
@@ -3377,7 +3749,7 @@ describe('apply executor with the SDK resource contract', () => {
           rootClient: mock.root,
           buildEnvironmentClient: mock.client,
           bundlePath,
-          options: { ...defaults, keepFailedFork },
+          options: { ...defaults, forkName: 'failed-review', keepFailedFork },
         }),
         (error: Error & { keptForkEnvironmentId?: string }) => {
           assert.match(error.message, /injected update failure/);
@@ -3387,6 +3759,8 @@ describe('apply executor with the SDK resource contract', () => {
               mock.environments.has(error.keptForkEnvironmentId),
             keepFailedFork,
           );
+          if (keepFailedFork)
+            assert.equal(error.keptForkEnvironmentId, 'failed-review');
           return true;
         },
       );

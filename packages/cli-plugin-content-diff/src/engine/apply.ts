@@ -35,6 +35,7 @@ import {
 } from './codec';
 import { lockEnvironment, unlockEnvironment } from './environment-lock';
 import { ContentError } from './errors';
+import { buildPlanPreview } from './migration-preview';
 import { collectionTransitionIssues, orderedCollectionWrites } from './planner';
 import {
   assertApplyAccess,
@@ -44,7 +45,7 @@ import {
 import { SnapshotStore } from './store';
 import type {
   ApplyOptions,
-  ApplyResult,
+  ApplyOutcome,
   Client,
   CollectionPlan,
   CollectionState,
@@ -64,6 +65,50 @@ import type {
 } from './types';
 
 const emptySchedules: Schedules = { publication: null, unpublishing: null };
+
+/** One counter per model/action, never one object per record. */
+class ExecutionProgress {
+  private readonly groups = new Map<
+    string,
+    { completed: number; reported: number }
+  >();
+  private lastReport = Date.now();
+
+  constructor(private readonly log?: ApplyOptions['log']) {}
+
+  completed(group: string): void {
+    if (!this.log) return;
+    const count = this.groups.get(group) ?? { completed: 0, reported: 0 };
+    count.completed++;
+    this.groups.set(group, count);
+    if (Date.now() - this.lastReport >= 5_000) this.flush();
+  }
+
+  flush(): void {
+    this.lastReport = Date.now();
+    for (const [group, count] of this.groups) {
+      if (count.completed === count.reported) continue;
+      this.log?.(`${group}: ${count.completed} completed and verified.`);
+      count.reported = count.completed;
+    }
+  }
+}
+
+export function validateForkName(
+  options: Pick<ApplyOptions, 'forkName' | 'inPlace'>,
+): void {
+  if (options.forkName === undefined) return;
+  if (options.inPlace)
+    throw new ContentError(
+      'INVALID_FORK_NAME',
+      '--fork-name cannot be used with --in-place.',
+    );
+  if (!options.forkName || /[^a-z0-9-]/.test(options.forkName))
+    throw new ContentError(
+      'INVALID_FORK_NAME',
+      'Fork names must contain only lowercase letters, numbers, and dashes, and cannot be empty.',
+    );
+}
 
 function conflict(kind: Kind, id: string, reason: string): never {
   throw new ContentError('APPLY_CONFLICT', `${kind} ${id}: ${reason}`);
@@ -173,6 +218,7 @@ interface Context {
   repairOnly?: boolean;
   signal?: AbortSignal;
   log?: ApplyOptions['log'];
+  progress?: ExecutionProgress;
 }
 
 function scheduleNeedsValidity(context: Context, record: RecordState): boolean {
@@ -280,9 +326,15 @@ async function recordPhase(
   context: Context,
   actions: string[],
   order: 'createOrder' | 'updateOrder' | 'publishOrder' | 'deleteOrder',
+  phase: string,
   work: (entry: RecordPlan) => Promise<void>,
 ): Promise<void> {
   const models = modelIndex(context.schema);
+  const progressState = context.log
+    ? context.store.database.prepare(
+        "SELECT hash,json_extract(state_json,'$.currentVersion') AS version FROM records WHERE side='live' AND id=?",
+      )
+    : undefined;
   const dependencyModelId = context.store.database.prepare(
     "SELECT model_id FROM records WHERE side='live' AND id=? UNION ALL SELECT model_id FROM plan WHERE kind='record' AND id=? LIMIT 1",
   );
@@ -297,7 +349,24 @@ async function recordPhase(
     await boundedWork(
       records(context, actions, order, Number(row.rank)),
       context.concurrency,
-      work,
+      async (entry) => {
+        const before = progressState?.get(entry.id);
+        await work(entry);
+        const after = progressState?.get(entry.id);
+        // A publication/current pass can legitimately be a no-op. Report only
+        // a completed, guarded change; concurrent workers have independent IDs.
+        if (
+          before?.hash !== after?.hash ||
+          before?.version !== after?.version
+        ) {
+          const model = models.get(entry.modelId)!;
+          context.progress?.completed(
+            `${entry.action} records / ${phase} / ${JSON.stringify(
+              model.name,
+            )} (${model.apiKey})`,
+          );
+        }
+      },
       (entry) => {
         const model = models.get(entry.modelId)!;
         // CMA renumbers siblings when inserting, removing, or moving. Serialize
@@ -329,6 +398,7 @@ async function recordPhase(
       context.signal,
     );
   }
+  context.progress?.flush();
 }
 
 async function focusedRecord(
@@ -2228,10 +2298,12 @@ export async function applyBundle(args: {
     };
     release?: () => void;
   };
-}): Promise<ApplyResult> {
+}): Promise<ApplyOutcome> {
   const store = new SnapshotStore();
   let ownedFork: string | undefined;
   let forkRequested = false;
+  let forkConfirmed = false;
+  let forkCreatedAt: string | undefined;
   let context: Context | undefined;
   let changedSchema = false;
   let destinationLocked = false;
@@ -2247,6 +2319,7 @@ export async function applyBundle(args: {
   };
   try {
     assertNotAborted(args.options.signal);
+    validateForkName(args.options);
     if (
       args.options.concurrency !== undefined &&
       (!Number.isSafeInteger(args.options.concurrency) ||
@@ -2371,7 +2444,20 @@ export async function applyBundle(args: {
         'Applying in place to primary requires --allow-primary.',
       );
     }
-    destinationLocked = await lockEnvironment(targetClient, destinationId);
+    if (!args.options.inPlace) {
+      const requestedName =
+        args.options.forkName ?? `content-apply-${randomUUID()}`;
+      if (
+        await findMaybe(() => args.rootClient.environments.find(requestedName))
+      )
+        throw new ContentError(
+          'FORK_ID_COLLISION',
+          `Environment "${requestedName}" already exists. Choose another --fork-name.`,
+        );
+      if (!args.options.dryRun) ownedFork = requestedName;
+    }
+    if (!args.options.dryRun)
+      destinationLocked = await lockEnvironment(targetClient, destinationId);
     context = {
       client: targetClient,
       store,
@@ -2395,21 +2481,13 @@ export async function applyBundle(args: {
           .get(),
       signal: args.options.signal,
       log: args.options.log,
+      progress: new ExecutionProgress(args.options.log),
     };
     // DatoCMS exposes no persistent sandbox freeze. Maintenance mode applies
     // only to primary and is not an immutable snapshot or a transaction. These
     // complete baseline and focused checks reduce races; apply is not atomic.
     let environmentId = destinationId;
-    if (!args.options.inPlace) {
-      ownedFork = `content-apply-${randomUUID()}`;
-      if (
-        await findMaybe(() => args.rootClient.environments.find(ownedFork!))
-      ) {
-        throw new ContentError(
-          'FORK_ID_COLLISION',
-          'Generated fork ID is already in use.',
-        );
-      }
+    if (ownedFork) {
       forkRequested = true;
       assertNotAborted(context.signal);
       // DatoCMS copies the environment in the background. Request the fork
@@ -2428,11 +2506,20 @@ export async function applyBundle(args: {
           ...(args.options.fastFork ? { fast: true } : {}),
         },
       );
-      if (requested.id !== ownedFork)
+      if (
+        requested.id !== ownedFork ||
+        typeof requested.meta.created_at !== 'string' ||
+        !Number.isFinite(Date.parse(requested.meta.created_at))
+      )
         throw new ContentError(
           'FORK_VERIFY_FAILED',
-          'DatoCMS created the fork under another ID.',
+          'DatoCMS did not confirm the requested fork identity and creation time.',
         );
+      // A name can be claimed between the existence check and creation. A
+      // rejected request proves no ownership, even if that same name now exists
+      // and was forked from our destination. Never clean up that other run.
+      forkConfirmed = true;
+      forkCreatedAt = requested.meta.created_at;
     }
     context.log?.(`Verifying destination baseline in "${destinationId}".`);
     if (reusedSnapshot) await verifyPreparedBaseline(context, destinationId);
@@ -2440,6 +2527,11 @@ export async function applyBundle(args: {
     validateBundlePreflight(context);
     if (context.writesPlanned)
       assertScheduleWindow(context, args.options.scheduleWindowMinutes ?? 120);
+    if (args.options.dryRun) {
+      assertNotAborted(context.signal);
+      complete = true;
+      return buildPlanPreview(store, manifest, destinationId);
+    }
     preserveBaseline(context);
     if (ownedFork) {
       const fork = await waitForFork(
@@ -2448,7 +2540,13 @@ export async function applyBundle(args: {
         context.log,
         context.signal,
       );
-      if (fork.id !== ownedFork || fork.meta.read_only_mode) {
+      if (
+        fork.id !== ownedFork ||
+        fork.meta.read_only_mode ||
+        fork.meta.primary ||
+        fork.meta.forked_from !== destinationId ||
+        fork.meta.created_at !== forkCreatedAt
+      ) {
         throw new ContentError(
           'FORK_VERIFY_FAILED',
           'The owned fork is not a regular writable fork.',
@@ -2506,50 +2604,75 @@ export async function applyBundle(args: {
     // array of all collection payloads. CROSS JOIN fixes the recursive row as
     // the outer loop; unary + removes TEXT affinity without changing its ID,
     // allowing the JSON-parent expression index to seek each child's parent.
-    for (const entry of orderedCollections(context, false))
+    for (const entry of orderedCollections(context, false)) {
       await collection(context, entry);
+      context.progress?.completed(`${entry.action} asset folders`);
+    }
+    context.progress?.flush();
     await boundedWork(
       store.iteratePlan('upload'),
       context.concurrency,
       async (entry) => {
-        if (entry.action === 'create' || entry.action === 'update')
+        if (entry.action === 'create' || entry.action === 'update') {
           await upload(context!, entry as UploadPlan);
+          context!.progress?.completed(`${entry.action} assets`);
+        }
       },
       undefined,
       context.signal,
     );
-    await recordPhase(context, ['create'], 'createOrder', (entry) =>
+    context.progress?.flush();
+    await recordPhase(context, ['create'], 'createOrder', 'creation', (entry) =>
       createRecord(context!, entry),
     );
-    await recordPhase(context, ['create', 'update'], 'publishOrder', (entry) =>
-      publication(context!, entry),
+    await recordPhase(
+      context,
+      ['create', 'update'],
+      'publishOrder',
+      'publication',
+      (entry) => publication(context!, entry),
     );
     // Every record is now published as planned, except cycle members that were
     // published without their cycle links. Restore and republish those before
     // the current phase, which would otherwise be overwritten by this write.
-    await recordPhase(context, ['create', 'update'], 'publishOrder', (entry) =>
-      entry.execution?.provisionalPublished
-        ? publication(context!, entry, true)
-        : Promise.resolve(),
+    await recordPhase(
+      context,
+      ['create', 'update'],
+      'publishOrder',
+      'publication links',
+      (entry) =>
+        entry.execution?.provisionalPublished
+          ? publication(context!, entry, true)
+          : Promise.resolve(),
     );
-    await recordPhase(context, ['create', 'update'], 'updateOrder', (entry) =>
-      current(context!, entry),
+    await recordPhase(
+      context,
+      ['create', 'update'],
+      'updateOrder',
+      'current state',
+      (entry) => current(context!, entry),
     );
-    await recordPhase(context, ['delete'], 'deleteOrder', async (entry) => {
-      const ordering = await orderingBefore(context!, entry, null);
-      await noReferrers(context!, entry, false);
-      const live = await guardRecord(context!, entry.id);
-      if (live) assertRecordWritable(context!, live);
-      assertNotAborted(context!.signal);
-      await context!.client.items.destroy(entry.id);
-      context!.mutations++;
-      if (await focusedRecord(context!, entry.id))
-        conflict('record', entry.id, 'record remained after deletion');
-      store.database
-        .prepare("DELETE FROM records WHERE side='live' AND id=?")
-        .run(entry.id);
-      if (ordering) await orderingAfter(context!, entry);
-    });
+    await recordPhase(
+      context,
+      ['delete'],
+      'deleteOrder',
+      'deletion',
+      async (entry) => {
+        const ordering = await orderingBefore(context!, entry, null);
+        await noReferrers(context!, entry, false);
+        const live = await guardRecord(context!, entry.id);
+        if (live) assertRecordWritable(context!, live);
+        assertNotAborted(context!.signal);
+        await context!.client.items.destroy(entry.id);
+        context!.mutations++;
+        if (await focusedRecord(context!, entry.id))
+          conflict('record', entry.id, 'record remained after deletion');
+        store.database
+          .prepare("DELETE FROM records WHERE side='live' AND id=?")
+          .run(entry.id);
+        if (ordering) await orderingAfter(context!, entry);
+      },
+    );
     await reconcileOrdering(context);
     for (const entry of store.iteratePlan('upload', 'delete')) {
       assertNotAborted(context.signal);
@@ -2568,6 +2691,9 @@ export async function applyBundle(args: {
       assertNotAborted(context.signal);
       await context.client.uploads.destroy(entry.id);
       context.mutations++;
+      if (await findMaybe(() => context!.client.uploads.find(entry.id)))
+        conflict('upload', entry.id, 'asset remained after deletion');
+      context.progress?.completed('delete assets');
     }
     // Collection deletion is child-first; uploads have already been moved or
     // removed. The CMA rejects any remaining dependency rather than cascading.
@@ -2605,7 +2731,9 @@ export async function applyBundle(args: {
       store.database
         .prepare("DELETE FROM collections WHERE side='live' AND id=?")
         .run(entry.id);
+      context.progress?.completed('delete asset folders');
     }
+    context.progress?.flush();
     await reconcileCollectionOrdering(context);
     // Deletions and ordered writes can shift positions. Reconcile after them
     // and before the final full capture, preserving every managed and
@@ -2622,8 +2750,12 @@ export async function applyBundle(args: {
         )
         .get(...ordered)
     )
-      await recordPhase(context, ['create', 'update'], 'updateOrder', (entry) =>
-        current(context!, entry),
+      await recordPhase(
+        context,
+        ['create', 'update'],
+        'updateOrder',
+        'ordering reconciliation',
+        (entry) => current(context!, entry),
       );
     if (changedSchema) {
       await temporarySchema(context, true);
@@ -2785,7 +2917,7 @@ export async function applyBundle(args: {
         }
       }
     }
-    if (ownedFork && forkRequested && !args.options.keepFailedFork) {
+    if (ownedFork && forkConfirmed && !args.options.keepFailedFork) {
       try {
         // A fork requested without waiting may still be copying; it can only
         // be deleted once DatoCMS has finished creating it.
@@ -2809,6 +2941,8 @@ export async function applyBundle(args: {
         );
         if (
           fork &&
+          !fork.meta.primary &&
+          fork.meta.created_at === forkCreatedAt &&
           fork.meta.forked_from ===
             (args.options.destinationEnvironmentId ??
               context?.manifest.destination.environmentId)
@@ -2828,6 +2962,13 @@ export async function applyBundle(args: {
       } catch (repair) {
         recordRepairFailure(`Failed fork ${ownedFork}: ${String(repair)}`);
       }
+    }
+    if (ownedFork && forkRequested && !forkConfirmed) {
+      args.options.log?.(
+        `Fork request for "${ownedFork}" did not return confirmed ownership; no environment cleanup was attempted.`,
+      );
+      if (error instanceof Error)
+        Object.assign(error, { unconfirmedForkEnvironmentId: ownedFork });
     }
     const failure = repairFailureCount
       ? new ContentError(
@@ -2850,7 +2991,7 @@ export async function applyBundle(args: {
     // fork is also named on the reported failure.
     if (
       ownedFork &&
-      forkRequested &&
+      forkConfirmed &&
       args.options.keepFailedFork &&
       failure instanceof Error
     )
@@ -2876,7 +3017,8 @@ export async function applyBundle(args: {
     // The bundle is an export and survives both success and failure. Only the
     // SQLite workspace owned by this execution is disposed here.
     store.dispose();
-    if (!complete && ownedFork && forkRequested && args.options.keepFailedFork)
+    context?.progress?.flush();
+    if (!complete && ownedFork && forkConfirmed && args.options.keepFailedFork)
       args.options.log?.(`Kept failed fork ${ownedFork}`);
   }
 }

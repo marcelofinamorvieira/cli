@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { afterEach, beforeEach, describe, it } from 'mocha';
-import type { Client } from '../../src/engine/types';
+import type { ContentMigrationClient } from '../../src/migration';
 import { defineContentMigration, runMigrationPart } from '../../src/migration';
 
 function deferred() {
@@ -14,8 +14,10 @@ function deferred() {
   });
   return { promise, resolve };
 }
-function client(update: (...args: unknown[]) => unknown): Client {
-  return { items: { update } } as unknown as Client;
+function client(
+  update: (...args: unknown[]) => unknown,
+): ContentMigrationClient {
+  return { items: { update } } as unknown as ContentMigrationClient;
 }
 
 describe('content migration part lifecycle', () => {

@@ -37,7 +37,8 @@
     "@oclif/core": "^4",
     "tslib": "^2.8.1",
     "typescript": "5.7.2",
-    "lodash": "^4.17.21"
+    "lodash": "^4.17.21",
+    "prettier": "^3.4.2"
   },
   "devDependencies": {
     "@datocms/cma-client": "^6.1.0",

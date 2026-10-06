@@ -33,19 +33,21 @@ This creates a native-style file such as `migrations/content/1791200000_syncCont
 
 `--output=./review/content.ts` chooses an exact filename. `--output=./review` chooses a directory and keeps automatic timestamped naming. Existing scripts and companion directories are never overwritten.
 
-A small generated migration contains readable operations like this:
+Generated comments identify models, record IDs and available title/name values, with labels for lifecycle, asset, folder, schedule and ordering operations. Scripts use project Prettier settings resolved at their final paths; invalid configuration falls back to Prettier defaults. Each bounded part is formatted separately and checked against the file-size limit. A small generated migration contains operations like this:
 
 ```ts
 import { join } from 'node:path';
-import type { Client } from 'datocms/lib/cma-client-node';
-import { defineContentMigration } from '@datocms/cli-plugin-content-diff/migration';
+import {
+  type ContentMigrationClient,
+  defineContentMigration,
+} from '@datocms/cli-plugin-content-diff/migration';
 
 export default defineContentMigration(
   {
     baseline: join(__dirname, '1791200000_syncContent.content'),
     allowTemporarySchemaChanges: false,
   },
-  async (client: Client): Promise<void> => {
+  async (client: ContentMigrationClient): Promise<void> => {
     await client.items.update('AbCdEfGhIjKlMnOpQrStUv', {
       summary: { en: 'Updated procurement guidance.' },
     });
@@ -55,7 +57,7 @@ export default defineContentMigration(
 
 **The TypeScript calls define the intended changes.** Apply records those calls locally, rebuilds the complete desired state and dependency plan, and checks it before submitting content writes. Editing a payload changes what will be applied. A field omitted from an update keeps its destination value. Records the script does not mention are preserved.
 
-The supplied client supports the content operations the planner can prove safe; unsupported methods or properties are rejected. Creates need explicit portable IDs so links, blocks, and later operations can refer to the same identities. Record changes must stay within the model scope selected during generation. Align source and destination schemas before generating a content migration.
+The exported `ContentMigrationClient` type exposes the supported record, asset, folder and schedule mutations. Autocomplete and TypeScript reject unsupported reads, schema operations and client configuration. Returned values describe local intended content, not server responses with version metadata or CDN URLs. Runtime validation still checks field values, dependencies and the captured schema. Creates need explicit portable IDs so links, blocks, and later operations can refer to the same identities. Record changes must stay within the model scope selected during generation. Align source and destination schemas before generating a content migration.
 
 Generated migrations are **trusted executable Node.js code**. Only calls made through the supplied recording client follow the managed content workflow. Arbitrary imports, filesystem access, and other code are not sandboxed.
 
@@ -112,6 +114,8 @@ Apply checks the companion, destination project/schema, and complete baseline, e
 
 | Flag | Behavior |
 | --- | --- |
+| `--dry-run` | Validate the edited script and preview its rebuilt plan without plugin-owned remote writes or a fork. |
+| `--fork-name=content-review` | Name the newly created fork; existing names are refused. Incompatible with `--in-place` and `--repair`. |
 | `--in-place` | Write directly into the destination environment. |
 | `--allow-primary` | Additionally authorize primary writes; requires `--in-place` or `--repair`. |
 | `--keep-failed-fork` | Keep a fork created by this apply after failure. |
@@ -122,7 +126,24 @@ Apply checks the companion, destination project/schema, and complete baseline, e
 | `--allow-temporary-schema-changes` | Authorize supported temporary changes required by the rebuilt plan. |
 | `--concurrency=8` | Bound independent requests to 1–16; dependent writes retain their required order. |
 
+Execution reports verified record changes by model, action and phase, and groups asset and folder changes. Counts are cumulative per phase and do not represent unique records or exact API request totals. Messages come from actual execution, not local script recording.
+
+`--destination` selects the existing environment to compare and fork; `--fork-name` names the new result. Names may contain lowercase letters, numbers and dashes. If a fork request fails without confirming its identity, the plugin reports the unconfirmed name and leaves it alone; it never infers ownership from a matching name.
+
 Only records being written have their schedules cancelled and later restored to the exact intended future dates. Other schedules are left alone. The schedule window includes existing destination schedules and intended schedules. Temporary field settings are restored before success. On failure, an owned fork is deleted unless explicitly retained; pre-existing environments are never deleted.
+
+### Preview an edited migration
+
+```sh
+npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
+  --dry-run --fork-name=content-review --profile=target-project
+```
+
+Dry-run verifies the companion, destination baseline, permissions, schema, requested fork-name availability and schedule window. It evaluates the edited TypeScript locally, uses native validation endpoints when required, and rebuilds the dependency plan. It stops before locks, fork creation, uploads, record writes, schedule changes or temporary schema changes. It still reads the full managed namespace and can take significant time on a large project. Use the same authorization flags as the intended apply, including `--allow-temporary-schema-changes` when needed.
+
+The terminal summary groups creates, updates and deletions by model and asset resource. `--json` returns `dryRun: true`, `mutations: 0`, overall `counts`, changed `groups`, `temporarySchemaChanges` and `partial`. Counts describe planned entities, not API requests; lifecycle, ordering and cycle handling may require multiple writes per entity. Originally skipped content remains omitted and is indicated by `partial`.
+
+This preview does not reserve the fork name or freeze the environment. A later apply repeats its checks and can fail if the destination or schedules change. The supplied recording client makes no content writes during dry-run, but migration code and formatter configuration remain trusted executable code: independently constructed clients, filesystem operations and arbitrary imports are not sandboxed. Dry-run cannot be combined with `--repair` or `--keep-failed-fork`.
 
 ### Keep schema and content execution separate
 

@@ -17,6 +17,7 @@ import * as capture from '../../src/engine/capture';
 import { inspectRecord, recordHash } from '../../src/engine/codec';
 import { writeMigration } from '../../src/engine/migration-artifact';
 import { loadMigrationModule } from '../../src/engine/migration-loader';
+import { buildPlanPreview } from '../../src/engine/migration-preview';
 import { createPlan } from '../../src/engine/planner';
 import * as schemaApi from '../../src/engine/schema';
 import { SnapshotStore } from '../../src/engine/store';
@@ -315,6 +316,21 @@ function harness(test: Fixture) {
         entries: [...args.prepared.entries()],
         options: args.options,
       });
+      if (args.options.dryRun) {
+        const previewStore = new SnapshotStore();
+        try {
+          for (const entry of plans.at(-1)!.entries)
+            previewStore.putPlan(entry);
+          return buildPlanPreview(
+            previewStore,
+            args.prepared.metadata,
+            'destination',
+          );
+        } finally {
+          args.prepared.release?.();
+          previewStore.dispose();
+        }
+      }
       args.prepared.release?.();
       return {
         environmentId: args.options.inPlace
@@ -403,6 +419,37 @@ describe('generated TypeScript public runtime integration', () => {
       en: 'Edited English',
       it: 'Prima',
     });
+    assert.equal(run.counts().writes, 0);
+    assert.ok(
+      run.capturedStores.every((store) => !existsSync(store.directory)),
+    );
+  });
+
+  it('dry-run evaluates edited TypeScript and returns its rebuilt plan without content writes', async () => {
+    const test = await fixture();
+    await writeFile(
+      test.output,
+      (await readFile(test.output, 'utf8')).replace(
+        'Generated English',
+        'Previewed English',
+      ),
+    );
+    const run = harness(test);
+    const result = await run.run({ dryRun: true, forkName: 'review-content' });
+    assert.ok('dryRun' in result && result.dryRun);
+    assert.equal(result.mutations, 0);
+    assert.equal(result.counts.record.update, 1);
+    assert.equal(result.groups.length, 1);
+    const changed = run.plans[0].entries.find(
+      (entry) => entry.id === CHANGED,
+    ) as RecordPlan;
+    assert.equal(
+      (changed.desired!.current.summary as JsonObject).en,
+      'Previewed English',
+    );
+    assert.equal(run.plans[0].options.dryRun, true);
+    assert.equal(run.plans[0].options.forkName, 'review-content');
+    assert.equal(run.validations.length, 1);
     assert.equal(run.counts().writes, 0);
     assert.ok(
       run.capturedStores.every((store) => !existsSync(store.directory)),

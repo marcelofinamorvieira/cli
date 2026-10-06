@@ -230,7 +230,7 @@ export interface CaptureOptions {
   progress?: (message: string) => void;
 }
 export interface ApplyOptions {
-  /** Internal native migration integration; never serialized into artifacts. */
+  /** Exclude only explicitly verified migration-tracking metadata. */
   schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
   inPlace: boolean;
@@ -238,6 +238,10 @@ export interface ApplyOptions {
   keepFailedFork: boolean;
   allowTemporarySchemaChanges: boolean;
   destinationEnvironmentId?: string;
+  /** Requested ID of a newly created fork; never an existing environment. */
+  forkName?: string;
+  /** Complete read-only preflight and return the rebuilt plan before writes. */
+  dryRun?: boolean;
   concurrency?: number;
   /** Refuse to start when a schedule falls due within this many minutes. */
   scheduleWindowMinutes?: number;
@@ -267,3 +271,18 @@ export interface ApplyResult {
   mutations: number;
   partial: boolean;
 }
+
+export interface PlanPreviewGroup {
+  kind: Kind;
+  model?: { id: string; apiKey: string; name: string };
+  counts: Record<Action, number>;
+}
+
+export interface ApplyPreviewResult extends ApplyResult {
+  dryRun: true;
+  counts: PlanCounts;
+  groups: PlanPreviewGroup[];
+  temporarySchemaChanges: number;
+}
+
+export type ApplyOutcome = ApplyResult | ApplyPreviewResult;

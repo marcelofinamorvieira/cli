@@ -1,5 +1,6 @@
 import { basename } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
+import type { ContentMigrationClient } from '../content-migration-client';
 import { assertNotAborted } from './cancellation';
 import {
   canonicalFields,
@@ -16,7 +17,6 @@ import { creationEmptyValue } from './planner-validity';
 import type { SnapshotStore } from './store';
 import type {
   BinaryFile,
-  Client,
   CollectionState,
   JsonObject,
   JsonValue,
@@ -55,7 +55,7 @@ export interface IntentBinaryBinding {
 
 export interface IntentRecorder {
   /** Only the explicitly supported mutation methods are available. */
-  client: Client;
+  client: ContentMigrationClient;
   needsValidation(): Generator<IntentValidation>;
   resolveValidity(evidence: IntentValidityEvidence): void;
   /** Seal further calls and drain every submitted local operation. */
@@ -1032,7 +1032,7 @@ export function createIntentRecorder(args: {
     resources[resource] = facade(wrapped, `client.${resource}`);
   }
   return {
-    client: facade(resources) as Client,
+    client: facade(resources) as ContentMigrationClient,
     *needsValidation() {
       for (const row of db
         .prepare(

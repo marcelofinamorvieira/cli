@@ -1,6 +1,7 @@
 import { oclif } from '@datocms/cli-utils';
+import { validateForkName } from '../../engine/apply';
 import { ContentError } from '../../engine/errors';
-import type { ApplyResult, RepairResult } from '../../engine/types';
+import type { ApplyOutcome, RepairResult } from '../../engine/types';
 import { applyContentMigration, repairContentMigration } from '../../migration';
 import { ContentCommand, concurrency } from '../../utils/content-command';
 import { withInterruptHandling } from '../../utils/interruption';
@@ -12,6 +13,8 @@ export default class ContentApplyCommand extends ContentCommand {
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --in-place',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --repair',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --dry-run',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --fork-name=content-review',
   ];
   static args = {
     SCRIPT: oclif.Args.string({
@@ -23,6 +26,17 @@ export default class ContentApplyCommand extends ContentCommand {
     destination: oclif.Flags.string({
       description:
         'Apply against this destination environment ID instead of the migration binding',
+    }),
+    'dry-run': oclif.Flags.boolean({
+      description:
+        'Validate the script and preview its rebuilt plan without applying changes or creating a fork',
+      exclusive: ['repair', 'keep-failed-fork'],
+      default: false,
+    }),
+    'fork-name': oclif.Flags.string({
+      description:
+        'Name of the new fork to create (defaults to a unique generated name)',
+      exclusive: ['in-place', 'repair'],
     }),
     'in-place': oclif.Flags.boolean({
       description: 'Write directly into the destination environment',
@@ -73,7 +87,7 @@ export default class ContentApplyCommand extends ContentCommand {
     }),
   };
 
-  async run(): Promise<ApplyResult | RepairResult> {
+  async run(): Promise<ApplyOutcome | RepairResult> {
     return withInterruptHandling(
       (signal) => this.runOperation(signal),
       () =>
@@ -85,9 +99,13 @@ export default class ContentApplyCommand extends ContentCommand {
 
   private async runOperation(
     signal: AbortSignal,
-  ): Promise<ApplyResult | RepairResult> {
+  ): Promise<ApplyOutcome | RepairResult> {
     const { flags, args } = await this.parse(ContentApplyCommand);
     const maximum = concurrency(flags.concurrency);
+    validateForkName({
+      forkName: flags['fork-name'],
+      inPlace: flags['in-place'],
+    });
     if (flags['allow-primary'] && !flags['in-place'] && !flags.repair)
       throw new ContentError(
         'INVALID_PRIMARY_AUTHORIZATION',
@@ -136,6 +154,10 @@ export default class ContentApplyCommand extends ContentCommand {
         keepFailedFork: flags['keep-failed-fork'],
         allowTemporarySchemaChanges: flags['allow-temporary-schema-changes'],
         destinationEnvironmentId: flags.destination,
+        ...(flags['fork-name'] !== undefined
+          ? { forkName: flags['fork-name'] }
+          : {}),
+        ...(flags['dry-run'] ? { dryRun: true } : {}),
         concurrency: maximum,
         scheduleWindowMinutes: flags['schedule-window'],
         fastFork: flags['fast-fork'],
@@ -144,6 +166,34 @@ export default class ContentApplyCommand extends ContentCommand {
       },
     });
     if (!this.jsonEnabled()) {
+      if ('dryRun' in result && result.dryRun) {
+        this.log(
+          `Dry run validated against environment "${result.environmentId}". No changes applied.`,
+        );
+        for (const group of result.groups) {
+          const label = group.model
+            ? `${group.model.name} (${group.model.apiKey})`
+            : group.kind === 'upload'
+              ? 'Assets'
+              : 'Asset folders';
+          const { create, update, delete: deleted, skip } = group.counts;
+          this.log(
+            `${label}: ${create} create, ${update} update, ${deleted} delete${
+              skip ? `, ${skip} skip` : ''
+            }.`,
+          );
+        }
+        if (result.groups.length === 0) this.log('No content changes planned.');
+        if (result.temporarySchemaChanges)
+          this.log(
+            `${result.temporarySchemaChanges} temporary field changes required; original settings will be restored during apply.`,
+          );
+        if (result.partial)
+          this.log(
+            'Partial migration: generation omitted unsupported content.',
+          );
+        return result;
+      }
       const partial = result.partial
         ? ' from a partial migration; skipped entries were not applied'
         : '';

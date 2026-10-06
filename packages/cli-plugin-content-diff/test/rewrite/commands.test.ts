@@ -16,6 +16,7 @@ import * as planner from '../../src/engine/planner';
 import * as schema from '../../src/engine/schema';
 import type { SnapshotStore } from '../../src/engine/store';
 import type {
+  ApplyPreviewResult,
   PlanMetadata,
   RecordState,
   SchemaState,
@@ -612,6 +613,80 @@ describe('content command integration', () => {
     assert.deepEqual(await command.run(), result);
   });
 
+  it('previews rebuilt groups without an applied message and keeps JSON output quiet', async () => {
+    const empty = { create: 0, update: 0, delete: 0, noop: 0, skip: 0 };
+    const preview: ApplyPreviewResult = {
+      dryRun: true,
+      environmentId: 'main',
+      mutations: 0,
+      partial: true,
+      counts: {
+        record: { ...empty, update: 2 },
+        upload: empty,
+        collection: empty,
+      },
+      groups: [
+        {
+          kind: 'record',
+          model: { id: 'article', apiKey: 'article', name: 'Articles' },
+          counts: { ...empty, update: 2 },
+        },
+      ],
+      temporarySchemaChanges: 1,
+    };
+    replace(
+      apply,
+      'applyContentMigration',
+      async (args: Parameters<typeof apply.applyContentMigration>[0]) => {
+        assert.equal(args.options.dryRun, true);
+        assert.equal(args.options.forkName, 'content-review');
+        assert.equal(args.options.destinationEnvironmentId, 'main');
+        return preview;
+      },
+    );
+    for (const json of [false, true]) {
+      const logs: string[] = [];
+      const command = Object.assign(
+        Object.create(ContentApplyCommand.prototype),
+        {
+          parse: async () => ({
+            args: { SCRIPT: './migration.ts' },
+            flags: {
+              destination: 'main',
+              'dry-run': true,
+              'fork-name': 'content-review',
+              'in-place': false,
+              'allow-primary': false,
+              repair: false,
+              'schedule-window': 120,
+              'keep-failed-fork': false,
+              'allow-temporary-schema-changes': true,
+              concurrency: 4,
+            },
+          }),
+          endpoint: async () => ({
+            rootClient: {},
+            buildEnvironmentClient: () => ({}),
+          }),
+          progress: () => undefined,
+          log: (message: string) => logs.push(message),
+          jsonEnabled: () => json,
+        },
+      );
+      assert.deepEqual(await command.run(), preview);
+      if (json) assert.deepEqual(logs, []);
+      else {
+        assert.match(
+          logs.join('\n'),
+          /Articles \(article\): 0 create, 2 update, 0 delete/,
+        );
+        assert.match(logs.join('\n'), /1 temporary field changes required/);
+        assert.match(logs.join('\n'), /Partial migration/);
+        assert.doesNotMatch(logs.join('\n'), /Applied \d+ mutations/);
+      }
+    }
+  });
+
   it('passes explicit application authorization to the executor and returns its result', async () => {
     const result = { environmentId: 'isolated', mutations: 3 };
     replace(
@@ -1011,6 +1086,27 @@ describe('content command integration', () => {
           message: /--schedule-window must be a whole number of minutes/,
           code: 'INVALID_SCHEDULE_WINDOW',
           status: 1,
+        },
+        {
+          args: ['content:apply', './migration.ts', '--fork-name=Invalid Name'],
+          message: /Fork names must contain only lowercase letters/,
+          code: 'INVALID_FORK_NAME',
+          status: 1,
+        },
+        {
+          args: ['content:apply', './migration.ts', '--dry-run', '--repair'],
+          message: /cannot also be provided when using/,
+          status: 2,
+        },
+        {
+          args: [
+            'content:apply',
+            './migration.ts',
+            '--fork-name=review',
+            '--in-place',
+          ],
+          message: /cannot also be provided when using/,
+          status: 2,
         },
         {
           args: ['content:apply', './migration.ts', '--repair', '--in-place'],

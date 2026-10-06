@@ -18,7 +18,6 @@ import { createPlan } from '../../src/engine/planner';
 import { schemaHash } from '../../src/engine/schema';
 import { SnapshotStore } from '../../src/engine/store';
 import type {
-  Client,
   CollectionState,
   FieldSchema,
   JsonObject,
@@ -26,6 +25,7 @@ import type {
   RecordState,
   SchemaState,
 } from '../../src/engine/types';
+import type { ContentMigrationClient } from '../../src/migration';
 
 const id = (name: string) =>
   createHash('sha256').update(name).digest('base64url').slice(0, 22);
@@ -134,7 +134,7 @@ function createBody(recordId: string, values: JsonObject = {}) {
     meta: { created_at: WHEN, first_published_at: WHEN },
     summary: { en: 'New', it: 'Nuovo' },
     ...values,
-  } as Parameters<Client['items']['create']>[0];
+  } as Parameters<ContentMigrationClient['items']['create']>[0];
 }
 function validate(recorder: IntentRecorder): void {
   for (const needed of [...recorder.needsValidation()])
@@ -308,6 +308,7 @@ describe('TypeScript migration recorded intent', () => {
 
   it('rejects unsupported methods without exposing a remote client', async () => {
     const recorder = createIntentRecorder({ store, schema: state });
+    // @ts-expect-error The runtime must also reject unsupported methods from untyped scripts.
     assert.throws(() => recorder.client.roles.list(), /Unsupported CMA method/);
     assert.throws(() => recorder.assertReady(), /Unsupported CMA method/);
   });

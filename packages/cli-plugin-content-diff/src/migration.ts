@@ -1,4 +1,6 @@
 import { dirname, resolve } from 'node:path';
+import type { ContentMigrationClient } from './content-migration-client';
+export type * from './content-migration-client';
 import { applyBundle } from './engine/apply';
 import { assertNotAborted } from './engine/cancellation';
 import { captureSnapshot } from './engine/capture';
@@ -22,7 +24,7 @@ import { fetchSchema } from './engine/schema';
 import { SnapshotStore } from './engine/store';
 import type {
   ApplyOptions,
-  ApplyResult,
+  ApplyOutcome,
   Client,
   RepairOptions,
   RepairResult,
@@ -40,7 +42,7 @@ export interface ContentMigrationOptions {
 export interface ContentMigrationDefinition {
   version: 1;
   options: ContentMigrationOptions;
-  run: (client: Client, signal?: AbortSignal) => Promise<void>;
+  run: (client: ContentMigrationClient, signal?: AbortSignal) => Promise<void>;
 }
 
 export type ContentMigration = ((client: Client) => Promise<void>) & {
@@ -55,14 +57,17 @@ interface RecordingSession {
   closed: boolean;
 }
 
-const activeRecorders = new WeakMap<Client, RecordingSession>();
+const activeRecorders = new WeakMap<ContentMigrationClient, RecordingSession>();
 
 /**
  * Generated parts run in disposable workers, so compiled code and source maps
  * cannot accumulate across a project. Only one awaited CMA intent is in flight.
  * Scripts are trusted local code; the worker is not a security sandbox.
  */
-export function runMigrationPart(client: Client, path: string): Promise<void> {
+export function runMigrationPart(
+  client: ContentMigrationClient,
+  path: string,
+): Promise<void> {
   const active = activeRecorders.get(client);
   if (!active || active.closed) {
     const error = new ContentError(
@@ -112,7 +117,7 @@ export function runMigrationPart(client: Client, path: string): Promise<void> {
  */
 export function defineContentMigration(
   options: ContentMigrationOptions,
-  run: (client: Client) => Promise<void>,
+  run: (client: ContentMigrationClient) => Promise<void>,
 ): ContentMigration {
   const definition: ContentMigrationDefinition = {
     version: 1,
@@ -205,7 +210,7 @@ export interface ContentMigrationApplyArguments {
 
 export async function applyContentMigration(
   args: ContentMigrationApplyArguments,
-): Promise<ApplyResult> {
+): Promise<ApplyOutcome> {
   const definition = await loadContentMigration(
     args.scriptPath,
     args.options.signal,
@@ -217,7 +222,7 @@ async function executeDefinition(
   args: ContentMigrationApplyArguments & {
     definition: ContentMigrationDefinition;
   },
-): Promise<ApplyResult> {
+): Promise<ApplyOutcome> {
   const { options, definition } = args;
   const store = new SnapshotStore();
   try {

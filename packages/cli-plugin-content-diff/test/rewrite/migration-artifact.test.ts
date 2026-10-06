@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { compileFunction, runInNewContext } from 'node:vm';
+import { format } from 'prettier';
 import * as ts from 'typescript';
 import {
   canonicalFields,
@@ -32,13 +33,13 @@ import { createPlan } from '../../src/engine/planner';
 import { schemaHash } from '../../src/engine/schema';
 import { SnapshotStore } from '../../src/engine/store';
 import type {
-  Client,
   CollectionState,
   JsonObject,
   RecordState,
   SchemaState,
   UploadState,
 } from '../../src/engine/types';
+import type { ContentMigrationClient } from '../../src/migration';
 
 const MODEL = 'aaaaaaaaaaaaaaaaaaaaaa';
 const id = (value: string) =>
@@ -162,7 +163,10 @@ async function fixture(
     },
   };
 }
-async function runScript(file: string, client: Client): Promise<void> {
+async function runScript(
+  file: string,
+  client: ContentMigrationClient,
+): Promise<void> {
   const source = await readFile(file, 'utf8');
   const transformed = ts.transpileModule(source, {
     fileName: file,
@@ -180,14 +184,17 @@ async function runScript(file: string, client: Client): Promise<void> {
   );
   const localRequire = createRequire(file);
   const module = {
-    exports: {} as { default: (client: Client) => Promise<void> },
+    exports: {} as {
+      default: (client: ContentMigrationClient) => Promise<void>;
+    },
   };
   const runtime = {
     defineContentMigration: (
       _options: unknown,
-      callback: (client: Client) => Promise<void>,
+      callback: (client: ContentMigrationClient) => Promise<void>,
     ) => callback,
-    runMigrationPart: (client: Client, path: string) => runScript(path, client),
+    runMigrationPart: (client: ContentMigrationClient, path: string) =>
+      runScript(path, client),
   };
   compileFunction(
     transformed.outputText,
@@ -207,14 +214,6 @@ async function runScript(file: string, client: Client): Promise<void> {
 }
 
 async function typecheckScript(test: Awaited<ReturnType<typeof fixture>>) {
-  const declaration = join(test.directory, 'runtime-test.d.ts');
-  await writeFile(
-    declaration,
-    `import type { Client } from 'datocms/lib/cma-client-node';
-export function defineContentMigration(options: { baseline: string; allowTemporarySchemaChanges: boolean }, callback: (client: Client) => Promise<void>): (client: Client) => Promise<void>;
-export function runMigrationPart(client: Client, path: string): Promise<void>;
-`,
-  );
   const files = [test.output];
   try {
     for (const part of await readdir(join(test.baseline, 'parts')))
@@ -232,10 +231,9 @@ export function runMigrationPart(client: Client, path: string): Promise<void>;
     moduleResolution: ts.ModuleResolutionKind.Node16,
     typeRoots: [join(root, 'node_modules/@types')],
     paths: {
-      'datocms/lib/cma-client-node': [
-        join(root, 'packages/cli/lib/cma-client-node.d.ts'),
+      '@datocms/cli-plugin-content-diff/migration': [
+        join(root, 'packages/cli-plugin-content-diff/src/migration.ts'),
       ],
-      '@datocms/cli-plugin-content-diff/migration': [declaration],
     },
   });
   assert.deepEqual(
@@ -324,12 +322,13 @@ function upload(
 }
 
 describe('TypeScript migration artifacts', () => {
-  it('preserves __proto__ as data without rewriting string contents', () => {
+  it('preserves __proto__ as data through formatting without rewriting string contents', async () => {
     const original = JSON.parse(
       '{"__proto__":{"safe":true},"text":"__MIGRATION_ASSET__(\\"binaries/abc.bin\\")","quotes":"a\\nb\\"c"}',
     );
     const literal = migrationLiteral(original);
-    const reconstructed = runInNewContext(`(${literal})`);
+    const formatted = await format(`(${literal})`, { parser: 'typescript' });
+    const reconstructed = runInNewContext(formatted);
     assert.equal(Object.hasOwn(reconstructed, '__proto__'), true);
     assert.equal(JSON.stringify(reconstructed), JSON.stringify(original));
   });
@@ -350,7 +349,14 @@ describe('TypeScript migration artifacts', () => {
       });
       const script = await readFile(test.output, 'utf8');
       assert.match(script, /client\.items\.update/);
-      assert.match(script, /"title": "After"/);
+      assert.match(script, /title: "After"/);
+      assert.match(
+        script,
+        /Update record fields and metadata: "Page" \("page"\) record/,
+      );
+      assert.match(script, /, "After"\./);
+      assert.match(script, /ContentMigrationClient/);
+      assert.doesNotMatch(script, /datocms\/lib\/cma-client-node/);
       assert.doesNotMatch(script, /unchanged-|"Before"|runMigrationPart/);
       assert(script.length < 2000);
       const loaded = new SnapshotStore(test.directory);
@@ -378,6 +384,259 @@ describe('TypeScript migration artifacts', () => {
       }
       const replayed = await replay(test);
       replayed.dispose();
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('escapes bounded comments without changing payload strings or quoted property keys', async () => {
+    const definition = schema();
+    definition.models[0].name =
+      'Page */\nawait client.items.destroy("injected");\u2028';
+    definition.models[0].fields.push({
+      id: id('details'),
+      apiKey: 'details',
+      type: 'json',
+      localized: false,
+      validators: {},
+      defaultValue: null,
+    });
+    definition.hash = schemaHash(definition);
+    const title = `Title */\r\n// @ts-ignore\u2029${'very long '.repeat(100)}`;
+    const details = JSON.parse(
+      '{"quoted-key":{"value":"safe"},"text":"quotes \\" and newlines\\n"}',
+    );
+    const test = await fixture(
+      [record('unsafe-label', { title: 'Before', details: null })],
+      [record('unsafe-label', { title, details })],
+      definition,
+    );
+    try {
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+      });
+      const script = await readFile(test.output, 'utf8');
+      const label = script
+        .split('\n')
+        .find((line) => line.includes('// Update record fields'))!;
+      assert(label.length < 600);
+      assert(!label.includes('*/'));
+      assert(!label.includes('\u2028'));
+      assert(!label.includes('\u2029'));
+      assert(label.includes('…'));
+      assert.match(script, /"quoted-key":/);
+      const replayed = await replay(test);
+      try {
+        assert.equal(
+          replayed.getRecord('source', id('unsafe-label'))!.current.title,
+          title,
+        );
+        assert.deepEqual(
+          replayed.getRecord('source', id('unsafe-label'))!.current.details,
+          details,
+        );
+      } finally {
+        replayed.dispose();
+      }
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('formats inline code using the project configuration', async () => {
+    const test = await fixture(
+      [record('style', {})],
+      [record('style', { title: 'Styled' })],
+    );
+    try {
+      await writeFile(
+        join(test.directory, '.prettierrc.json'),
+        JSON.stringify({
+          singleQuote: true,
+          semi: false,
+          tabWidth: 4,
+          quoteProps: 'preserve',
+        }),
+      );
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+      });
+      const script = await readFile(test.output, 'utf8');
+      assert.match(
+        script,
+        /from '@datocms\/cli-plugin-content-diff\/migration'\n/,
+      );
+      assert.match(script, /'title': 'Styled'/);
+      assert.match(script, /\n {8}await client\.items\.update/);
+      const replayed = await replay(test);
+      replayed.dispose();
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('resolves split-part configuration against final paths and replays the formatted code', async () => {
+    const test = await fixture(
+      [],
+      Array.from({ length: 5 }, (_, index) => record(`style-${index}`, {})),
+    );
+    try {
+      await writeFile(
+        join(test.directory, '.prettierrc.json'),
+        JSON.stringify({
+          singleQuote: true,
+          semi: false,
+          overrides: [
+            {
+              files: ['**/*.content/parts/*.ts'],
+              options: { singleQuote: false, semi: true, tabWidth: 4 },
+            },
+          ],
+        }),
+      );
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+        chunkBytes: 400,
+      });
+      const script = await readFile(test.output, 'utf8');
+      assert.match(
+        script,
+        /from '@datocms\/cli-plugin-content-diff\/migration'\n/,
+      );
+      for (const part of await readdir(join(test.baseline, 'parts'))) {
+        const content = await readFile(
+          join(test.baseline, 'parts', part),
+          'utf8',
+        );
+        assert.match(
+          content,
+          /from "@datocms\/cli-plugin-content-diff\/migration";/,
+        );
+        assert.match(content, /\n {4}await client\.items\.create/);
+      }
+      await typecheckScript(test);
+      const replayed = await replay(test);
+      replayed.dispose();
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  for (const invalidConfig of [
+    '{ invalid JSON',
+    JSON.stringify({ tabWidth: 'invalid' }),
+  ])
+    it(`falls back to default formatting for invalid project configuration: ${invalidConfig}`, async () => {
+      const test = await fixture(
+        [record('fallback', {})],
+        [record('fallback', { title: 'Fallback' })],
+      );
+      try {
+        await writeFile(
+          join(test.directory, '.prettierrc.json'),
+          invalidConfig,
+        );
+        await writeMigration({
+          ...test,
+          outputPath: test.output,
+          sourceTracking: tracking,
+          destinationTracking: tracking,
+        });
+        const script = await readFile(test.output, 'utf8');
+        assert.match(
+          script,
+          /from "@datocms\/cli-plugin-content-diff\/migration";/,
+        );
+        assert.match(script, /title: "Fallback"/);
+        const replayed = await replay(test);
+        replayed.dispose();
+      } finally {
+        await test.dispose();
+      }
+    });
+
+  it('splits parts again when project formatting expands a group beyond its target', async () => {
+    const test = await fixture(
+      Array.from({ length: 12 }, (_, index) => record(`growth-${index}`, {})),
+      Array.from({ length: 12 }, (_, index) =>
+        record(`growth-${index}`, { title: 'Changed' }),
+      ),
+    );
+    try {
+      await writeFile(
+        join(test.directory, '.prettierrc.json'),
+        JSON.stringify({ tabWidth: 100 }),
+      );
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+        chunkBytes: 5000,
+      });
+      const parts = await readdir(join(test.baseline, 'parts'));
+      assert(parts.length > 1);
+      for (const part of parts)
+        assert(
+          (await readFile(join(test.baseline, 'parts', part))).length <= 6024,
+        );
+      const replayed = await replay(test);
+      replayed.dispose();
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('rejects a single operation that grows past 16 MiB during formatting and removes partial output', async () => {
+    const definition = schema();
+    definition.models[0].fields.push({
+      id: id('details'),
+      apiKey: 'details',
+      type: 'json',
+      localized: false,
+      validators: {},
+      defaultValue: null,
+    });
+    definition.hash = schemaHash(definition);
+    const test = await fixture(
+      [record('growth', { details: null })],
+      [
+        record('growth', {
+          details: Array.from({ length: 2500 }, () => 'value'),
+        }),
+      ],
+      definition,
+    );
+    try {
+      await writeFile(
+        join(test.directory, '.prettierrc.json'),
+        JSON.stringify({ tabWidth: 2048, printWidth: 40 }),
+      );
+      await assert.rejects(
+        writeMigration({
+          ...test,
+          outputPath: test.output,
+          sourceTracking: tracking,
+          destinationTracking: tracking,
+        }),
+        { code: 'MIGRATION_FILE_TOO_LARGE' },
+      );
+      assert(
+        !(await readdir(test.directory)).some(
+          (name) =>
+            name.startsWith('.content-migration-') ||
+            name.startsWith('123_change'),
+        ),
+      );
     } finally {
       await test.dispose();
     }
@@ -757,7 +1016,7 @@ describe('TypeScript migration artifacts', () => {
       1,
     )}, ${migrationLiteral({ title: '' }, 1)});\n\n`;
     const title = 'x'.repeat(
-      MAX_MIGRATION_CHUNK_BYTES - Buffer.byteLength(emptyCall),
+      MAX_MIGRATION_CHUNK_BYTES - Buffer.byteLength(emptyCall) - 300,
     );
     const test = await fixture(
       [record('boundary', {})],

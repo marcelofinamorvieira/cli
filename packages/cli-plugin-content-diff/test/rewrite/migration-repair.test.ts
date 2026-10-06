@@ -19,6 +19,7 @@ import type {
   RecordState,
   SchemaState,
 } from '../../src/engine/types';
+import type { ContentMigrationClient } from '../../src/migration';
 import type { ContentMigrationDefinition } from '../../src/migration';
 
 const id = (value: string) =>
@@ -391,7 +392,7 @@ describe('TypeScript migration repair', () => {
   ): ContentMigrationDefinition {
     return { version: 1, options: { baseline: './repair.content' }, run };
   }
-  async function replay(client: Client, title = 'Desired') {
+  async function replay(client: ContentMigrationClient, title = 'Desired') {
     await client.items.update(A, { title });
     await client.scheduledPublication.destroy(A);
     await client.scheduledPublication.create(A, {

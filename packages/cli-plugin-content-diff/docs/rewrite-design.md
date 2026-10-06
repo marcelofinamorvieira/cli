@@ -10,7 +10,7 @@ The companion contains immutable baseline evidence: source/destination bindings,
 
 Checksums detect corruption, incomplete copies, and accidental baseline edits. They do not authenticate a migration against someone who can replace both files and checksums. Scripts and companions contain project content and no client authentication credentials. Keep them together and preserve their filenames and relative paths.
 
-Generated code uses `defineContentMigration` from the plugin's public `migration` entrypoint. It is trusted Node code, not a sandbox. Guards cover operations performed through its supplied recording client; arbitrary imports or independently constructed clients retain ordinary Node capabilities.
+Generated code imports the precise public `ContentMigrationClient` interface for supported local mutation methods and their intended-state return values. Compile-time checks reject unsupported reads/schema/configuration, while runtime validation remains authoritative for values and dependencies. Generated code uses `defineContentMigration` from the plugin's public `migration` entrypoint. It is trusted Node code, not a sandbox. Guards cover operations performed through its supplied recording client; arbitrary imports or independently constructed clients retain ordinary Node capabilities.
 
 ## Generation
 
@@ -22,6 +22,8 @@ Generated code uses `defineContentMigration` from the plugin's public `migration
 
 `content:diff [NAME]` uses native `{unix_timestamp}_{camelCaseName}.ts` naming. The name defaults to `contentMigration`. `--output` accepts an exact `.ts` path or directory. Without it, use the `content/` subdirectory of the destination profile's configured migration directory relative to the configuration file, or `./migrations/content`. The native schema runner does not discover scripts in this subdirectory.
 
+Comments label captured model/record identities and lifecycle, asset, folder, schedule and ordering actions. Labels are bounded and escaped; content cannot inject code through comments. Prettier resolves project configuration against final entrypoint and part paths, falls back to defaults on invalid configuration, and formats bounded groups of operations. Formatting growth can trigger further splitting between operations; every resulting file must satisfy the absolute 16 MiB limit.
+
 The default TypeScript part target is 1 MiB. Never split a CMA operation. One large operation can occupy its own part, within the source-file ceiling. A small diff remains a short script even when its full-namespace guards are large.
 
 ## Execution and edits
@@ -32,6 +34,8 @@ The default TypeScript part target is 1 MiB. Never split a CMA operation. One la
 4. Resolve validity for every intended current/published slice. Exact captured source evidence can be reused only when record ID, slice, and field hash match. Unknown edited values use native non-mutating validation endpoints. Refuse validation that depends on future/new references, changed assets, structural failures, or defaults that would substitute different values. Do not invent validity. Unchanged generated cycles retain their exact source evidence.
 5. Rebuild the plan from the executed TypeScript, including dependencies, publication cycles, ordering, deletions, temporary rules, and binary bindings. Generation-time choices are not an executable desired-state override. The generation deletion flag controls emitted calls; explicit supported deletes in edited TypeScript become intended deletions when replanned.
 6. Pass the fresh plan to the guarded executor. Verify the destination/fork, perform dependency-ordered writes with focused guards, restore schedules and temporary settings, then verify the complete intended namespace.
+
+`content:apply --dry-run` follows this same path through full baseline, permission, schema, dependency and schedule preflight, then returns before environment locks, fork creation or any plugin-owned remote write. It returns entity counts, changed model/resource groups and temporary field-change count; SQL aggregates keep preview memory proportional to schema size. Native validation requests remain read-only with respect to content, and trusted user code can have independent side effects. Preview reserves nothing; a later apply repeats preflight.
 
 The public `applyContentMigration` and `repairContentMigration` take the script path, root client, environment-client factory, and explicit execution options. They share the original executor through an internal prepared-plan adapter. Internal JSON plan rows are temporary derived state, not saved execution progress or public input.
 
@@ -57,7 +61,7 @@ A fresh CommonJS wrapper without `require.cache` entries did not prove bounded m
 
 Generation and execution are one-shot. No pause/resume, checkpoints, persisted temporary database, or recovery cursor is accepted. Remove owned SQLite and staging files on completion or failure. Keep complete scripts and companions. Cooperative signals drain submitted work and perform cleanup; forced process termination cannot.
 
-Default application owns a fresh fork and removes it after failure unless explicitly retained. `--in-place` is an explicit override; primary also requires `--allow-primary`. Never delete a pre-existing environment or automatically promote a fork.
+Default application owns a fresh fork and removes it after failure unless explicitly retained. `--fork-name` names that new fork, separately from the baseline `--destination`; collisions fail before mutations. Ownership requires a successful fork response and the same creation timestamp, origin and nonprimary state during verification/cleanup. An uncertain creation response never grants cleanup ownership. Verified progress is aggregated by model/action/phase with bounded counters and throttled output, never emitted from local intent recording. `--in-place` is an explicit override; primary also requires `--allow-primary`. Never delete a pre-existing environment or automatically promote a fork.
 
 Cancel schedules only for written records. Recreate their exact intended future dates after writes and temporary settings are restored. Preserve other schedules. Refuse schedules within the configured window before starting. On in-place failure, restore an original schedule only when the record still contains original content; report ambiguous or already-changed records.
 
@@ -74,6 +78,7 @@ Repair must refuse missing original evidence, unrelated schema changes, changed 
 | `engine/planner*` | Dependency order, uniqueness, publication cycles, ordering, safe skips, and temporary rules. |
 | `engine/migration-artifact` | TypeScript emission, immutable baseline storage, binaries, integrity, and atomic staging. |
 | `engine/migration-intent`, `migration-validity` | Recording facade, local simulation, exact evidence, and native validation of unknown edits. |
+| `content-migration-client`, `engine/migration-preview` | Accurate authoring types and bounded read-only preview summaries. |
 | `engine/migration-loader` | Trusted TypeScript loading, source locations, disposable parts, and recording IPC. |
 | `engine/migration-schema` | Explicit native tracking-model identity and schema projection. |
 | `engine/migration-repair` | Original-namespace reconstruction and fresh repair planning. |
