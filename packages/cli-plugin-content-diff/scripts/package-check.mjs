@@ -111,7 +111,7 @@ try {
     'artifact-integrity',
     'asset-download',
     'portable-id',
-    'apply',
+    'direct-apply',
   ]) {
     assert.ok(
       files.includes(`lib/engine/${name}.js`),
@@ -120,6 +120,18 @@ try {
     assert.ok(
       files.includes(`lib/engine/${name}.d.ts`),
       `missing engine/${name}.d.ts`,
+    );
+  }
+  for (const retired of [
+    'apply',
+    'migration-intent',
+    'migration-validity',
+    'migration-repair',
+    'migration-preview',
+  ]) {
+    assert.ok(
+      !files.includes(`lib/engine/${retired}.js`),
+      `retired execution path is still packed: ${retired}`,
     );
   }
   assertNoCredentials(files);

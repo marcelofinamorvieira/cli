@@ -17,7 +17,7 @@ import * as schema from '../../src/engine/schema';
 import * as storage from '../../src/engine/store';
 import type { SnapshotStore } from '../../src/engine/store';
 import type {
-  ApplyPreviewResult,
+  DirectPreflightResult,
   PlanMetadata,
   RecordState,
   SchemaState,
@@ -820,32 +820,24 @@ describe('content command integration', () => {
     assert.deepEqual(await command.run(), result);
   });
 
-  it('previews rebuilt groups without an applied message and keeps JSON output quiet', async () => {
+  it('reports preflight without executing or predicting edited effects and keeps JSON output quiet', async () => {
     const empty = { create: 0, update: 0, delete: 0, noop: 0, skip: 0 };
-    const preview: ApplyPreviewResult = {
-      dryRun: true,
+    const preview: DirectPreflightResult = {
+      preflightOnly: true,
       environmentId: 'main',
-      mutations: 0,
+      scriptExecuted: false,
       partial: true,
-      counts: {
+      generatedCounts: {
         record: { ...empty, update: 2 },
         upload: empty,
         collection: empty,
       },
-      groups: [
-        {
-          kind: 'record',
-          model: { id: 'article', apiKey: 'article', name: 'Articles' },
-          counts: { ...empty, update: 2 },
-        },
-      ],
-      temporarySchemaChanges: 1,
     };
     replace(
       apply,
       'applyContentMigration',
       async (args: Parameters<typeof apply.applyContentMigration>[0]) => {
-        assert.equal(args.options.dryRun, true);
+        assert.equal(args.options.preflightOnly, true);
         assert.equal(args.options.forkName, 'content-review');
         assert.equal(args.options.destinationEnvironmentId, 'main');
         return preview;
@@ -860,7 +852,7 @@ describe('content command integration', () => {
             args: { SCRIPT: './migration.ts' },
             flags: {
               destination: 'main',
-              'dry-run': true,
+              'preflight-only': true,
               'fork-name': 'content-review',
               'in-place': false,
               'allow-primary': false,
@@ -885,9 +877,12 @@ describe('content command integration', () => {
       else {
         assert.match(
           logs.join('\n'),
-          /Articles \(article\): 0 create, 2 update, 0 delete/,
+          /The script was not executed; edited effects were not previewed/,
         );
-        assert.match(logs.join('\n'), /1 temporary field changes required/);
+        assert.doesNotMatch(
+          logs.join('\n'),
+          /2 update|temporary field changes required/,
+        );
         assert.match(logs.join('\n'), /Partial migration/);
         assert.doesNotMatch(logs.join('\n'), /Applied \d+ mutations/);
       }
@@ -895,7 +890,11 @@ describe('content command integration', () => {
   });
 
   it('passes explicit application authorization to the executor and returns its result', async () => {
-    const result = { environmentId: 'isolated', mutations: 3 };
+    const result = {
+      environmentId: 'isolated',
+      scriptExecuted: true,
+      partial: false,
+    };
     replace(
       apply,
       'applyContentMigration',
@@ -997,7 +996,7 @@ describe('content command integration', () => {
     try {
       let outcome: unknown = {
         environmentId: 'isolated',
-        mutations: 3,
+        scriptExecuted: true,
         partial: true,
       };
       replace(
@@ -1037,12 +1036,16 @@ describe('content command integration', () => {
         });
       await command(join(directory, 'migration.ts')).run();
       await command(join(directory, 'missing.ts')).run();
-      outcome = { environmentId: 'isolated', mutations: 3, partial: false };
+      outcome = {
+        environmentId: 'isolated',
+        scriptExecuted: true,
+        partial: false,
+      };
       await command(join(directory, 'migration.ts')).run();
       assert.deepEqual(logged, [
-        'Applied 3 mutations in environment "isolated" from a partial migration; skipped entries were not applied.',
-        'Applied 3 mutations in environment "isolated" from a partial migration; skipped entries were not applied.',
-        'Applied 3 mutations in environment "isolated".',
+        'Executed content migration in environment "isolated" (generation omitted unsupported content).',
+        'Executed content migration in environment "isolated" (generation omitted unsupported content).',
+        'Executed content migration in environment "isolated".',
       ]);
       outcome = new ContentError('APPLY_FAILED', 'Injected failure.');
       await assert.rejects(
@@ -1310,7 +1313,12 @@ describe('content command integration', () => {
           status: 1,
         },
         {
-          args: ['content:apply', './migration.ts', '--dry-run', '--repair'],
+          args: [
+            'content:apply',
+            './migration.ts',
+            '--preflight-only',
+            '--repair',
+          ],
           message: /cannot also be provided when using/,
           status: 2,
         },

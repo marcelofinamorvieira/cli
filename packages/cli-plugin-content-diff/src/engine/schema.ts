@@ -309,9 +309,43 @@ export async function assertApplyAccess(
   inPlace: boolean,
   managedModelIds?: readonly string[],
 ): Promise<void> {
+  const models = new Set<string>();
+  for (const row of store.database
+    .prepare(
+      "SELECT DISTINCT model_id FROM plan WHERE kind='record' AND action IN ('create','update','delete') OR kind='record' AND json_extract(data,'$.guard.schedules.publication') IS NOT NULL OR kind='record' AND json_extract(data,'$.guard.schedules.unpublishing') IS NOT NULL",
+    )
+    .iterate()) {
+    const id = String(row.model_id);
+    if (!managedModelIds || managedModelIds.includes(id)) models.add(id);
+  }
+  const changed = (kind: string) =>
+    !!store.database
+      .prepare(
+        "SELECT 1 FROM plan WHERE kind=? AND action IN ('create','update','delete') LIMIT 1",
+      )
+      .get(kind);
+  return assertDirectApplyAccess(client, schema, {
+    modelIds: [...models],
+    uploads: changed('upload'),
+    collections: changed('collection'),
+    inPlace,
+  });
+}
+
+/** Prove permission for the declared generation scope; edited calls remain subject to CMA permissions. */
+export async function assertDirectApplyAccess(
+  client: Client,
+  schema: SchemaState,
+  scope: {
+    modelIds: readonly string[];
+    uploads: boolean;
+    collections: boolean;
+    inPlace: boolean;
+  },
+): Promise<void> {
   const permissions = await effectivePermissions(client);
   if (!permissions) return;
-  if (!inPlace && permissions.can_manage_environments !== true)
+  if (!scope.inPlace && permissions.can_manage_environments !== true)
     throw new ContentError(
       'UNPROVEN_APPLY_ACCESS',
       'Fresh-fork execution requires proven environment management permission.',
@@ -327,13 +361,8 @@ export async function assertApplyAccess(
       rule.localization_scope === 'all');
   const positives = rules(permissions.positive_item_type_permissions);
   const negatives = rules(permissions.negative_item_type_permissions);
-  const modelIds = store.database.prepare(
-    "SELECT DISTINCT model_id FROM plan WHERE kind='record' AND action IN ('create','update','delete') OR kind='record' AND json_extract(data,'$.guard.schedules.publication') IS NOT NULL OR kind='record' AND json_extract(data,'$.guard.schedules.unpublishing') IS NOT NULL",
-  );
-  for (const row of modelIds.iterate()) {
-    if (managedModelIds && !managedModelIds.includes(String(row.model_id)))
-      continue;
-    const model = schema.models.find((entry) => entry.id === row.model_id);
+  for (const id of scope.modelIds) {
+    const model = schema.models.find((entry) => entry.id === id);
     if (!model)
       throw new ContentError(
         'INVALID_BUNDLE',
@@ -356,13 +385,8 @@ export async function assertApplyAccess(
         `Cannot prove unrestricted mutations for model ${model.apiKey}.`,
       );
   }
-  const uploadChanges = store.database
-    .prepare(
-      "SELECT 1 FROM plan WHERE kind='upload' AND action IN ('create','update','delete') LIMIT 1",
-    )
-    .get();
   if (
-    uploadChanges &&
+    scope.uploads &&
     (!rules(permissions.positive_upload_permissions).some(
       (rule) => unrestricted(rule) && !rule.upload_collection,
     ) ||
@@ -374,12 +398,7 @@ export async function assertApplyAccess(
       'UNPROVEN_APPLY_ACCESS',
       'Cannot prove unrestricted upload mutations.',
     );
-  const collectionChanges = store.database
-    .prepare(
-      "SELECT 1 FROM plan WHERE kind='collection' AND action IN ('create','update','delete') LIMIT 1",
-    )
-    .get();
-  if (collectionChanges && permissions.can_manage_upload_collections !== true)
+  if (scope.collections && permissions.can_manage_upload_collections !== true)
     throw new ContentError(
       'UNPROVEN_APPLY_ACCESS',
       'Cannot prove upload collection mutation permission.',

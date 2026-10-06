@@ -59,11 +59,7 @@ async function reseal(
   await writeFile(join(directory, 'manifest.sha256'), `${digest(raw)}\n`);
 }
 function assertEmpty(store: SnapshotStore) {
-  for (const table of [
-    'migration_baseline',
-    'migration_baseline_validity',
-    'migration_baseline_binaries',
-  ])
+  for (const table of ['migration_baseline', 'migration_baseline_binaries'])
     if (
       store.database
         .prepare('SELECT name FROM sqlite_temp_master WHERE name=?')

@@ -23,15 +23,21 @@ import {
 } from './artifact-integrity';
 import { fetchBinary, requiresBinary } from './asset-download';
 import { assertNotAborted } from './cancellation';
-import { hashJson, object, recordGuard, recordPayloadFields } from './codec';
+import {
+  assertMetadataIntegerPrecision,
+  hashJson,
+  object,
+  recordGuard,
+} from './codec';
 import { ContentError } from './errors';
-import type { IntentBinary, IntentValidityEvidence } from './migration-intent';
+import { emitMigrationCalls, restoreFieldSource } from './migration-emit';
 import {
   DEFAULT_MIGRATION_CHUNK_BYTES,
   MAX_MIGRATION_CHUNK_BYTES,
   MAX_MIGRATION_FILE_BYTES,
 } from './migration-limits';
 import type { MigrationTrackingBinding } from './migration-schema';
+import { suppressedDefaultValue } from './planner-validity';
 import { schemaHash } from './schema';
 import type { SnapshotStore } from './store';
 import type {
@@ -52,14 +58,13 @@ import type {
   UploadState,
 } from './types';
 
-const FORMAT = 'datocms-content-migration-baseline/1';
+const FORMAT = 'datocms-content-migration-baseline/2';
 const MAX_METADATA = 16 * 1024 * 1024;
 const kinds = ['record', 'upload', 'collection'] as const;
 const sha256 = (data: string | Buffer) =>
   createHash('sha256').update(data).digest('hex');
 
-export interface BaselineManifest
-  extends Omit<PlanMetadata, 'temporarySchemaChanges'> {
+export interface BaselineManifest extends PlanMetadata {
   format: typeof FORMAT;
   createdAt: string;
   sourceTracking: MigrationTrackingBinding;
@@ -68,6 +73,12 @@ export interface BaselineManifest
   chunks: ArtifactChunkIndex;
 }
 
+export interface MigrationBinary {
+  localPath: string;
+  binary: BinaryFile;
+  filename: string;
+  url: string;
+}
 interface BaselineEntry {
   type: 'baseline';
   kind: Kind;
@@ -82,10 +93,7 @@ interface BinaryEntry {
   filename: string;
   url: string;
 }
-type Row =
-  | BaselineEntry
-  | ({ type: 'validity' } & IntentValidityEvidence)
-  | BinaryEntry;
+type Row = BaselineEntry | BinaryEntry;
 
 function invalid(message: string): never {
   throw new ContentError('INVALID_MIGRATION_BASELINE', message);
@@ -163,10 +171,6 @@ function initTables(store: SnapshotStore): void {
     CREATE TEMP TABLE IF NOT EXISTS migration_baseline (
       kind TEXT NOT NULL,id TEXT NOT NULL,hash TEXT NOT NULL,model_id TEXT,parent_id TEXT,
       position REAL,guard_json TEXT NOT NULL,original_json TEXT,PRIMARY KEY(kind,id)
-    ) WITHOUT ROWID;
-    CREATE TEMP TABLE IF NOT EXISTS migration_baseline_validity (
-      id TEXT NOT NULL,slice TEXT NOT NULL,hash TEXT NOT NULL,valid INTEGER NOT NULL,
-      PRIMARY KEY(id,slice,hash)
     ) WITHOUT ROWID;
     CREATE TEMP TABLE IF NOT EXISTS migration_baseline_binaries (
       upload_id TEXT PRIMARY KEY,file TEXT NOT NULL UNIQUE,data TEXT NOT NULL
@@ -289,6 +293,7 @@ class ScriptWriter {
     private outputPath: string,
     private maximum: number,
     private signal?: AbortSignal,
+    private temporaryChanges: PlanMetadata['temporarySchemaChanges'] = [],
   ) {}
   async add(statement: string, partStatement = statement) {
     assertNotAborted(this.signal);
@@ -311,6 +316,8 @@ class ScriptWriter {
     assertNotAborted(this.signal);
     const name = `${String(this.parts + 1).padStart(6, '0')}.ts`;
     const source = `import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { checkMigration, uploadMigrationFile } from '@datocms/cli-plugin-content-diff/migration';
 import type { ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
 
 export default async function(client: ContentMigrationClient): Promise<void> {
@@ -358,17 +365,34 @@ ${statements.map((statement) => statement.part).join('')}
 `
       : this.statements.map((statement) => statement.main).join('');
     return `import { join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type { ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
-import { defineContentMigration${this.parts ? ', runMigrationPart' : ''} } from '@datocms/cli-plugin-content-diff/migration';
+import { defineContentMigration, checkMigration, uploadMigrationFile${
+      this.parts ? ', runMigrationPart' : ''
+    } } from '@datocms/cli-plugin-content-diff/migration';
 
 // Run this file with datocms content:apply.
-// Review and edit these CMA operations. The runtime rebuilds their safe execution plan.
+// Review and edit these ready-to-execute CMA operations.
 export default defineContentMigration(
   { baseline: join(__dirname, ${JSON.stringify(
     this.companionName,
   )}), allowTemporarySchemaChanges: ${allowTemporarySchemaChanges} },
   async (client: ContentMigrationClient): Promise<void> => {
-${body || '  // No content changes.\n'}  },
+${
+  this.temporaryChanges.length
+    ? `    let migrationError: unknown;\n    try {\n${body}    } catch (error) {\n      migrationError = error;\n      throw error;\n    } finally {\n      const failures: unknown[] = [];\n${this.temporaryChanges
+        .map(
+          (change) =>
+            `      try {\n${restoreFieldSource(
+              change,
+              migrationLiteral,
+            )}      } catch (error) { failures.push(error); }\n`,
+        )
+        .join(
+          '',
+        )}      if (failures.length) throw new AggregateError(migrationError === undefined ? failures : [migrationError, ...failures], 'Some original field settings could not be restored.', { cause: migrationError });\n    }\n`
+    : body || '  // No content changes.\n'
+}  },
 );
 `;
   }
@@ -400,468 +424,6 @@ ${body || '  // No content changes.\n'}  },
       ),
       statement(`join(__dirname, '..', ${JSON.stringify(file)})`),
     );
-  }
-}
-
-/** Display captured labels only, bounded and escaped so content cannot add code. */
-function commentLabel(value: string): string {
-  const shortened = value.length > 120 ? `${value.slice(0, 120)}…` : value;
-  return JSON.stringify(shortened)
-    .replace(/\*\//g, '*\\/')
-    .replace(/[\u2028\u2029]/g, (character) =>
-      character === '\u2028' ? '\\u2028' : '\\u2029',
-    );
-}
-function comment(action: string, subject: string, statement: string): string {
-  return `  // ${action}: ${subject}.\n${statement}`;
-}
-function recordLabel(
-  id: string,
-  modelId: string,
-  schema: PlanMetadata['schema'],
-  state?: RecordState | null,
-): string {
-  const model = schema.models.find((candidate) => candidate.id === modelId);
-  let title: string | undefined;
-  for (const key of ['title', 'name']) {
-    const field = model?.fields.find(
-      (candidate) => candidate.apiKey === key && candidate.type === 'string',
-    );
-    if (!field) continue;
-    const value = state?.current[key];
-    if (typeof value === 'string') title = value;
-    else if (field.localized && object(value))
-      for (const locale of schema.locales) {
-        if (typeof value[locale] === 'string' && value[locale]) {
-          title = value[locale];
-          break;
-        }
-      }
-    if (title) break;
-  }
-  return `${
-    model
-      ? `${commentLabel(model.name)} (${commentLabel(model.apiKey)})`
-      : commentLabel(modelId)
-  } record ${commentLabel(id)}${title ? `, ${commentLabel(title)}` : ''}`;
-}
-
-function changedFields(
-  before: JsonObject | null,
-  after: JsonObject,
-): JsonObject {
-  return Object.fromEntries(
-    Object.entries(after).filter(
-      ([key, value]) =>
-        !before ||
-        !Object.hasOwn(before, key) ||
-        hashJson(before[key]) !== hashJson(value),
-    ),
-  );
-}
-function payloadPatch(
-  fields: JsonObject,
-  modelId: string,
-  schema: PlanMetadata['schema'],
-): JsonObject {
-  const payload = recordPayloadFields(fields, modelId, schema);
-  // The codec normalizes a full record and supplies null for omitted fields.
-  // Preserve omission in a script patch while still transforming its blocks.
-  return Object.fromEntries(
-    Object.keys(fields).map((key) => [key, payload[key]]),
-  );
-}
-
-function call(method: string, ...args: unknown[]): string {
-  return `  await client.${method}(${args
-    .map((arg) => migrationLiteral(arg, 1))
-    .join(', ')});\n\n`;
-}
-function recordMeta(
-  state: RecordState,
-  before?: RecordState | null,
-): JsonObject {
-  const values: JsonObject = {};
-  if (!before || state.createdAt !== before.createdAt)
-    values.created_at = state.createdAt;
-  if (!before || state.firstPublishedAt !== before.firstPublishedAt)
-    values.first_published_at = state.firstPublishedAt;
-  if (!before || state.stage !== before.stage) values.stage = state.stage;
-  return values;
-}
-
-async function emitRecord(
-  writer: ScriptWriter,
-  entry: RecordPlan,
-  schema: PlanMetadata['schema'],
-) {
-  const label = recordLabel(
-    entry.id,
-    entry.modelId,
-    schema,
-    entry.desired ?? entry.baseline,
-  );
-  const add = (action: string, statement: string) =>
-    writer.add(comment(action, label, statement));
-  if (entry.action === 'delete') {
-    await add('Delete record', call('items.destroy', entry.id));
-    return;
-  }
-  if (!entry.desired || !['create', 'update'].includes(entry.action)) return;
-  const desired = entry.desired;
-  const before = entry.baseline;
-  const model = schema.models.find(
-    (candidate) => candidate.id === desired.modelId,
-  )!;
-  let current = before?.current ?? null;
-  const metadata = recordMeta(desired, before);
-  const publish =
-    model.draftMode &&
-    desired.published !== null &&
-    hashJson(before?.published ?? null) !== hashJson(desired.published);
-  const initial = publish ? desired.published! : desired.current;
-  if (entry.action === 'create') {
-    const { stage: _stage, ...creationMetadata } = metadata;
-    await add(
-      'Create record',
-      call('items.create', {
-        id: entry.id,
-        item_type: { id: desired.modelId, type: 'item_type' },
-        ...recordPayloadFields(initial, desired.modelId, schema),
-        meta: creationMetadata,
-        ...(model.tree ? { parent_id: desired.parentId } : {}),
-        ...(model.sortable || model.tree ? { position: desired.position } : {}),
-      }),
-    );
-    const workflow = schema.workflows.find(
-      (candidate) => candidate.id === model.workflowId,
-    );
-    const initialStage = Array.isArray(workflow?.stages)
-      ? workflow.stages.find((stage) => object(stage) && stage.initial === true)
-      : undefined;
-    const createdStage =
-      object(initialStage) && typeof initialStage.id === 'string'
-        ? initialStage.id
-        : null;
-    if (desired.stage !== createdStage)
-      await add(
-        'Set workflow stage',
-        call('items.update', entry.id, { meta: { stage: desired.stage } }),
-      );
-    current = initial;
-  } else if (publish) {
-    const fields = changedFields(current, desired.published!);
-    if (Object.keys(fields).length || Object.keys(metadata).length)
-      await add(
-        'Update published fields',
-        call('items.update', entry.id, {
-          ...payloadPatch(fields, desired.modelId, schema),
-          ...(Object.keys(metadata).length ? { meta: metadata } : {}),
-        }),
-      );
-    current = desired.published;
-  }
-  if (publish)
-    await add(
-      'Publish record',
-      `  await client.items.publish(${JSON.stringify(
-        entry.id,
-      )}, undefined, { recursive: false });\n\n`,
-    );
-  if (model.draftMode && before?.published && desired.published === null)
-    await add(
-      'Unpublish record',
-      `  await client.items.unpublish(${JSON.stringify(
-        entry.id,
-      )}, undefined, { recursive: false });\n\n`,
-    );
-  const fields = changedFields(current, desired.current);
-  if (
-    Object.keys(fields).length ||
-    (entry.action !== 'create' && !publish && Object.keys(metadata).length)
-  )
-    await add(
-      publish
-        ? 'Restore newer draft fields'
-        : 'Update record fields and metadata',
-      call('items.update', entry.id, {
-        ...payloadPatch(fields, desired.modelId, schema),
-        ...(entry.action !== 'create' &&
-        !publish &&
-        Object.keys(metadata).length
-          ? { meta: metadata }
-          : {}),
-      }),
-    );
-  for (const [key, resource] of [
-    ['publication', 'scheduledPublication'],
-    ['unpublishing', 'scheduledUnpublishing'],
-  ] as const) {
-    const oldSchedule = before?.schedules[key] ?? null;
-    const schedule = desired.schedules[key];
-    if (hashJson(oldSchedule) === hashJson(schedule)) continue;
-    if (oldSchedule)
-      await add(
-        `Remove ${key} schedule`,
-        call(`${resource}.destroy`, entry.id),
-      );
-    if (schedule) {
-      const payload =
-        key === 'publication'
-          ? {
-              publication_scheduled_at: schedule.at,
-              selective_publication: desired.schedules.publication!.selective
-                ? {
-                    content_in_locales:
-                      desired.schedules.publication!.selective.locales,
-                    non_localized_content:
-                      desired.schedules.publication!.selective.nonLocalized,
-                  }
-                : null,
-            }
-          : {
-              unpublishing_scheduled_at: schedule.at,
-              content_in_locales: desired.schedules.unpublishing!.locales,
-            };
-      await add(
-        `Set ${key} schedule`,
-        call(`${resource}.create`, entry.id, payload),
-      );
-    }
-  }
-}
-
-function binaryRow(store: SnapshotStore, id: string): BinaryEntry {
-  const row = store.database
-    .prepare('SELECT data FROM migration_baseline_binaries WHERE upload_id=?')
-    .get(id);
-  if (!row) invalid(`Missing verified binary for upload ${id}.`);
-  return JSON.parse(String(row.data)) as BinaryEntry;
-}
-
-async function emitScript(
-  store: SnapshotStore,
-  metadata: PlanMetadata,
-  writer: ScriptWriter,
-): Promise<void> {
-  for (const entry of store.iteratePlan('collection')) {
-    const plan = entry as CollectionPlan;
-    if (!plan.desired || !['create', 'update'].includes(plan.action)) continue;
-    const desired = plan.desired;
-    await writer.add(
-      comment(
-        plan.action === 'create'
-          ? 'Create asset folder'
-          : 'Update asset folder',
-        `${commentLabel(desired.label)} (${commentLabel(plan.id)})`,
-        call(
-          `uploadCollections.${plan.action === 'create' ? 'create' : 'update'}`,
-          ...(plan.action === 'create' ? [] : [plan.id]),
-          {
-            ...(plan.action === 'create' ? { id: plan.id } : {}),
-            label: desired.label,
-            parent: desired.parentId
-              ? { id: desired.parentId, type: 'upload_collection' }
-              : null,
-            position: desired.position,
-          },
-        ),
-      ),
-    );
-  }
-  for (const entry of store.iteratePlan('upload')) {
-    const plan = entry as UploadPlan;
-    if (!plan.desired || !['create', 'update'].includes(plan.action)) continue;
-    const label = `${commentLabel(plan.desired.filename)} (${commentLabel(
-      plan.id,
-    )})`;
-    const body: JsonObject = {
-      ...plan.desired.attributes,
-      upload_collection: plan.desired.collectionId
-        ? { id: plan.desired.collectionId, type: 'upload_collection' }
-        : null,
-    };
-    if (requiresBinary(plan)) {
-      const asset = binaryRow(store, plan.id);
-      if (plan.action === 'create') {
-        const { basename: _basename, ...creationAttributes } = body;
-        const encoded = migrationLiteral(
-          {
-            id: plan.id,
-            filename: plan.desired.filename,
-            ...creationAttributes,
-          },
-          1,
-        );
-        await writer.asset(
-          (local) =>
-            comment(
-              'Create asset',
-              label,
-              `  await client.uploads.createFromLocalFile({\n    localPath: ${local},\n${encoded.slice(
-                2,
-              )});\n\n`,
-            ),
-          asset.binary.file,
-        );
-      } else {
-        const encoded = migrationLiteral(body, 1);
-        await writer.asset(
-          (local) =>
-            comment(
-              'Replace asset binary and metadata',
-              label,
-              `  // The runtime stages this verified local binary before the CMA replacement.\n  await client.uploads.update(${JSON.stringify(
-                plan.id,
-              )}, {\n    path: ${local},\n${encoded.slice(
-                2,
-              )}, { replace_strategy: 'create_new_url' });\n\n`,
-            ),
-          asset.binary.file,
-        );
-      }
-    } else
-      await writer.add(
-        comment(
-          'Update asset metadata',
-          label,
-          call('uploads.update', plan.id, body),
-        ),
-      );
-  }
-  for (const entry of store.iteratePlan('record'))
-    await emitRecord(writer, entry as RecordPlan, metadata.schema);
-  for (const entry of store.iteratePlan('upload', 'delete')) {
-    const plan = entry as UploadPlan;
-    await writer.add(
-      comment(
-        'Delete asset',
-        `${commentLabel(plan.baseline?.filename ?? '')} (${commentLabel(
-          plan.id,
-        )})`,
-        call('uploads.destroy', entry.id),
-      ),
-    );
-  }
-  for (const entry of store.iteratePlan('collection', 'delete')) {
-    const plan = entry as CollectionPlan;
-    await writer.add(
-      comment(
-        'Delete asset folder',
-        `${commentLabel(plan.baseline?.label ?? '')} (${commentLabel(
-          plan.id,
-        )})`,
-        call('uploadCollections.destroy', entry.id),
-      ),
-    );
-  }
-
-  // Reconcile complete affected groups, including unchanged siblings whose
-  // positions can shift as explicit create/update/delete intent is recorded.
-  const db = store.database;
-  db.exec(`CREATE TEMP TABLE migration_emit_positions(kind TEXT,id TEXT,model_id TEXT,parent_id TEXT,position REAL,PRIMARY KEY(kind,id)) WITHOUT ROWID;
-    CREATE INDEX migration_emit_position_order ON migration_emit_positions(kind,model_id,parent_id,position,id);`);
-  try {
-    const insert = db.prepare(
-      'INSERT OR REPLACE INTO migration_emit_positions VALUES(?,?,?,?,?)',
-    );
-    const remove = db.prepare(
-      'DELETE FROM migration_emit_positions WHERE kind=? AND id=?',
-    );
-    for (const model of metadata.schema.models) {
-      if (
-        (!model.sortable && !model.tree) ||
-        !db
-          .prepare(
-            "SELECT 1 FROM plan WHERE kind='record' AND model_id=? AND action IN ('create','update','delete') LIMIT 1",
-          )
-          .get(model.id)
-      )
-        continue;
-      for (const state of store.iterateRecords('target', model.id))
-        insert.run(
-          'record',
-          state.id,
-          model.id,
-          state.parentId,
-          state.position,
-        );
-      for (const row of db
-        .prepare(
-          "SELECT data FROM plan WHERE kind='record' AND model_id=? AND action IN ('create','update','delete') ORDER BY id",
-        )
-        .iterate(model.id)) {
-        const plan = JSON.parse(String(row.data)) as RecordPlan;
-        if (plan.action === 'delete') remove.run('record', plan.id);
-        else
-          insert.run(
-            'record',
-            plan.id,
-            model.id,
-            plan.desired!.parentId,
-            plan.desired!.position,
-          );
-      }
-    }
-    if (
-      db
-        .prepare(
-          "SELECT 1 FROM plan WHERE kind='collection' AND action IN ('create','update','delete') LIMIT 1",
-        )
-        .get()
-    ) {
-      for (const state of store.iterateCollections('target'))
-        insert.run('collection', state.id, '', state.parentId, state.position);
-      for (const entry of store.iteratePlan('collection')) {
-        const plan = entry as CollectionPlan;
-        if (plan.action === 'delete') remove.run('collection', plan.id);
-        else if (['create', 'update'].includes(plan.action))
-          insert.run(
-            'collection',
-            plan.id,
-            '',
-            plan.desired!.parentId,
-            plan.desired!.position,
-          );
-      }
-    }
-    for (let pass = 0; pass < 2; pass++)
-      for (const row of db
-        .prepare(
-          'SELECT * FROM migration_emit_positions ORDER BY kind,model_id,parent_id,position,id',
-        )
-        .iterate()) {
-        if (row.kind === 'collection')
-          await writer.add(
-            comment(
-              `Restore asset folder order (pass ${pass + 1}/2)`,
-              commentLabel(String(row.id)),
-              call('uploadCollections.update', row.id, {
-                parent: row.parent_id
-                  ? { id: row.parent_id, type: 'upload_collection' }
-                  : null,
-                position: row.position,
-              }),
-            ),
-          );
-        else {
-          const model = metadata.schema.models.find(
-            (candidate) => candidate.id === row.model_id,
-          )!;
-          await writer.add(
-            comment(
-              `Restore record order (pass ${pass + 1}/2)`,
-              recordLabel(String(row.id), model.id, metadata.schema),
-              call('items.update', row.id, {
-                ...(model.tree ? { parent_id: row.parent_id } : {}),
-                position: row.position,
-              }),
-            ),
-          );
-        }
-      }
-  } finally {
-    db.exec('DROP TABLE migration_emit_positions');
   }
 }
 
@@ -977,17 +539,6 @@ export async function writeMigration(args: {
         targetCounts[kind]++;
       }
     }
-    for (const state of store.iterateRecords('source'))
-      for (const slice of ['current', 'published'] as const) {
-        if (state[slice] !== null)
-          await writer.add({
-            type: 'validity',
-            recordId: state.id,
-            slice,
-            fieldHash: hashJson(state[slice]),
-            valid: state.validity[slice] === true,
-          });
-      }
     for (const row of store.database
       .prepare(
         'SELECT data FROM migration_baseline_binaries ORDER BY upload_id',
@@ -995,10 +546,8 @@ export async function writeMigration(args: {
       .iterate())
       await writer.add(JSON.parse(String(row.data)) as BinaryEntry);
     const chunks = await writer.finish();
-    const { temporarySchemaChanges: _changes, ...metadataWithoutExecution } =
-      metadata;
     const manifest: BaselineManifest = {
-      ...metadataWithoutExecution,
+      ...metadata,
       format: FORMAT,
       createdAt: new Date().toISOString(),
       sourceTracking: args.sourceTracking,
@@ -1026,8 +575,9 @@ export async function writeMigration(args: {
       output,
       maximum,
       signal,
+      metadata.temporarySchemaChanges,
     );
-    await emitScript(store, metadata, scriptWriter);
+    await emitMigrationCalls(store, metadata, scriptWriter, migrationLiteral);
     const script = await scriptWriter.finish(
       metadata.options.allowTemporarySchemaChanges,
     );
@@ -1108,6 +658,59 @@ function validateManifest(value: unknown): asserts value is BaselineManifest {
     )
   )
     invalid('Invalid generation options.');
+  if (!Array.isArray(value.temporarySchemaChanges))
+    invalid('Missing temporary field settings.');
+  const changed = new Set<string>();
+  const schema = value.schema as unknown as PlanMetadata['schema'];
+  for (const change of value.temporarySchemaChanges) {
+    if (
+      !object(change) ||
+      !text(change.fieldId) ||
+      !text(change.modelId) ||
+      changed.has(change.fieldId) ||
+      !object(change.original) ||
+      !object(change.temporary) ||
+      !object(change.original.validators) ||
+      !object(change.temporary.validators) ||
+      !Array.isArray(change.reasons) ||
+      !change.reasons.every(text)
+    )
+      invalid('Invalid temporary field settings.');
+    changed.add(change.fieldId);
+    const field = schema.models
+      .find((model) => model.id === change.modelId)
+      ?.fields.find((field) => field.id === change.fieldId);
+    if (
+      !field ||
+      hashJson(field.validators) !== hashJson(change.original.validators) ||
+      hashJson(field.defaultValue) !== hashJson(change.original.defaultValue)
+    )
+      invalid(
+        'Temporary field original settings differ from the captured schema.',
+      );
+    assertMetadataIntegerPrecision(
+      change.temporary.validators,
+      `Temporary validators for ${change.fieldId}`,
+    );
+    for (const [key, validator] of Object.entries(change.temporary.validators))
+      if (
+        !Object.hasOwn(change.original.validators, key) ||
+        hashJson(validator) !== hashJson(change.original.validators[key])
+      )
+        invalid('Temporary settings may only remove existing validators.');
+    if (
+      hashJson(change.temporary.defaultValue) !==
+        hashJson(change.original.defaultValue) &&
+      hashJson(change.temporary.defaultValue) !==
+        hashJson(suppressedDefaultValue(field, schema.locales))
+    )
+      invalid('Temporary settings may only suppress defaults.');
+  }
+  if (
+    changed.size &&
+    !(value.options as JsonObject).allowTemporarySchemaChanges
+  )
+    invalid('Temporary schema changes were not authorized at generation.');
   if (
     !object(value.targetCounts) ||
     kinds.some((kind) => !count((value.targetCounts as JsonObject)[kind]))
@@ -1136,16 +739,6 @@ function validateManifest(value: unknown): asserts value is BaselineManifest {
 }
 function validateRow(value: unknown): asserts value is Row {
   if (!object(value)) invalid('Invalid baseline entry.');
-  if (value.type === 'validity') {
-    if (
-      !text(value.recordId) ||
-      !['current', 'published'].includes(String(value.slice)) ||
-      !digest(value.fieldHash) ||
-      typeof value.valid !== 'boolean'
-    )
-      invalid('Invalid source validity evidence.');
-    return;
-  }
   if (value.type === 'binary') {
     if (
       !text(value.uploadId) ||
@@ -1229,18 +822,11 @@ export async function loadBaseline(
   );
   validateManifest(manifest);
   initTables(store);
-  for (const table of [
-    'migration_baseline',
-    'migration_baseline_validity',
-    'migration_baseline_binaries',
-  ])
+  for (const table of ['migration_baseline', 'migration_baseline_binaries'])
     if (store.database.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get())
       invalid('Baseline loading requires empty baseline tables.');
   const insert = store.database.prepare(
     'INSERT INTO migration_baseline VALUES(?,?,?,?,?,?,?,?)',
-  );
-  const evidence = store.database.prepare(
-    'INSERT INTO migration_baseline_validity VALUES(?,?,?,?)',
   );
   const binary = store.database.prepare(
     'INSERT INTO migration_baseline_binaries VALUES(?,?,?)',
@@ -1292,14 +878,7 @@ export async function loadBaseline(
             row.original ? JSON.stringify(row.original) : null,
           );
           counts[row.kind]++;
-        } else if (row.type === 'validity')
-          evidence.run(
-            row.recordId,
-            row.slice,
-            row.fieldHash,
-            Number(row.valid),
-          );
-        else {
+        } else {
           await verifyBinary(root, row.binary, signal);
           binary.run(row.uploadId, row.binary.file, JSON.stringify(row));
         }
@@ -1324,23 +903,10 @@ export async function loadBaseline(
   return manifest;
 }
 
-export function* baselineValidity(
-  store: SnapshotStore,
-): Generator<IntentValidityEvidence> {
-  for (const row of store.database
-    .prepare('SELECT * FROM migration_baseline_validity ORDER BY id,slice,hash')
-    .iterate())
-    yield {
-      recordId: String(row.id),
-      slice: row.slice as 'current' | 'published',
-      fieldHash: String(row.hash),
-      valid: Boolean(row.valid),
-    };
-}
 export function* baselineBinaries(
   store: SnapshotStore,
   directory: string,
-): Generator<IntentBinary> {
+): Generator<MigrationBinary> {
   for (const row of store.database
     .prepare('SELECT data FROM migration_baseline_binaries ORDER BY upload_id')
     .iterate()) {
@@ -1357,7 +923,7 @@ export function baselineBinaryLookup(
   store: SnapshotStore,
   directory: string,
   localPath: string,
-): IntentBinary | undefined {
+): MigrationBinary | undefined {
   if (resolve(localPath) !== localPath) return undefined;
   const file = relative(resolve(directory), localPath).split('\\').join('/');
   const row = store.database

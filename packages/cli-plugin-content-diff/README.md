@@ -1,39 +1,60 @@
 # DatoCMS content migrations
 
-Generate editable TypeScript migrations from content differences between DatoCMS environments or projects. Review the actual CMA calls, edit them if needed, then apply with destination checks, dependency planning, and final verification.
+Generate editable TypeScript migrations from content differences between DatoCMS environments or projects. Generation plans dependency order and emits actual CMA calls. Apply checks the destination and executes the script as written against the real CMA client.
 
-The plugin adds `content:diff` and `content:apply` to the unmodified DatoCMS CLI. Generate and execute content migrations through these plugin commands. Native `migrations:new --autogenerate` and `migrations:run` remain the separate schema migration workflow.
+The plugin adds `content:diff` and `content:apply` to the unmodified DatoCMS CLI. It does not change native schema migrations or write their migration receipts.
 
 ## Setup
 
-Requires Node.js 22.13+ on the 22.x line, or Node.js 24+. Node 22 may print an experimental SQLite warning to stderr.
+Requires Node.js 22.13+ on the 22.x line, or Node.js 24+. Node 22 may print an experimental SQLite warning to stderr. SQLite is local temporary storage; it requires no separate server or account.
 
-No custom CLI build or native migration-runner extension is required. When testing an unreleased plugin, install its local package or tarball in place of the registry plugin below.
-
-Install both packages in the project containing your migrations, and register that local plugin with the CLI:
+Install both packages in the project containing your migrations and register the local plugin:
 
 ```sh
 npm install --save-dev datocms @datocms/cli-plugin-content-diff
 npx datocms plugins:link ./node_modules/@datocms/cli-plugin-content-diff
 ```
 
-The generated TypeScript imports `@datocms/cli-plugin-content-diff/migration`. That import must resolve from the migration file. Installing a CLI plugin only with `plugins:install`, in a separate CLI plugin directory, does not necessarily make it available to the project's migration scripts.
+For an unreleased plugin, install its local package or tarball instead of the registry version. Generated scripts import `@datocms/cli-plugin-content-diff/migration`, so the package must resolve from the migration directory. Installing only with `plugins:install` in a separate CLI data directory is insufficient for those imports.
 
-Use the CLI's existing profiles, linked-project OAuth authentication, token environment variables, or `--api-token`. The plugin reads the native credential store and uses public SDK APIs; it does not patch native commands or call their private authentication methods.
+Use native profiles, linked-project OAuth, token environment variables, or `--api-token`. Authentication uses public CLI utilities and SDK APIs.
 
-## Generate and review
+## Generate
+
+```sh
+npx datocms content:diff syncContent --source=staging --destination=primary
+```
+
+Generation checks schema compatibility before capturing content. It reads complete managed namespaces once into temporary SQLite, including current and published values, expanded blocks, schedules, assets and folders. It performs no post-capture verification pass. Keep both environments' content and schemas unchanged during generation using external write controls; the plugin does not acquire an environment lock.
+
+The planner determines required changes, dependencies, publication cycles, ordering and any explicitly authorized temporary field settings. It then writes those execution steps into TypeScript. Assets are created before records; record operations follow the generated dependency order. Model selection limits changes, while other captured content supplies dependency and preservation evidence.
+
+Output is a timestamped file such as `migrations/content/1791200000_syncContent.ts` and its sibling `1791200000_syncContent.content/` directory. The default directory is the `content/` subdirectory of the destination profile's migration directory, or `./migrations/content`. Existing output is never overwritten.
+
+| Flag | Default | Behavior |
+| --- | --- | --- |
+| `--output` | Timestamped file | Choose an exact `.ts` path or an output directory. |
+| `--item-types=article,page` | `all` | Select regular model API keys for changes. |
+| `--uploads=referenced` | `referenced` | Include referenced assets, or use `all`. |
+| `--include-deletions` | Off | Include safe destination-only deletions within scope. |
+| `--allow-partial` | Off | Permit only proven isolated skips and dependent skips. |
+| `--allow-temporary-schema-changes` | Off | Permit supported temporary validator/default changes. |
+| `--concurrency=8` | `8` | Maximum concurrent generation requests, from 1 to 16. |
+| `--chunk-bytes=1048576` | `1048576` | Target TypeScript part size; individual operations are never split. |
+
+For separate projects, select both profiles:
 
 ```sh
 npx datocms content:diff syncContent \
-  --source=staging \
-  --destination=primary
+  --source=main --destination=main \
+  --source-profile=source-project --destination-profile=target-project
 ```
 
-This creates a native-style file such as `migrations/content/1791200000_syncContent.ts` and its sibling `1791200000_syncContent.content/` directory. The default directory is the `content/` subdirectory of the destination profile's `migrations.directory`, resolved relative to the configuration file, or `./migrations/content`. This keeps content scripts outside native schema migration discovery. The optional name defaults to `contentMigration`.
+The projects must have compatible managed schemas and public IDs. Captures run concurrently for separate projects. `--source-api-token` and `--destination-api-token` override their respective authentication; paired profiles cannot be combined with `--profile` or `--api-token`.
 
-`--output=./review/content.ts` chooses an exact filename. `--output=./review` chooses a directory and keeps automatic timestamped naming. Existing scripts and companion directories are never overwritten.
+## Review and edit the script
 
-Generated comments identify models, record IDs and available title/name values, with labels for lifecycle, asset, folder, schedule and ordering operations. Scripts use project Prettier settings resolved at their final paths; invalid configuration falls back to Prettier defaults. Each bounded part is formatted separately and checked against the file-size limit. A small generated migration contains operations like this:
+A small migration contains ordinary awaited CMA calls:
 
 ```ts
 import { join } from 'node:path';
@@ -43,10 +64,7 @@ import {
 } from '@datocms/cli-plugin-content-diff/migration';
 
 export default defineContentMigration(
-  {
-    baseline: join(__dirname, '1791200000_syncContent.content'),
-    allowTemporarySchemaChanges: false,
-  },
+  { baseline: join(__dirname, '1791200000_syncContent.content') },
   async (client: ContentMigrationClient): Promise<void> => {
     await client.items.update('AbCdEfGhIjKlMnOpQrStUv', {
       summary: { en: 'Updated procurement guidance.' },
@@ -55,135 +73,67 @@ export default defineContentMigration(
 );
 ```
 
-**The TypeScript calls define the intended changes.** Apply records those calls locally, rebuilds the complete desired state and dependency plan, and checks it before submitting content writes. Editing a payload changes what will be applied. A field omitted from an update keeps its destination value. Records the script does not mention are preserved.
+Each call executes immediately against the selected environment and returns the real CMA result. The plugin does not simulate the script, record intended content, or rebuild a plan during apply. `defineContentMigration` attaches the baseline declaration and manages outstanding requests; it returns a callable migration function. `ContentMigrationClient` uses public SDK method and response types for the methods supported by generated scripts and their parts.
 
-The exported `ContentMigrationClient` type exposes the supported record, asset, folder and schedule mutations. Autocomplete and TypeScript reject unsupported reads, schema operations and client configuration. Returned values describe local intended content, not server responses with version metadata or CDN URLs. Runtime validation still checks field values, dependencies and the captured schema. Creates need explicit canonical DatoCMS UUIDv4 IDs so links, blocks, and later operations can refer to the same identities. The plugin uses the CMA SDK validator and rejects legacy numeric IDs for new records, blocks, assets and folders. Use the SDK's `generateId()` helper when adding new creations; existing legacy identities can still be updated or deleted where supported. Record changes must stay within the model scope selected during generation. Align source and destination schemas before generating a content migration.
+Edits change what is sent to the CMA. Authors must keep edited operations in a valid order and update any related publication, schedule, or temporary-schema steps. The CMA validates actual writes. There is no automatic reordering or promise that an arbitrary edited script reproduces the originally generated result. Await every call.
 
-`defineContentMigration` returns a branded content definition consumed by `content:apply`, not a callable native schema migration. Scripts and their imported TypeScript helpers load through the public `tsx` runtime used by the native CLI. Run from the project directory so its tsconfig and path aliases apply, or set `TSX_TSCONFIG_PATH` explicitly. Entrypoint edits are reloaded; ordinary imported dependencies follow the runtime's normal module caching. Large parts execute in disposable Node worker processes, which release both module memory and compiler subprocesses after each part.
+Large migrations contain sequential TypeScript parts in the companion directory. Parts run in disposable Node processes to release compiled code and compiler subprocesses. Calls from a part are forwarded immediately to the real CMA client; this is execution, not a local simulation. The bridge supports the declared client methods and returns their real server responses.
 
-Generated migrations are **trusted executable Node.js code**. Only calls made through the supplied recording client follow the managed content workflow. Arbitrary imports, filesystem access, and other code are not sandboxed.
+TypeScript loads through public `tsx` APIs. Run from the project directory so its tsconfig/path aliases apply, or set `TSX_TSCONFIG_PATH`. Generated comments identify models, records and phases. Each part uses project Prettier settings and must fit within 16 MiB, including headers.
 
-### Generation options
+Scripts, imports and formatter configuration are trusted executable Node code, not a sandbox. Independently constructed clients and other side effects are outside the supplied client's request lifecycle.
 
-`--source` accepts an environment ID or `primary`; `--destination` defaults to `primary`. Generation checks schema compatibility before capturing both complete managed namespaces, including expanded current and published blocks. Each environment is captured once, without subsequent version scans, full-content rereads, or schema/asset consistency rereads. Keep content and schema unchanged in both environments throughout generation using external write controls; the plugin does not acquire an environment lock. Model selection limits intended changes, while other content supplies dependency and preservation evidence.
+## Companion files
 
-| Flag | Default | Behavior |
-| --- | --- | --- |
-| `--item-types=article,page` | `all` | Select regular model API keys for changes. |
-| `--uploads=referenced` | `referenced` | Include assets referenced by selected content, or use `all`. |
-| `--include-deletions` | Off | Emit safe destination-only deletions within scope. |
-| `--allow-partial` | Off | Allow only proven isolated skips and their dependency closure. |
-| `--allow-temporary-schema-changes` | Off | Permit planning supported temporary validator/default changes. |
-| `--concurrency=8` | `8` | Bound independent requests to 1–16. |
-| `--chunk-bytes=1048576` | `1048576` | Target TypeScript part size, from 1 to 16,776,192 bytes; never split an operation. |
+Keep the `.ts` file and its same-named `.content` directory together. Apply, preflight and repair all bind to that sibling directory. The companion holds checksummed schema/project bindings, original destination guards, original values for changed identities, repair settings, and required original asset binaries. It is not an executable mutation plan or saved run progress. The TypeScript contains the operations to execute.
 
-For separate projects, select both profiles:
+Edit TypeScript, including parts when present. Preserve baseline metadata and binary files. Checksums detect corruption and incomplete copies, not deliberate tampering by someone who can replace the checksums too. Artifacts contain project content, not authentication credentials.
 
-```sh
-npx datocms content:diff syncContent \
-  --source=main --destination=main \
-  --source-profile=source-project \
-  --destination-profile=target-project
-```
-
-The projects must have compatible managed schemas and public IDs. Both captures run concurrently because the projects have separate API rate limits. `--source-api-token` and `--destination-api-token` override their respective profile authentication. Paired profiles cannot be combined with `--profile` or `--api-token`.
-
-### What the companion directory contains
-
-Keep the `.ts` file and its `.content` directory together. The companion stores a checksummed baseline: schema and project bindings, guards for all destination identities, complete original values for content changed at generation, exact source validity evidence, and required asset binaries. Intended values come from the TypeScript; the companion contains no authoritative desired-content plan.
-
-Large migrations put actual CMA calls in TypeScript parts inside the companion directory. The entrypoint executes each part through a disposable Node worker process, so compiled modules and compiler subprocesses do not accumulate across the entire migration. One large operation may exceed the target part size. Every emitted TypeScript file must fit within 16 MiB including headers; oversized operations or files fail generation without leaving partial output.
-
-Edit the TypeScript, including parts when present. Keep baseline metadata and binaries unchanged. Checksums detect corruption and incomplete copies, not deliberate tampering by someone who can also replace the checksums. Artifacts contain project content and exclude client authentication credentials.
-
-### Validation after edits
-
-Unedited generated values reuse exact captured validity evidence, including invalid drafts and supported new records linking to each other. Edited values without matching evidence are checked with CMA validation endpoints before writes; these calls do not save content.
-
-Some edited values cannot be proven against the current destination: references to records that exist only in the future migration, changed or new uploads, or nested/default behavior that would validate a different value. Such edits are refused rather than assigned an invented validity result. This limitation does not reject an unchanged generated dependency cycle whose exact source evidence is available.
-
-Invalid drafts can be preserved where the model permits them. Writes that require temporary validators or default suppression need explicit authorization. Field settings are restored afterwards; DatoCMS determines the final validity flags.
+This format is incompatible with the earlier simulated-migration format. Regenerate old scripts and companions before applying them.
 
 ## Apply
 
 ```sh
-npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
-  --profile=target-project
+npx datocms content:apply ./migrations/content/1791200000_syncContent.ts
 ```
 
-Apply checks the companion, destination project/schema, and complete baseline, executes the TypeScript against the local recorder, and rebuilds its safety plan. It applies into a new isolated destination fork by default and reports its environment ID. It never promotes the fork automatically. `--destination=ENVIRONMENT_ID` selects another destination only if it satisfies the same project, schema, and baseline checks.
+Apply validates companion integrity, destination project/schema, permissions and the complete original destination baseline. By default it creates an isolated destination fork, verifies its baseline, and executes the script against that fork. It reports the resulting environment ID and never promotes it automatically.
 
 | Flag | Behavior |
 | --- | --- |
-| `--dry-run` | Validate the edited script and preview its rebuilt plan without plugin-owned remote writes or a fork. |
-| `--fork-name=content-review` | Name the newly created fork; existing names are refused. Incompatible with `--in-place` and `--repair`. |
-| `--in-place` | Write directly into the destination environment. |
-| `--allow-primary` | Additionally authorize primary writes; requires `--in-place` or `--repair`. |
-| `--keep-failed-fork` | Keep a fork created by this apply after failure. |
-| `--schedule-window=120` | Refuse schedules falling due within this many minutes; `0` disables this check. |
-| `--repair` | Restore eligible schedules and temporary field settings after an interrupted in-place run. |
-| `--fast-fork` | Use DatoCMS's fast fork, making the destination read-only while it copies. |
-| `--verification=versions` | Use version-based checks, or `full` to reread all records. |
-| `--allow-temporary-schema-changes` | Authorize supported temporary changes required by the rebuilt plan. |
-| `--concurrency=8` | Bound independent requests to 1–16; dependent writes retain their required order. |
+| `--preflight-only` | Check artifacts, destination baseline, permissions and options without executing the migration or creating a fork. |
+| `--fork-name=content-review` | Choose the new fork's name; existing names are refused. |
+| `--destination=ENVIRONMENT_ID` | Select a destination satisfying the recorded project/schema/baseline binding. |
+| `--in-place` | Execute directly in the destination. |
+| `--allow-primary` | Additionally authorize primary writes; required for primary in-place execution or repair. |
+| `--keep-failed-fork` | Retain a confirmed owned fork after failure. |
+| `--allow-temporary-schema-changes` | Authorize generated temporary validator/default changes. |
+| `--schedule-window=120` | Refuse existing schedules due within this many minutes; `0` disables the check. |
+| `--fast-fork` | Use DatoCMS's fast fork, which blocks destination writes while copying. |
+| `--verification=versions` | Choose version-based or full destination capture checks. |
+| `--concurrency=8` | Bound preflight capture requests; execution follows the script's written order. |
+| `--repair` | Conservatively restore original field settings and eligible original schedules after interrupted in-place execution. |
 
-Execution reports verified record changes by model, action and phase, and groups asset and folder changes. Counts are cumulative per phase and do not represent unique records or exact API request totals. Messages come from actual execution, not local script recording.
+`--preflight-only` replaces `--dry-run`. It does not execute migration callbacks, preview edited operations, validate arbitrary new payloads, or promise they will succeed. Preflight checks the script file without evaluating its imports or top-level code. Any displayed generated counts describe the original generation, not later edits. A later apply repeats destination checks.
 
-`--destination` selects the existing environment to compare and fork; `--fork-name` names the new result. Names may contain lowercase letters, numbers and dashes. If a fork request fails without confirming its identity, the plugin reports the unconfirmed name and leaves it alone; it never infers ownership from a matching name.
+The destination baseline protects against content changes made after generation. Execution does not compare its result with an obsolete desired-state copy or perform apply-time replanning. Script authors own edited logic and any additional assertions they need. Stop competing writes during execution; there is no atomic transaction around the entire migration.
 
-Only records being written have their schedules cancelled and later restored to the exact intended future dates. Other schedules are left alone. The schedule window includes existing destination schedules and intended schedules. Temporary field settings are restored before success. On failure, an owned fork is deleted unless explicitly retained; pre-existing environments are never deleted.
+## Interruptions and repair
 
-### Preview an edited migration
+Generation and execution are one-shot operations, with no pause, resume, checkpoints, or saved execution progress. Temporary SQLite/staging state is removed on completion or failure. Keep completed scripts and companions.
 
-```sh
-npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
-  --dry-run --fork-name=content-review --profile=target-project
-```
+Cooperative interruption stops new supported requests and drains submitted requests before cleanup. A confirmed owned fork is removed after failure unless explicitly retained. A failed fork request with an unconfirmed identity never grants cleanup ownership. SIGKILL and machine shutdown cannot run cleanup.
 
-Dry-run verifies the companion, destination baseline, permissions, schema, requested fork-name availability and schedule window. It evaluates the edited TypeScript locally, uses native validation endpoints when required, and rebuilds the dependency plan. It stops before fork creation, uploads, record writes, schedule changes or temporary schema changes. It still reads the full managed namespace and can take significant time on a large project. Use the same authorization flags as the intended apply, including `--allow-temporary-schema-changes` when needed.
-
-The terminal summary groups creates, updates and deletions by model and asset resource. `--json` returns `dryRun: true`, `mutations: 0`, overall `counts`, changed `groups`, `temporarySchemaChanges` and `partial`. Counts describe planned entities, not API requests; lifecycle, ordering and cycle handling may require multiple writes per entity. Originally skipped content remains omitted and is indicated by `partial`.
-
-This preview does not reserve the fork name or freeze the environment. A later apply repeats its checks and can fail if the destination or schedules change. The supplied recording client makes no content writes during dry-run, but migration code and formatter configuration remain trusted executable code: independently constructed clients, filesystem operations and arbitrary imports are not sandboxed. Dry-run cannot be combined with `--repair` or `--keep-failed-fork`.
-
-### Keep schema and content execution separate
-
-Use `migrations:run` for schema scripts and `content:apply SCRIPT.ts` for content scripts. Content execution owns its fork, authorization, interruption handling and cleanup entirely within the plugin. It does not create native migration receipts or participate in the native runner's pending-script queue.
-
-Keep content scripts in the default `migrations/content/` subdirectory or another directory outside native script discovery. If `--output` points into the schema migration directory, move the generated script and its companion together before running schema migrations. The native `migrations:run` command rejects a content definition because it is not a schema migration function; that runner may already have created its own fork and tracking model.
-
-Run required schema migrations before generating the content diff, against the aligned environments. Subsequent schema or content changes can invalidate the captured baseline. Use the same `migrations.modelApiKey` as at generation: the plugin preserves existing, validated schema migration receipts by excluding their exact tracking-model identity from content synchronization. A missing, replaced or newly introduced tracking model fails the baseline checks.
-
-Content application controls are flags on `content:apply`, including `--concurrency`, `--verification`, `--schedule-window` and `--allow-temporary-schema-changes`. Repair uses the script's optional `defineContentMigration` `concurrency` setting for reconstruction reads.
-
-### Interruptions and repair
-
-Generation and application are one-shot operations: no pause, resume, checkpoints, or saved execution progress. Temporary SQLite databases and staging files are removed on success or failure. Completed scripts and companions remain available for review.
-
-SIGINT, SIGTERM, and SIGHUP stop queued work, drain submitted operations, and run restoration and cleanup. A pending CMA operation can delay cleanup. SIGKILL and machine shutdown cannot run cleanup; use a persistent terminal session for long runs.
-
-Forced termination can leave owned `content-diff-*` temporary directories or `.content-migration-*` staging directories beside the output. Remove those only after confirming the run has stopped; they cannot be used to resume it.
-
-After an interrupted in-place run, retain the exact script used for that run and execute:
+Generated temporary field settings are restored through guarded cleanup. Conservative repair reads the sibling companion directly, never evaluates the TypeScript module, and never reconstructs edited intent. It restores a field only when its settings match the recorded temporary state, and an original missing future schedule only when the record still matches the original content. It cannot infer desired schedules from edited code or resume content writes. Ambiguous states require manual review.
 
 ```sh
 npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
-  --repair --destination=main --allow-primary --profile=target-project
+  --repair --destination=main --allow-primary
 ```
 
-Repair reconstructs the original baseline locally, replays the script to recover its intent, and restores only eligible field settings and schedules. It does not reapply record content or resume the failed run. Original-content records can receive their original schedules; records already matching the intended content can receive the intended schedules. Ambiguous states, expired schedules, and validity that would require saving a record are reported.
+## Native schema migrations
 
-Automatic repair requires enough original evidence. If a script edit changed a previously unchanged identity whose original payload was not stored, its live guard may no longer allow reconstruction. Repair also refuses unrelated schema changes, changed migration-tracking identity, and edited validity that cannot be checked while temporary rules remain. Keep the original script and companion, and investigate reported refusals rather than repeatedly applying the migration.
-
-## Concurrency and verification
-
-Generation assumes content and schema remain unchanged through external write controls and performs no post-capture verification. Initial schema compatibility, read permissions, pagination completeness, and payload integrity are still checked.
-
-During apply, destination capture checks, baseline comparison, focused live guards, and final verification detect observed conflicts. DatoCMS provides no persistent public sandbox write freeze; maintenance mode applies only to primary and is not an immutable snapshot or transaction. Stop competing writes during execution too, since another writer can act between a check and its write.
-
-`content:apply --verification=versions` uses current-version IDs and published-version timestamps to avoid rereading unchanged records. Changed versions are read fully and compared. `content:apply --verification=full` rereads every record in each consistency/final check and costs more requests. `content:diff` has no `--verification` flag.
-
-Some native operations rewrite values without a new record version, including upload URL changes and schema-driven changes. Schema fingerprints catch managed schema changes, and apply forces full record checks when its asset changes require them. An unrelated writer's URL rewrite can still escape a version-based capture check. Full verification gives stronger reads but does not freeze the environment.
+Keep content scripts under `migrations/content/` and execute them with `content:apply`. Use native `migrations:run` for schema migrations. Run schema changes before generating the content diff. The plugin preserves validated schema-migration tracking records and does not participate in the native pending-migration queue.
 
 ## Supported behavior and limits
 
@@ -208,4 +158,4 @@ npm test
 npm run package:check
 ```
 
-Tests cover generation, executable TypeScript edits, baseline integrity, recorded intent, dependency planning, plugin-only execution, interruption, repair, and cleanup. Memory and throughput claims require separate measurements: an incremental apply on a populated project does not establish full-transfer throughput, and synthetic scale tests do not establish a 600,000-record live TypeScript migration.
+Tests cover generated execution order, real CMA results, edited scripts, baseline integrity, plugin boundaries, interruption, repair and cleanup. Synthetic scale measurements and previous live runs of the retired execution architecture do not establish full-transfer throughput for this direct execution version.

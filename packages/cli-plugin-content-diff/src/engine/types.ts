@@ -1,5 +1,4 @@
 import type { CmaClient } from '@datocms/cli-utils';
-import type { SnapshotStore } from './store';
 
 export type Client = CmaClient.Client;
 export type JsonPrimitive = string | number | boolean | null;
@@ -216,17 +215,6 @@ export interface ArtifactChunkIndex {
   bytes: number;
   count: number;
 }
-/** A fresh plan rebuilt from TypeScript; never saved execution progress. */
-export interface PreparedPlan {
-  metadata: PlanMetadata;
-  entries: () => Iterable<PlanEntry>;
-  snapshot?: {
-    store: SnapshotStore;
-    environmentId: string;
-    schemaHash: string;
-  };
-  release?: () => void;
-}
 export interface CaptureOptions {
   /** Exclude only explicitly verified migration-tracking metadata. */
   schemaProjection?: (schema: SchemaState) => SchemaState;
@@ -236,7 +224,7 @@ export interface CaptureOptions {
   concurrency?: number;
   progress?: (message: string) => void;
 }
-export interface ApplyOptions {
+export interface DirectApplyOptions {
   /** Exclude only explicitly verified migration-tracking metadata. */
   schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
@@ -247,8 +235,8 @@ export interface ApplyOptions {
   destinationEnvironmentId?: string;
   /** Requested ID of a newly created fork; never an existing environment. */
   forkName?: string;
-  /** Complete read-only preflight and return the rebuilt plan before writes. */
-  dryRun?: boolean;
+  /** Check original artifacts and destination state without executing the script. */
+  preflightOnly?: boolean;
   concurrency?: number;
   /** Refuse to start when a schedule falls due within this many minutes. */
   scheduleWindowMinutes?: number;
@@ -273,23 +261,17 @@ export interface RepairResult {
   restoredSchedules: number;
   restoredFields: number;
 }
-export interface ApplyResult {
+export interface DirectApplyResult {
   environmentId: string;
-  mutations: number;
+  scriptExecuted: true;
   partial: boolean;
 }
-
-export interface PlanPreviewGroup {
-  kind: Kind;
-  model?: { id: string; apiKey: string; name: string };
-  counts: Record<Action, number>;
+export interface DirectPreflightResult {
+  environmentId: string;
+  preflightOnly: true;
+  scriptExecuted: false;
+  partial: boolean;
+  /** Original generation summary, not a prediction of edited TypeScript effects. */
+  generatedCounts: PlanCounts;
 }
-
-export interface ApplyPreviewResult extends ApplyResult {
-  dryRun: true;
-  counts: PlanCounts;
-  groups: PlanPreviewGroup[];
-  temporarySchemaChanges: number;
-}
-
-export type ApplyOutcome = ApplyResult | ApplyPreviewResult;
+export type DirectApplyOutcome = DirectApplyResult | DirectPreflightResult;

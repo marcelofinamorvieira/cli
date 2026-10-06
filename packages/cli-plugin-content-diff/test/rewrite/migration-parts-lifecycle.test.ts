@@ -30,7 +30,7 @@ describe('content migration part lifecycle', () => {
   });
   const filename = () => join(directory, 'part.ts');
 
-  it('rejects a delayed unawaited part before its intent can escape recording', async () => {
+  it('rejects a delayed unawaited part before it can write after the callback closes', async () => {
     await writeFile(
       filename(),
       `export default async function(client) {
@@ -41,12 +41,12 @@ describe('content migration part lifecycle', () => {
     const calls: unknown[] = [];
     const migration = defineContentMigration(
       { baseline: directory },
-      async (recording) => {
-        void runMigrationPart(recording, filename());
+      async (actual) => {
+        void runMigrationPart(actual, filename());
       },
     );
     await assert.rejects(
-      migration.run(
+      migration(
         client((...args) => {
           calls.push(args);
         }),
@@ -67,20 +67,20 @@ describe('content migration part lifecycle', () => {
     const release = deferred();
     const original = new Error('Callback failed');
     const events: string[] = [];
-    const recording = client(async () => {
+    const actual = client(async () => {
       started.resolve();
       await release.promise;
       events.push('drained');
     });
     const migration = defineContentMigration(
       { baseline: directory },
-      async (recording) => {
-        void runMigrationPart(recording, filename());
+      async (actual) => {
+        void runMigrationPart(actual, filename());
         await started.promise;
         throw original;
       },
     );
-    const result = migration.run(recording);
+    const result = migration(actual);
     const failed = assert.rejects(
       result,
       (error: unknown) => error === original,
@@ -93,7 +93,7 @@ describe('content migration part lifecycle', () => {
     assert.deepEqual(events, ['drained']);
   });
 
-  it('keeps a caught part failure sticky so partial intent cannot be applied', async () => {
+  it('keeps a caught part failure sticky so the runner cannot report success', async () => {
     await writeFile(
       filename(),
       `export default async function(client) {
@@ -104,16 +104,16 @@ describe('content migration part lifecycle', () => {
     const events: string[] = [];
     const migration = defineContentMigration(
       { baseline: directory },
-      async (recording) => {
+      async (actual) => {
         try {
-          await runMigrationPart(recording, filename());
+          await runMigrationPart(actual, filename());
         } catch {
           events.push('caught');
         }
       },
     );
     await assert.rejects(
-      migration.run(
+      migration(
         client(() => {
           events.push('prefix');
         }),
@@ -134,20 +134,20 @@ describe('content migration part lifecycle', () => {
       "export default async function(client) { await client.items.update('two', {}); }",
     );
     const calls: unknown[] = [];
-    const recording = client((id) => {
+    const actual = client((id) => {
       calls.push(id);
     });
     const migration = defineContentMigration(
       { baseline: directory },
-      async (recording) => {
-        await runMigrationPart(recording, filename());
-        await runMigrationPart(recording, next);
+      async (actual) => {
+        await runMigrationPart(actual, filename());
+        await runMigrationPart(actual, next);
       },
     );
-    await migration.run(recording);
+    await migration(actual);
     assert.deepEqual(calls, ['one', 'two']);
     await assert.rejects(
-      runMigrationPart(recording, filename()),
+      runMigrationPart(actual, filename()),
       /inside defineContentMigration/,
     );
   });
@@ -160,7 +160,7 @@ describe('content migration part lifecycle', () => {
     const started = deferred();
     const release = deferred();
     const calls: unknown[] = [];
-    const recording = client(async (id) => {
+    const actual = client(async (id) => {
       calls.push(id);
       started.resolve();
       await release.promise;
@@ -173,11 +173,11 @@ describe('content migration part lifecycle', () => {
     });
     const migration = defineContentMigration(
       { baseline: directory },
-      async (recording) => {
-        await runMigrationPart(recording, filename());
+      async (actual) => {
+        await runMigrationPart(actual, filename());
       },
     );
-    const result = migration.run(recording, controller.signal);
+    const result = migration(actual, controller.signal);
     const failed = assert.rejects(
       result,
       (error: unknown) => error === interruption,

@@ -1,7 +1,7 @@
 import { oclif } from '@datocms/cli-utils';
-import { validateForkName } from '../../engine/apply';
+import { validateForkName } from '../../engine/direct-apply';
 import { ContentError } from '../../engine/errors';
-import type { ApplyOutcome, RepairResult } from '../../engine/types';
+import type { DirectApplyOutcome, RepairResult } from '../../engine/types';
 import { applyContentMigration, repairContentMigration } from '../../migration';
 import { ContentCommand, concurrency } from '../../utils/content-command';
 import { withInterruptHandling } from '../../utils/interruption';
@@ -13,7 +13,7 @@ export default class ContentApplyCommand extends ContentCommand {
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --in-place',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --repair',
-    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --dry-run',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --preflight-only',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --fork-name=content-review',
   ];
   static args = {
@@ -27,9 +27,9 @@ export default class ContentApplyCommand extends ContentCommand {
       description:
         'Apply against this destination environment ID instead of the migration binding',
     }),
-    'dry-run': oclif.Flags.boolean({
+    'preflight-only': oclif.Flags.boolean({
       description:
-        'Validate the script and preview its rebuilt plan without applying changes or creating a fork',
+        'Check artifacts, permissions and the original destination baseline without executing the script or creating a fork',
       exclusive: ['repair', 'keep-failed-fork'],
       default: false,
     }),
@@ -82,12 +82,13 @@ export default class ContentApplyCommand extends ContentCommand {
       default: 'versions',
     })(),
     concurrency: oclif.Flags.integer({
-      description: 'Maximum concurrent independent requests (1–16)',
+      description:
+        'Maximum concurrent baseline read requests (1–16); script calls execute as written',
       default: 8,
     }),
   };
 
-  async run(): Promise<ApplyOutcome | RepairResult> {
+  async run(): Promise<DirectApplyOutcome | RepairResult> {
     return withInterruptHandling(
       (signal) => this.runOperation(signal),
       () =>
@@ -99,7 +100,7 @@ export default class ContentApplyCommand extends ContentCommand {
 
   private async runOperation(
     signal: AbortSignal,
-  ): Promise<ApplyOutcome | RepairResult> {
+  ): Promise<DirectApplyOutcome | RepairResult> {
     const { flags, args } = await this.parse(ContentApplyCommand);
     const maximum = concurrency(flags.concurrency);
     validateForkName({
@@ -157,7 +158,7 @@ export default class ContentApplyCommand extends ContentCommand {
         ...(flags['fork-name'] !== undefined
           ? { forkName: flags['fork-name'] }
           : {}),
-        ...(flags['dry-run'] ? { dryRun: true } : {}),
+        ...(flags['preflight-only'] ? { preflightOnly: true } : {}),
         concurrency: maximum,
         scheduleWindowMinutes: flags['schedule-window'],
         fastFork: flags['fast-fork'],
@@ -166,28 +167,10 @@ export default class ContentApplyCommand extends ContentCommand {
       },
     });
     if (!this.jsonEnabled()) {
-      if ('dryRun' in result && result.dryRun) {
+      if ('preflightOnly' in result) {
         this.log(
-          `Dry run validated against environment "${result.environmentId}". No changes applied.`,
+          `Preflight checks passed against environment "${result.environmentId}". The script was not executed; edited effects were not previewed.`,
         );
-        for (const group of result.groups) {
-          const label = group.model
-            ? `${group.model.name} (${group.model.apiKey})`
-            : group.kind === 'upload'
-              ? 'Assets'
-              : 'Asset folders';
-          const { create, update, delete: deleted, skip } = group.counts;
-          this.log(
-            `${label}: ${create} create, ${update} update, ${deleted} delete${
-              skip ? `, ${skip} skip` : ''
-            }.`,
-          );
-        }
-        if (result.groups.length === 0) this.log('No content changes planned.');
-        if (result.temporarySchemaChanges)
-          this.log(
-            `${result.temporarySchemaChanges} temporary field changes required; original settings will be restored during apply.`,
-          );
         if (result.partial)
           this.log(
             'Partial migration: generation omitted unsupported content.',
@@ -195,10 +178,10 @@ export default class ContentApplyCommand extends ContentCommand {
         return result;
       }
       const partial = result.partial
-        ? ' from a partial migration; skipped entries were not applied'
+        ? ' (generation omitted unsupported content)'
         : '';
       this.log(
-        `Applied ${result.mutations} mutations in environment "${result.environmentId}"${partial}.`,
+        `Executed content migration in environment "${result.environmentId}"${partial}.`,
       );
     }
     return result;

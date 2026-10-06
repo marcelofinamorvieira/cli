@@ -5,6 +5,7 @@ import {
   loadBaseline,
   writeMigration,
 } from '../../src/engine/migration-artifact';
+import { PlannerGraph } from '../../src/engine/planner-graph';
 import type { SnapshotStore } from '../../src/engine/store';
 import type {
   BinaryFile,
@@ -205,6 +206,10 @@ export async function writeFixture(
     idleTimeout?: number;
   },
 ): Promise<string> {
+  // Artifact fixtures insert plans directly, including the folder ordering
+  // normally supplied by the generation planner.
+  const graph = new PlannerGraph(args.store.database);
+  graph.clear('collection-final-parent-proof');
   for (const entry of args.store.planEntries()) {
     if (entry.baseline) {
       if (entry.kind === 'record')
@@ -215,7 +220,20 @@ export async function writeFixture(
     }
     if (entry.kind === 'record' && entry.desired)
       args.store.putRecord('source', entry.desired);
+    if (entry.kind === 'collection' && entry.desired) {
+      graph.node('collection-final-parent-proof', 'collection', entry.id);
+      if (entry.desired.parentId)
+        graph.edge(
+          'collection-final-parent-proof',
+          'collection',
+          entry.id,
+          'collection',
+          entry.desired.parentId,
+          'parent',
+        );
+    }
   }
+  graph.order('collection-final-parent-proof');
   const original = assetDownload.fetchBinary;
   Reflect.set(
     assetDownload,

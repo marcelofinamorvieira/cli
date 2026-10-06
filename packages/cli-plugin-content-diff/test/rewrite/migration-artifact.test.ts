@@ -17,14 +17,11 @@ import {
 } from '../../src/engine/codec';
 import {
   baselineBinaries,
-  baselineBinaryLookup,
-  baselineValidity,
   compareBaseline,
   loadBaseline,
   migrationLiteral,
   writeMigration,
 } from '../../src/engine/migration-artifact';
-import { createIntentRecorder } from '../../src/engine/migration-intent';
 import {
   MAX_MIGRATION_CHUNK_BYTES,
   MAX_MIGRATION_FILE_BYTES,
@@ -40,6 +37,10 @@ import type {
   UploadState,
 } from '../../src/engine/types';
 import type { ContentMigrationClient } from '../../src/migration';
+import {
+  directClientFixture,
+  executeGeneratedScript as runScript,
+} from './direct-client-fixture';
 import { fixtureId } from './fixture-id';
 
 const MODEL = 'aaaaaaaaaaaaaaaaaaaaaa';
@@ -163,56 +164,6 @@ async function fixture(
     },
   };
 }
-async function runScript(
-  file: string,
-  client: ContentMigrationClient,
-): Promise<void> {
-  const source = await readFile(file, 'utf8');
-  const transformed = ts.transpileModule(source, {
-    fileName: file,
-    reportDiagnostics: true,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-    },
-  });
-  assert.deepEqual(
-    transformed.diagnostics?.filter(
-      (d) => d.category === ts.DiagnosticCategory.Error,
-    ),
-    [],
-  );
-  const localRequire = createRequire(file);
-  const module = {
-    exports: {} as {
-      default: (client: ContentMigrationClient) => Promise<void>;
-    },
-  };
-  const runtime = {
-    defineContentMigration: (
-      _options: unknown,
-      callback: (client: ContentMigrationClient) => Promise<void>,
-    ) => callback,
-    runMigrationPart: (client: ContentMigrationClient, path: string) =>
-      runScript(path, client),
-  };
-  compileFunction(
-    transformed.outputText,
-    ['require', 'module', 'exports', '__dirname', '__filename'],
-    { filename: file },
-  )(
-    (specifier: string) =>
-      specifier === '@datocms/cli-plugin-content-diff/migration'
-        ? runtime
-        : localRequire(specifier),
-    module,
-    module.exports,
-    dirname(file),
-    file,
-  );
-  await module.exports.default(client);
-}
-
 async function typecheckScript(test: Awaited<ReturnType<typeof fixture>>) {
   const files = [test.output];
   try {
@@ -256,14 +207,9 @@ async function replay(test: Awaited<ReturnType<typeof fixture>>) {
       store.putCollection('target', state);
     const manifest = await loadBaseline(test.baseline, store);
     compareBaseline(store);
-    const recorder = createIntentRecorder({
-      store,
-      schema: test.definition,
-      validityEvidence: baselineValidity(store),
-      binaryLookup: (path) => baselineBinaryLookup(store, test.baseline, path),
-    });
-    await runScript(test.output, recorder.client);
-    recorder.assertReady();
+    const remote = directClientFixture(store, test.definition);
+    await runScript(test.output, remote.client, remote.uploadFile);
+    remote.snapshot(store);
     const plan = await createPlan(
       store,
       test.definition,
@@ -473,7 +419,7 @@ describe('TypeScript migration artifacts', () => {
         /from '@datocms\/cli-plugin-content-diff\/migration'\n/,
       );
       assert.match(script, /'title': 'Styled'/);
-      assert.match(script, /\n {8}await client\.items\.update/);
+      assert.match(script, /\n {12}await client\.items\.update/);
       const replayed = await replay(test);
       replayed.dispose();
     } finally {
@@ -585,10 +531,17 @@ describe('TypeScript migration artifacts', () => {
       });
       const parts = await readdir(join(test.baseline, 'parts'));
       assert(parts.length > 1);
-      for (const part of parts)
-        assert(
-          (await readFile(join(test.baseline, 'parts', part))).length <= 6024,
+      for (const part of parts) {
+        const content = await readFile(
+          join(test.baseline, 'parts', part),
+          'utf8',
         );
+        assert(
+          Buffer.byteLength(content) <= 6024 ||
+            (content.match(/client\.items\.update/g) ?? []).length === 1,
+          'only one indivisible guarded operation may exceed the part target',
+        );
+      }
       const replayed = await replay(test);
       replayed.dispose();
     } finally {
@@ -693,6 +646,139 @@ describe('TypeScript migration artifacts', () => {
       await typecheckScript(test);
       const replayed = await replay(test);
       replayed.dispose();
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('executes provisional publication before completing circular published links and newer drafts', async () => {
+    const firstPublishedAt = '2025-02-01T00:00:00.000Z';
+    const left = record(
+      'cycle-left',
+      { title: 'Left draft', related: [id('cycle-right')] },
+      {
+        published: { title: 'Left published', related: [id('cycle-right')] },
+        firstPublishedAt,
+        validity: { current: true, published: true },
+      },
+    );
+    const right = record(
+      'cycle-right',
+      { title: 'Right draft', related: [id('cycle-left')] },
+      {
+        published: { title: 'Right published', related: [id('cycle-left')] },
+        firstPublishedAt,
+        validity: { current: true, published: true },
+      },
+    );
+    const test = await fixture([], [left, right]);
+    try {
+      assert(
+        [...test.store.planEntries('record')].some(
+          (entry) =>
+            entry.kind === 'record' && entry.execution?.provisionalPublished,
+        ),
+      );
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+        chunkBytes: 350,
+      });
+      const remote = directClientFixture(test.store, test.definition);
+      await runScript(test.output, remote.client, remote.uploadFile);
+      assert(
+        remote.events.filter((event) => event.startsWith('publish:')).length >=
+          3,
+      );
+      for (const expected of [left, right]) {
+        assert.deepEqual(
+          remote.records.get(expected.id)!.published,
+          expected.published,
+        );
+        assert.deepEqual(
+          remote.records.get(expected.id)!.current,
+          expected.current,
+        );
+      }
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('restores temporary required validators in the script after successful invalid publication and failed writes', async () => {
+    const definition = schema();
+    definition.models[0].fields[0].validators = { required: {} };
+    definition.hash = schemaHash(definition);
+    const invalid = record(
+      'invalid-published',
+      { title: '' },
+      {
+        published: { title: '', related: [] },
+        firstPublishedAt: '2025-02-01T00:00:00.000Z',
+        validity: { current: false, published: false },
+      },
+    );
+    const test = await fixture([], [invalid], definition);
+    try {
+      assert(test.metadata.temporarySchemaChanges.length > 0);
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+        chunkBytes: 300,
+      });
+      await typecheckScript(test);
+      for (const failure of [false, true]) {
+        const remote = directClientFixture(test.store, test.definition);
+        if (failure)
+          Reflect.set(remote.client.items, 'create', async () => {
+            throw new Error('injected create failure');
+          });
+        const run = runScript(test.output, remote.client, remote.uploadFile);
+        if (failure) await assert.rejects(run, /injected create failure/);
+        else await run;
+        assert.deepEqual(remote.definition.models[0].fields[0].validators, {
+          required: {},
+        });
+        assert(
+          remote.events.filter((event) => event.startsWith('field:')).length >=
+            2,
+        );
+      }
+    } finally {
+      await test.dispose();
+    }
+  });
+
+  it('suppresses configured creation defaults to preserve explicit null and restores the field afterward', async () => {
+    const definition = schema();
+    definition.models[0].fields[0].defaultValue = 'Native default';
+    definition.hash = schemaHash(definition);
+    const wanted = record('null-default', { title: null });
+    const test = await fixture([], [wanted], definition);
+    try {
+      assert(
+        test.metadata.temporarySchemaChanges.some(
+          (change) => change.temporary.defaultValue === null,
+        ),
+      );
+      await writeMigration({
+        ...test,
+        outputPath: test.output,
+        sourceTracking: tracking,
+        destinationTracking: tracking,
+        chunkBytes: 300,
+      });
+      const remote = directClientFixture(test.store, test.definition);
+      await runScript(test.output, remote.client, remote.uploadFile);
+      assert.equal(remote.records.get(wanted.id)!.current.title, null);
+      assert.equal(
+        remote.definition.models[0].fields[0].defaultValue,
+        'Native default',
+      );
     } finally {
       await test.dispose();
     }

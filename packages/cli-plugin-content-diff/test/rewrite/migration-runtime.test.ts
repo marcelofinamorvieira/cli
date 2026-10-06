@@ -1,577 +1,421 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rm,
-  writeFile,
-} from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, it } from 'mocha';
-import * as execution from '../../src/engine/apply';
-import * as capture from '../../src/engine/capture';
-import { inspectRecord, recordHash } from '../../src/engine/codec';
-import { writeMigration } from '../../src/engine/migration-artifact';
-import { loadMigrationModule } from '../../src/engine/migration-loader';
-import { buildPlanPreview } from '../../src/engine/migration-preview';
-import { createPlan } from '../../src/engine/planner';
-import * as schemaApi from '../../src/engine/schema';
-import { SnapshotStore } from '../../src/engine/store';
-import type {
-  ApplyOptions,
-  Client,
-  FieldSchema,
-  JsonObject,
-  PlanEntry,
-  RecordPlan,
-  RecordState,
-  SchemaState,
-} from '../../src/engine/types';
+import { CmaClient } from '@datocms/cli-utils';
+import { afterEach, beforeEach, describe, it } from 'mocha';
 import {
-  type ContentMigration,
+  type ContentMigrationClient,
   applyContentMigration,
+  checkMigration,
+  defineContentMigration,
+  loadContentMigration,
+  repairContentMigration,
+  runMigrationPart,
+  uploadMigrationFile,
 } from '../../src/migration';
 import { fixtureId } from './fixture-id';
 
-const id = fixtureId;
-const FAQ = id('runtime-faq');
-const PAGE = id('runtime-page');
-const CHANGED = id('runtime-changed');
-const UNCHANGED = id('runtime-unchanged');
-const UNSELECTED = id('runtime-unselected');
-const tracking = { apiKey: 'schema_migration', model: null };
-const restorations: Array<() => void> = [];
-const fixtures: Array<{ dispose(): Promise<void> }> = [];
-
-function replace(target: object, key: string, replacement: unknown): void {
-  const original = Reflect.get(target, key);
-  Reflect.set(target, key, replacement);
-  restorations.push(() => Reflect.set(target, key, original));
-}
-
-function field(apiKey: string, localized = false): FieldSchema {
-  return {
-    id: id(`runtime-field-${apiKey}`),
-    apiKey,
-    type: localized ? 'text' : 'string',
-    localized,
-    validators: {},
-    defaultValue: localized ? { en: null, it: null } : null,
-  };
-}
-
-function schema(): SchemaState {
-  const common = {
-    block: false,
-    singleton: false,
-    sortable: false,
-    tree: false,
-    draftMode: true,
-    saveInvalidDrafts: true,
-    allLocalesRequired: false,
-    workflowId: null,
-  };
-  const value: SchemaState = {
-    siteId: 'runtime-site',
-    environmentId: 'source',
-    locales: ['en', 'it'],
-    semantics: {},
-    workflows: [],
-    hash: '',
-    models: [
-      {
-        ...common,
-        id: FAQ,
-        apiKey: 'faq',
-        name: 'FAQ',
-        fields: [field('title'), field('summary', true)],
-      },
-      {
-        ...common,
-        id: PAGE,
-        apiKey: 'page',
-        name: 'Page',
-        fields: [field('page_title')],
-      },
-    ],
-  };
-  value.hash = schemaApi.schemaHash(value);
-  return value;
-}
-
-function record(
-  recordId: string,
-  current: JsonObject,
-  modelId = FAQ,
-): RecordState {
-  const value: RecordState = {
-    id: recordId,
-    modelId,
-    current,
-    published: null,
-    currentVersion: '1',
-    publishedUpdatedAt: null,
-    createdAt: '2025-01-01T00:00:00.000Z',
-    firstPublishedAt: null,
-    parentId: null,
-    position: null,
-    stage: null,
-    schedules: { publication: null, unpublishing: null },
-    validity: { current: true, published: null },
-    hash: '',
-  };
-  value.hash = recordHash(value);
-  return value;
-}
-
-function put(
-  store: SnapshotStore,
-  side: 'source' | 'target',
-  value: RecordState,
-  state: SchemaState,
-) {
-  store.putRecord(side, value);
-  const inspected = inspectRecord(value, state);
-  for (const reference of inspected.references)
-    store.putReference(side, reference);
-  for (const owner of inspected.blockOwners) store.putBlockOwner(side, owner);
-  for (const unique of inspected.uniqueValues)
-    store.putUniqueValue(side, unique);
-}
-
-async function fixture(chunkBytes?: number) {
-  const directory = await mkdtemp(join(tmpdir(), 'content-migration-runtime-'));
-  const state = schema();
-  const before = [
-    record(CHANGED, {
-      title: 'Procurement FAQ',
-      summary: { en: 'Before', it: 'Prima' },
-    }),
-    record(UNCHANGED, {
-      title: 'Unchanged FAQ',
-      summary: { en: 'Keep this', it: 'Conservare' },
-    }),
-    record(UNSELECTED, { page_title: 'Unselected page' }, PAGE),
-  ];
-  const after = [
-    record(CHANGED, {
-      title: 'Procurement FAQ',
-      summary: { en: 'Generated English', it: 'Prima' },
-    }),
-    chunkBytes === undefined
-      ? before[1]
-      : record(UNCHANGED, {
-          ...before[1].current,
-          title: 'Second changed FAQ',
-        }),
-    before[2],
-  ];
-  const store = new SnapshotStore(directory);
-  for (const value of before) put(store, 'target', value, state);
-  for (const value of after) put(store, 'source', value, state);
-  const metadata = await createPlan(
-    store,
-    state,
-    { ...state, environmentId: 'destination' },
-    {
-      modelIds: [FAQ],
-      uploads: 'referenced',
-      includeDeletions: false,
-      allowPartial: false,
-      allowTemporarySchemaChanges: false,
-    },
-  );
-  const output = join(directory, '123_change.ts');
-  await writeMigration({
-    store,
-    metadata,
-    outputPath: output,
-    sourceTracking: tracking,
-    destinationTracking: tracking,
-    chunkBytes,
+describe('direct TypeScript content execution', () => {
+  let directory: string;
+  beforeEach(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'direct-content-runtime-'));
   });
-  // Resolve the real public runtime to this test's source module. The emitted
-  // migration remains unchanged and executes through its actual public import.
-  const packageDirectory = join(
-    directory,
-    'node_modules/@datocms/cli-plugin-content-diff',
-  );
-  await mkdir(packageDirectory, { recursive: true });
-  await writeFile(
-    join(packageDirectory, 'package.json'),
-    JSON.stringify({
-      name: '@datocms/cli-plugin-content-diff',
-      exports: { './migration': './migration.cjs' },
-    }),
-  );
-  await writeFile(
-    join(packageDirectory, 'migration.cjs'),
-    `module.exports = require(${JSON.stringify(
-      resolve(__dirname, '../../src/migration.ts'),
-    )});\n`,
-  );
-  const result = {
-    directory,
-    state,
-    before,
-    after,
-    store,
-    output,
-    baseline: join(directory, '123_change.content'),
-    async dispose() {
-      store.dispose();
-      await rm(directory, { recursive: true, force: true });
-    },
-  };
-  fixtures.push(result);
-  return result;
-}
-
-type Fixture = Awaited<ReturnType<typeof fixture>>;
-function harness(test: Fixture) {
-  const events: string[] = [];
-  const validations: Array<{ recordId: string; payload: JsonObject }> = [];
-  const plans: Array<{ entries: PlanEntry[]; options: ApplyOptions }> = [];
-  const capturedStores: SnapshotStore[] = [];
-  let primary = false;
-  let wrongProject = false;
-  let captureCalls = 0;
-  let schemaCalls = 0;
-  let writes = 0;
-  const client = (environment: string) =>
-    ({
-      config: { environment },
-      items: {
-        validateExisting: async (recordId: string, payload: JsonObject) => {
-          validations.push({ recordId, payload });
-        },
-        validateNew: async () => assert.fail('fixture does not create records'),
-        create: async () => {
-          writes++;
-          assert.fail('recording must not create remotely');
-        },
-        update: async () => {
-          writes++;
-          assert.fail('recording must not update remotely');
-        },
-        destroy: async () => {
-          writes++;
-          assert.fail('recording must not delete remotely');
-        },
-      },
-    }) as unknown as Client;
-  const rootClient = {
-    environments: {
-      find: async (environment: string) => ({
-        id: environment,
-        meta: { primary },
-      }),
-    },
-  } as unknown as Client;
-  replace(
-    schemaApi,
-    'fetchSchema',
-    async (
-      _client: Client,
-      environment: string,
-      projection?: (schema: SchemaState) => SchemaState,
-    ) => {
-      events.push('schema');
-      schemaCalls++;
-      const raw: SchemaState = {
-        ...test.state,
-        environmentId: environment,
-        siteId: wrongProject ? 'wrong-site' : test.state.siteId,
-        models: [...test.state.models],
-      };
-      raw.hash = schemaApi.schemaHash(raw);
-      return projection ? projection(raw) : raw;
-    },
-  );
-  replace(
-    capture,
-    'captureSnapshot',
-    async (args: Parameters<typeof capture.captureSnapshot>[0]) => {
-      events.push('capture');
-      captureCalls++;
-      capturedStores.push(args.store);
-      for (const value of test.before)
-        put(args.store, 'target', value, args.schema);
-    },
-  );
-  replace(
-    execution,
-    'applyPlan',
-    async (args: Parameters<typeof execution.applyPlan>[0]) => {
-      assert.ok(args.plan, 'public runtime must replan executed TypeScript');
-      events.push('apply');
-      plans.push({
-        entries: [...args.plan.entries()],
-        options: args.options,
-      });
-      if (args.options.dryRun) {
-        const previewStore = new SnapshotStore();
-        try {
-          for (const entry of plans.at(-1)!.entries)
-            previewStore.putPlan(entry);
-          return buildPlanPreview(
-            previewStore,
-            args.plan.metadata,
-            'destination',
-          );
-        } finally {
-          args.plan.release?.();
-          previewStore.dispose();
-        }
-      }
-      args.plan.release?.();
-      return {
-        environmentId: args.options.inPlace
-          ? args.options.destinationEnvironmentId ?? 'destination'
-          : 'owned-fork',
-        mutations: 1,
-        partial: false,
-      };
-    },
-  );
-  const options: ApplyOptions = {
-    inPlace: false,
-    allowPrimary: false,
-    keepFailedFork: false,
-    allowTemporarySchemaChanges: false,
-    concurrency: 2,
-  };
-  return {
-    events,
-    validations,
-    plans,
-    capturedStores,
-    client,
-    rootClient,
-    options,
-    setPrimary: (value: boolean) => {
-      primary = value;
-    },
-    setWrongProject: (value: boolean) => {
-      wrongProject = value;
-    },
-    counts: () => ({ schemaCalls, captureCalls, writes }),
-    run: (overrides: Partial<ApplyOptions> = {}) =>
-      applyContentMigration({
-        rootClient,
-        buildEnvironmentClient: client,
-        scriptPath: test.output,
-        options: { ...options, ...overrides },
-      }),
-  };
-}
-
-describe('generated TypeScript public runtime integration', () => {
   afterEach(async () => {
-    for (const restore of restorations.splice(0).reverse()) restore();
-    for (const test of fixtures.splice(0)) await test.dispose();
+    await rm(directory, { recursive: true, force: true });
   });
 
-  it('executes edited CMA payloads, rebuilds their plan, and preserves the unmentioned namespace', async () => {
-    const test = await fixture();
-    const emitted = await readFile(test.output, 'utf8');
-    assert.match(emitted, /await client\.items\.update/);
-    assert.match(emitted, /Generated English/);
-    await writeFile(
-      test.output,
-      emitted.replace('Generated English', 'Edited English'),
+  it('passes the same real CMA client and actual server responses to inline scripts', async () => {
+    const id = fixtureId('server-record');
+    const model = fixtureId('server-model');
+    const requests: Array<{ method: string; url: string }> = [];
+    const client = CmaClient.buildClient({
+      apiToken: 'local-mock-only',
+      environment: 'sandbox',
+      fetchFn: async (url, init) => {
+        requests.push({ method: init?.method ?? 'GET', url: String(url) });
+        return new Response(
+          JSON.stringify({
+            data: {
+              id,
+              type: 'item',
+              attributes: { title: 'Real response' },
+              relationships: {
+                item_type: { data: { id: model, type: 'item_type' } },
+              },
+              meta: { current_version: 'server-version' },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      },
+    });
+    const original = client.items.update;
+    const migration = defineContentMigration(
+      { baseline: directory },
+      async (supplied) => {
+        assert.equal(supplied, client);
+        const response = await supplied.items.update(id, { title: 'Edited' });
+        assert.equal(response.meta.current_version, 'server-version');
+        assert.equal(response.title, 'Real response');
+        await supplied.items.find(response.id, { nested: true });
+      },
     );
-    const run = harness(test);
-    assert.deepEqual(await run.run(), {
-      environmentId: 'owned-fork',
-      mutations: 1,
-      partial: false,
-    });
-    const entries = run.plans[0].entries;
-    const changed = entries.find((entry) => entry.id === CHANGED) as RecordPlan;
-    assert.equal(changed.action, 'update');
-    assert.deepEqual(changed.desired!.current, {
-      title: 'Procurement FAQ',
-      summary: { en: 'Edited English', it: 'Prima' },
-    });
-    assert.equal(changed.desired!.published, null);
+    assert.equal(typeof migration, 'function');
+    assert.equal(migration.version, 2);
+    await migration(client);
+    assert.equal(client.items.update, original);
     assert.deepEqual(
-      entries
-        .filter((entry) => entry.action === 'noop')
-        .map((entry) => entry.id)
-        .sort(),
-      [UNCHANGED, UNSELECTED].sort(),
+      requests.map((request) => request.method),
+      ['PUT', 'GET'],
     );
-    assert.equal(
-      entries.some((entry) => entry.action === 'delete'),
-      false,
-    );
-    assert.equal(run.validations.length, 1);
-    assert.equal(run.validations[0].recordId, CHANGED);
-    assert.deepEqual(run.validations[0].payload.summary, {
-      en: 'Edited English',
-      it: 'Prima',
-    });
-    assert.equal(run.counts().writes, 0);
-    assert.ok(
-      run.capturedStores.every((store) => !existsSync(store.directory)),
-    );
+    assert.equal(requests.length, 2);
   });
 
-  it('dry-run evaluates edited TypeScript and returns its rebuilt plan without content writes', async () => {
-    const test = await fixture();
+  it('forwards real results between part calls only after the previous request finishes', async () => {
+    const file = join(directory, 'part.ts');
     await writeFile(
-      test.output,
-      (await readFile(test.output, 'utf8')).replace(
-        'Generated English',
-        'Previewed English',
-      ),
+      file,
+      `export default async client => {
+      const found = await client.items.find('existing');
+      const updated = await client.items.update(found.id, { title: found.title, meta: { current_version: found.meta.current_version } });
+      await client.items.publish(updated.id);
+    };`,
     );
-    const run = harness(test);
-    const result = await run.run({ dryRun: true, forkName: 'review-content' });
-    assert.ok('dryRun' in result && result.dryRun);
-    assert.equal(result.mutations, 0);
-    assert.equal(result.counts.record.update, 1);
-    assert.equal(result.groups.length, 1);
-    const changed = run.plans[0].entries.find(
-      (entry) => entry.id === CHANGED,
-    ) as RecordPlan;
-    assert.equal(
-      (changed.desired!.current.summary as JsonObject).en,
-      'Previewed English',
-    );
-    assert.equal(run.plans[0].options.dryRun, true);
-    assert.equal(run.plans[0].options.forkName, 'review-content');
-    assert.equal(run.validations.length, 1);
-    assert.equal(run.counts().writes, 0);
-    assert.ok(
-      run.capturedStores.every((store) => !existsSync(store.directory)),
-    );
+    const events: string[] = [];
+    const client = {
+      items: {
+        async find() {
+          events.push('read');
+          return {
+            id: 'actual-id',
+            title: 'server-value',
+            meta: { current_version: 'v8' },
+          };
+        },
+        async update(id: string, payload: unknown) {
+          assert.equal(id, 'actual-id');
+          assert.deepEqual(payload, {
+            title: 'server-value',
+            meta: { current_version: 'v8' },
+          });
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          events.push('write-complete');
+          return { id: 'updated-id' };
+        },
+        async publish(id: string) {
+          assert.equal(id, 'updated-id');
+          assert.equal(events.at(-1), 'write-complete');
+          events.push('publish');
+        },
+      },
+    } as unknown as ContentMigrationClient;
+    await defineContentMigration({ baseline: directory }, (client) =>
+      runMigrationPart(client, file),
+    )(client);
+    assert.deepEqual(events, ['read', 'write-complete', 'publish']);
   });
 
-  it('refuses corrupted immutable baseline metadata before any API operation', async () => {
-    const test = await fixture();
-    const manifest = join(test.baseline, 'manifest.json');
-    await writeFile(manifest, `${await readFile(manifest, 'utf8')} `);
-    const run = harness(test);
-    await assert.rejects(run.run(), /checksum/i);
-    assert.deepEqual(run.counts(), {
-      schemaCalls: 0,
-      captureCalls: 0,
-      writes: 0,
+  it('drains outstanding inline SDK work and restores methods before reporting callback failure', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
     });
-    assert.equal(run.plans.length, 0);
+    const error = new Error('script failed');
+    const events: string[] = [];
+    const update = async () => {
+      await pending;
+      events.push('request completed');
+    };
+    const client = { items: { update } } as unknown as ContentMigrationClient;
+    const migration = defineContentMigration(
+      { baseline: directory },
+      async (client) => {
+        void client.items.update('record', {});
+        throw error;
+      },
+    );
+    const execution = migration(client);
+    const rejected = assert
+      .rejects(execution, (candidate) => candidate === error)
+      .then(() => {
+        events.push('runner cleanup');
+      });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(events, []);
+    release();
+    await rejected;
+    assert.deepEqual(events, ['request completed', 'runner cleanup']);
+    assert.equal(client.items.update, update);
   });
 
-  it('rejects concurrent changes to an unselected record before recording the script', async () => {
-    const test = await fixture();
-    test.before[2] = record(
-      UNSELECTED,
-      { page_title: 'Concurrent edit' },
-      PAGE,
+  it('drains an inline SDK request on cancellation and prevents the next write', async () => {
+    const controller = new AbortController();
+    const interruption = Object.assign(new Error('interrupted'), {
+      code: 'INTERRUPTED',
+      exitCode: 130,
+    });
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ids: string[] = [];
+    const update = async (id: string) => {
+      ids.push(id);
+      await pending;
+      return {};
+    };
+    const client = { items: { update } } as unknown as ContentMigrationClient;
+    const migration = defineContentMigration(
+      { baseline: directory },
+      async (client) => {
+        await client.items.update('first', {});
+        await client.items.update('must-not-run', {});
+      },
     );
-    const run = harness(test);
-    await assert.rejects(run.run(), { code: 'APPLY_CONFLICT' });
-    assert.equal(run.plans.length, 0);
-    assert.equal(run.validations.length, 0);
-    assert.equal(run.counts().writes, 0);
-    assert.ok(
-      run.capturedStores.every((store) => !existsSync(store.directory)),
+    const execution = migration(client, controller.signal);
+    const rejected = assert.rejects(
+      execution,
+      (error) => error === interruption,
     );
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort(interruption);
+    assert.deepEqual(ids, ['first']);
+    release();
+    await rejected;
+    assert.deepEqual(ids, ['first']);
+    assert.equal(client.items.update, update);
   });
 
-  it('refuses unsupported edited methods without handing a plan to the executor', async () => {
-    const test = await fixture();
-    const source = await readFile(test.output, 'utf8');
-    await writeFile(
-      test.output,
-      source.replace('client.items.update', 'client.items.bulkPublish'),
-    );
-    const run = harness(test);
-    await assert.rejects(run.run(), /Unsupported CMA method or property/);
-    assert.equal(run.plans.length, 0);
-    assert.equal(run.validations.length, 0);
-    assert.equal(run.counts().writes, 0);
-    assert.ok(
-      run.capturedStores.every((store) => !existsSync(store.directory)),
-    );
+  it('preserves the original SDK Promise identity, cancellation and response values', async () => {
+    let canceled = false;
+    const value = { id: 'server-record', meta: { current_version: 'v3' } };
+    const native = Object.assign(Promise.resolve(value), {
+      cancel() {
+        assert.equal(this, native);
+        canceled = true;
+      },
+    });
+    const client = {
+      uploads: {
+        createFromLocalFile() {
+          return native;
+        },
+      },
+    } as unknown as ContentMigrationClient;
+    await defineContentMigration({ baseline: directory }, async (client) => {
+      const promise = client.uploads.createFromLocalFile({
+        localPath: './file',
+      });
+      assert(promise instanceof Promise);
+      assert.equal(promise, native);
+      promise.cancel();
+      assert.equal(await promise, value);
+    })(client);
+    assert.equal(canceled, true);
   });
 
-  it('executes real split TypeScript parts through the isolated recording bridge', async () => {
-    const test = await fixture(1);
-    const files = (await readdir(join(test.baseline, 'parts'))).filter((file) =>
-      file.endsWith('.ts'),
-    );
-    assert.ok(files.length > 0);
-    assert.match(await readFile(test.output, 'utf8'), /runMigrationPart/);
-    let part = '';
-    let source = '';
-    for (const file of files) {
-      const candidate = join(test.baseline, 'parts', file);
-      const value = await readFile(candidate, 'utf8');
-      if (value.includes('Generated English')) {
-        part = candidate;
-        source = value;
+  it('allows ordinary caught SDK failures and finally restoration before explicit cancellation', async () => {
+    const error = new Error('CMA refused write');
+    const events: string[] = [];
+    const client = {
+      items: {
+        async update() {
+          throw error;
+        },
+      },
+      fields: {
+        async update() {
+          events.push('restored');
+        },
+      },
+    } as unknown as ContentMigrationClient;
+    await defineContentMigration({ baseline: directory }, async (client) => {
+      try {
+        await client.items.update('record', {});
+      } catch (caught) {
+        assert.equal(caught, error);
+      } finally {
+        checkMigration(client);
+        await client.fields.update('field', { validators: {} });
       }
-    }
-    assert.match(source, /Generated English/);
+    })(client);
+    assert.deepEqual(events, ['restored']);
+  });
+
+  it('uploads companion bytes through the real SDK helper inline and across part IPC', async () => {
+    const asset = join(directory, 'asset.txt');
+    await writeFile(asset, 'asset bytes');
+    const filenames: string[] = [];
+    let uploads = 0;
+    const client = {
+      uploadRequest: {
+        async create(body: { filename: string }) {
+          filenames.push(body.filename);
+          return {
+            id: 'remote-upload-path',
+            url: 'https://upload.invalid/path',
+            request_headers: {},
+          };
+        },
+      },
+      config: {
+        fetchFn: async () => {
+          uploads++;
+          return new Response('', { status: 200 });
+        },
+      },
+    } as unknown as ContentMigrationClient;
+    let received: unknown;
+    await defineContentMigration({ baseline: directory }, async (client) => {
+      received = await uploadMigrationFile(client, asset, 'asset.txt');
+    })(client);
+    assert.equal(received, 'remote-upload-path');
+    const file = join(directory, 'upload.ts');
     await writeFile(
-      part,
-      source.replace('Generated English', 'Edited worker value'),
+      file,
+      `import { uploadMigrationFile } from ${JSON.stringify(
+        resolve(__dirname, '../../src/migration.ts'),
+      )};
+      export default async client => {
+        const path = await uploadMigrationFile(client, ${JSON.stringify(asset)}, 'asset.txt');
+        if (path !== 'remote-upload-path') throw new Error('Expected the actual SDK upload path');
+      };`,
     );
-    const run = harness(test);
-    await run.run();
-    const changed = run.plans[0].entries.find(
-      (entry) => entry.id === CHANGED,
-    ) as RecordPlan;
-    assert.deepEqual(changed.desired!.current.summary, {
-      en: 'Edited worker value',
-      it: 'Prima',
-    });
-    assert.equal(run.validations.length, 1);
-    assert.equal(require.cache[part], undefined);
-    assert.equal(run.counts().writes, 0);
+    await defineContentMigration({ baseline: directory }, (client) =>
+      runMigrationPart(client, file),
+    )(client);
+    assert.equal(uploads, 2);
+    assert.equal(filenames.length, 2);
+    assert.notEqual(filenames[0], filenames[1]);
+    for (const filename of filenames)
+      assert.match(filename, /^[0-9a-f-]{36}-asset\.txt$/);
   });
 
-  it('refuses the wrong project and primary writes without explicit authorization', async () => {
-    const test = await fixture();
-    const run = harness(test);
-    run.setWrongProject(true);
-    await assert.rejects(run.run(), /Destination project or schema differs/);
-    run.setWrongProject(false);
-    run.setPrimary(true);
+  it('repairs without evaluating a throwing or broken migration entrypoint', async () => {
+    const file = join(directory, 'repair.ts');
+    await writeFile(file, 'throw new Error("ENTRYPOINT_MUST_NOT_EXECUTE");');
     await assert.rejects(
-      run.run({ inPlace: true }),
-      /requires --allow-primary/,
+      repairContentMigration({
+        rootClient: {} as CmaClient.Client,
+        buildEnvironmentClient: () => {
+          throw new Error('No API should be reached without a companion');
+        },
+        scriptPath: file,
+        options: { allowPrimary: false },
+      }),
+      (error) => {
+        assert.doesNotMatch(
+          String(error),
+          /ENTRYPOINT_MUST_NOT_EXECUTE|No API should be reached/,
+        );
+        assert.equal((error as NodeJS.ErrnoException).code, 'ENOENT');
+        assert.match(String(error), /repair\.content/);
+        return true;
+      },
     );
-    assert.equal(run.counts().captureCalls, 0);
-    assert.equal(run.plans.length, 0);
-    await run.run({ inPlace: true, allowPrimary: true });
-    assert.equal(run.plans[0].options.allowPrimary, true);
-    assert.equal(run.counts().writes, 0);
   });
 
-  it('exports a non-callable descriptor and executes it through content:apply', async () => {
-    const test = await fixture();
-    const run = harness(test);
-    const module = await loadMigrationModule<{ default: ContentMigration }>(
-      test.output,
+  it('preflights source and companion without evaluating top-level side effects or imports', async () => {
+    const file = join(directory, 'paired.ts');
+    const marker = join(directory, 'evaluated');
+    await writeFile(
+      file,
+      `import { writeFileSync } from 'node:fs';
+      import { defineContentMigration } from ${JSON.stringify(
+        resolve(__dirname, '../../src/migration.ts'),
+      )};
+      writeFileSync(${JSON.stringify(marker)}, 'evaluated');
+      export default defineContentMigration({ baseline: './paired.content' }, async () => {});`,
     );
-    assert.equal(typeof module.default, 'object');
-    assert.equal(module.default.format, 'datocms-content-migration');
-    assert.deepEqual(run.counts(), {
-      schemaCalls: 0,
-      captureCalls: 0,
-      writes: 0,
-    });
-    assert.equal(run.plans.length, 0);
-    assert.equal(module.default.version, 1);
-    await run.run();
-    assert.deepEqual(run.events, ['schema', 'capture', 'apply']);
-    assert.equal(run.plans[0].options.inPlace, false);
-    assert.equal(run.plans[0].options.keepFailedFork, false);
+    const args = {
+      rootClient: {} as CmaClient.Client,
+      buildEnvironmentClient: () => {
+        throw new Error('No API before companion verification');
+      },
+      scriptPath: file,
+      options: {
+        inPlace: false,
+        allowPrimary: false,
+        keepFailedFork: false,
+        allowTemporarySchemaChanges: false,
+      },
+    };
+    await assert.rejects(
+      applyContentMigration({
+        ...args,
+        options: { ...args.options, preflightOnly: true },
+      }),
+      (error) => (error as NodeJS.ErrnoException).code === 'ENOENT',
+    );
+    await assert.rejects(
+      readFile(marker),
+      (error) => (error as NodeJS.ErrnoException).code === 'ENOENT',
+    );
+    // Normal application imports trusted executable code before baseline checks.
+    await assert.rejects(
+      applyContentMigration(args),
+      (error) => (error as NodeJS.ErrnoException).code === 'ENOENT',
+    );
+    assert.equal(await readFile(marker, 'utf8'), 'evaluated');
+    await writeFile(
+      file,
+      'import "missing-and-must-not-be-loaded"; throw new Error("MUST_NOT_EXECUTE");',
+    );
+    await assert.rejects(
+      applyContentMigration({
+        ...args,
+        options: { ...args.options, preflightOnly: true },
+      }),
+      (error) => (error as NodeJS.ErrnoException).code === 'ENOENT',
+    );
+  });
+
+  it('rejects a normal script bound to a different companion before any API access', async () => {
+    const file = join(directory, 'paired.ts');
+    await writeFile(
+      file,
+      `import { defineContentMigration } from ${JSON.stringify(
+        resolve(__dirname, '../../src/migration.ts'),
+      )}; export default defineContentMigration({baseline: './other.content'}, async () => {});`,
+    );
+    await assert.rejects(
+      applyContentMigration({
+        rootClient: {} as CmaClient.Client,
+        buildEnvironmentClient: () => {
+          throw new Error('No API');
+        },
+        scriptPath: file,
+        options: {
+          inPlace: false,
+          allowPrimary: false,
+          keepFailedFork: false,
+          allowTemporarySchemaChanges: false,
+        },
+      }),
+      (error) =>
+        (error as { code?: string }).code === 'MIGRATION_BASELINE_MISMATCH',
+    );
+  });
+
+  it('loads callable v2 scripts and excludes recording and replanning from the runtime', async () => {
+    const file = join(directory, 'migration.ts');
+    await writeFile(
+      file,
+      `import { defineContentMigration } from ${JSON.stringify(
+        resolve(__dirname, '../../src/migration.ts'),
+      )}; export default defineContentMigration({baseline: './proof'}, async client => { await client.items.find('record'); });`,
+    );
+    const loaded = await loadContentMigration(file);
+    assert.equal(typeof loaded, 'function');
+    assert.equal(loaded.options.baseline, './proof');
+    const source = await readFile(
+      resolve(__dirname, '../../src/migration.ts'),
+      'utf8',
+    );
+    assert.doesNotMatch(
+      source,
+      /createIntentRecorder|createPlan|SnapshotStore|migration-intent|migration-validity/,
+    );
   });
 });

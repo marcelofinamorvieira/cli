@@ -7,8 +7,8 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, it } from 'mocha';
 import { require as tsxRequire } from 'tsx/cjs/api';
 import {
+  executeDirectMigrationPart,
   executeMigrationPart,
-  executeRecordedMigrationPart,
   loadMigrationModule,
 } from '../../src/engine/migration-loader';
 import { loadContentMigration } from '../../src/migration';
@@ -113,7 +113,7 @@ describe('trusted TypeScript migration loader', () => {
     });
   });
 
-  it('maps initialization, inline descriptor callbacks and awaited part failures to source lines', async () => {
+  it('maps initialization, inline callable callbacks and awaited part failures to source lines', async () => {
     const initialization = join(directory, 'initialization.ts');
     const execution = join(directory, 'execution.ts');
     const inline = join(directory, 'inline.ts');
@@ -148,7 +148,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
         for (const work of [
           () => loadMigrationModule(${JSON.stringify(initialization)}),
           () => executeMigrationPart(${JSON.stringify(execution)}, []),
-          async () => (await loadContentMigration(${JSON.stringify(inline)})).run({}),
+          async () => (await loadContentMigration(${JSON.stringify(inline)}))({}),
         ]) { try { await work(); } catch (error) { console.log(error.stack); } }
       })().catch(error => { console.error(error); process.exitCode = 1; });`;
     const result = await promisify(execFile)(process.execPath, [
@@ -192,7 +192,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
       const script = `
         const assert = require('node:assert/strict');
         const { writeFile } = require('node:fs/promises');
-        const { executeMigrationPart, executeRecordedMigrationPart } = require(${JSON.stringify(
+        const { executeMigrationPart, executeDirectMigrationPart } = require(${JSON.stringify(
           resolve(__dirname, '../../src/engine/migration-loader.ts'),
         )});
         const filename = ${JSON.stringify(filename)};
@@ -202,7 +202,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
           assert.deepEqual(await executeMigrationPart(filename, []), { label: 'typed helper', edited: true });
           await writeFile(filename, 'import { value } from "@helpers/value"; export default async (client) => { await client.items.update("record", value); };');
           const calls = [];
-          await executeRecordedMigrationPart(filename, (call) => { calls.push(call); });
+          await executeDirectMigrationPart(filename, (call) => { calls.push(call); });
           assert.deepEqual(calls, [{ resource: 'items', method: 'update', args: ['record', { label: 'typed helper' }] }]);
           console.log('project aliases and fresh migration edits passed');
         })().catch(error => { console.error(error); process.exitCode = 1; });`;
@@ -218,7 +218,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
     }
   });
 
-  it('requires an explicitly branded content descriptor before accepting its callback', async () => {
+  it('requires callable v2 metadata before accepting a content migration', async () => {
     const filename = join(directory, 'migration.ts');
     for (const declaration of [
       'async () => {}',
@@ -230,7 +230,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
       await writeFile(filename, `export default ${declaration};`);
       await assert.rejects(
         loadContentMigration(filename),
-        /content:apply expects a default descriptor/,
+        /content:apply expects a default callable/,
       );
     }
   });
@@ -308,8 +308,8 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
     assert.equal(completed, true);
   });
 
-  it('isolates recorded parts and returns awaited client responses in order', async () => {
-    const filename = join(directory, 'recorded.ts');
+  it('isolates direct parts and returns awaited client responses in order', async () => {
+    const filename = join(directory, 'live.ts');
     await writeFile(
       filename,
       `export default async function(client) {
@@ -322,7 +322,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
     );
     const calls: unknown[] = [];
     let active = 0;
-    await executeRecordedMigrationPart(filename, async (call) => {
+    await executeDirectMigrationPart(filename, async (call) => {
       assert.equal(++active, 1);
       await new Promise((resolve) => setImmediate(resolve));
       calls.push(call);
@@ -366,7 +366,7 @@ export default async (client) => {
     };
     for (let index = 0; index < 3; index++) {
       let observed: { pid: number; children: number[] } | undefined;
-      await executeRecordedMigrationPart(filename, (call) => {
+      await executeDirectMigrationPart(filename, (call) => {
         observed = call.args[0] as typeof observed;
       });
       assert(observed);
@@ -394,7 +394,7 @@ export default async (client) => {
     };`,
     );
     let pid = 0;
-    await executeRecordedMigrationPart(filename, (call) => {
+    await executeDirectMigrationPart(filename, (call) => {
       pid = call.args[0] as number;
     });
     assert(pid > 0);
@@ -404,16 +404,16 @@ export default async (client) => {
     );
   });
 
-  it('propagates worker source locations and recorder failures', async () => {
-    const filename = join(directory, 'recorded.ts');
+  it('propagates worker source locations and CMA failures', async () => {
+    const filename = join(directory, 'live.ts');
     await writeFile(
       filename,
       'interface Ignored {}\nexport default async function() {\n  throw new Error("worker failure");\n}\n',
     );
     await assert.rejects(
-      executeRecordedMigrationPart(filename, () => undefined),
+      executeDirectMigrationPart(filename, () => undefined),
       (error: Error) => {
-        assert.match(error.stack!, /recorded\.ts:3:\d+/);
+        assert.match(error.stack!, /live\.ts:3:\d+/);
         return true;
       },
     );
@@ -422,15 +422,61 @@ export default async (client) => {
       'export default async (client) => { await client.items.destroy("missing"); };',
     );
     await assert.rejects(
-      executeRecordedMigrationPart(filename, async () => {
-        throw new Error('recorder refused the operation');
+      executeDirectMigrationPart(filename, async () => {
+        throw new Error('CMA refused the operation');
       }),
-      /recorder refused the operation/,
+      /CMA refused the operation/,
     );
   });
 
-  it('drains a submitted recording callback before cancelled worker teardown', async () => {
-    const filename = join(directory, 'recorded.ts');
+  it('stops queued live calls after failure and preserves the original parent SDK error', async () => {
+    const filename = join(directory, 'failed-requests.ts');
+    await writeFile(
+      filename,
+      `export default async client => {
+      await Promise.all([
+        client.items.update('first', {}),
+        client.items.update('must-not-run', {}),
+      ]);
+    };`,
+    );
+    const original = Object.assign(new Error('CMA request failed'), {
+      name: 'ApiError',
+      request: { method: 'PUT' },
+      response: { status: 422 },
+    });
+    const calls: string[] = [];
+    await assert.rejects(
+      executeDirectMigrationPart(filename, (call) => {
+        calls.push(call.args[0] as string);
+        throw original;
+      }),
+      (error) => error === original,
+    );
+    assert.deepEqual(calls, ['first']);
+  });
+
+  it('allows a handled CMA failure to recover with a newly submitted live call', async () => {
+    const filename = join(directory, 'recover.ts');
+    await writeFile(
+      filename,
+      `export default async client => {
+      try { await client.items.find('missing'); }
+      catch { await client.items.create({ title: 'Recovered' }); }
+    };`,
+    );
+    const calls: string[] = [];
+    await executeDirectMigrationPart(filename, (call) => {
+      calls.push(call.method);
+      if (call.method === 'find')
+        throw Object.assign(new Error('Not found'), { name: 'ApiError' });
+      return { id: 'created' };
+    });
+    assert.deepEqual(calls, ['find', 'create']);
+  });
+
+  it('drains a submitted CMA callback before cancelled worker teardown', async () => {
+    const filename = join(directory, 'live.ts');
     await writeFile(
       filename,
       'export default async (client) => { await client.items.create({}); await client.items.create({}); };',
@@ -439,7 +485,7 @@ export default async (client) => {
     let completed = false;
     let calls = 0;
     await assert.rejects(
-      executeRecordedMigrationPart(
+      executeDirectMigrationPart(
         filename,
         async () => {
           calls++;
@@ -455,11 +501,11 @@ export default async (client) => {
     assert.equal(completed, true);
   });
 
-  it('reports abrupt worker exit and non-transferable recorder responses', async () => {
-    const filename = join(directory, 'recorded.ts');
+  it('reports abrupt worker exit and non-transferable CMA responses', async () => {
+    const filename = join(directory, 'live.ts');
     await writeFile(filename, 'export default async () => process.exit(7);');
     await assert.rejects(
-      executeRecordedMigrationPart(filename, () => undefined),
+      executeDirectMigrationPart(filename, () => undefined),
       /exited before completing \(7\)/,
     );
     await writeFile(
@@ -467,7 +513,7 @@ export default async (client) => {
       'export default async (client) => { await client.items.create({}); };',
     );
     await assert.rejects(
-      executeRecordedMigrationPart(filename, () => () => undefined),
+      executeDirectMigrationPart(filename, () => () => undefined),
       /could not be cloned/,
     );
   });

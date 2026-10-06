@@ -15,14 +15,14 @@ export interface MigrationLoadOptions {
   maxBytes?: number;
 }
 
-export interface RecordedMigrationCall {
+export interface DirectMigrationCall {
   resource: string;
   method: string;
   args: unknown[];
 }
 
 export type MigrationCallHandler = (
-  call: RecordedMigrationCall,
+  call: DirectMigrationCall,
 ) => unknown | Promise<unknown>;
 
 async function sourceFile(
@@ -77,6 +77,22 @@ async function sourceFile(
   }
 }
 
+/** Check executable source bytes without importing or evaluating the module. */
+export async function validateMigrationSource(
+  path: string,
+  options: MigrationLoadOptions = {},
+): Promise<void> {
+  assertNotAborted(options.signal);
+  const maximum = options.maxBytes ?? DEFAULT_MIGRATION_FILE_BYTES;
+  if (!Number.isSafeInteger(maximum) || maximum < 1)
+    throw new ContentError(
+      'INVALID_MIGRATION_LIMIT',
+      'Migration file size limit must be a positive safe integer.',
+    );
+  await sourceFile(resolve(path), maximum, options.signal);
+  assertNotAborted(options.signal);
+}
+
 /**
  * Load trusted code through the same public tsx API as native migrations.
  * tsx owns TypeScript imports, project configuration and source maps. The small
@@ -88,16 +104,8 @@ export async function loadMigrationModule<T = unknown>(
   path: string,
   options: MigrationLoadOptions = {},
 ): Promise<T> {
-  assertNotAborted(options.signal);
-  const maximum = options.maxBytes ?? DEFAULT_MIGRATION_FILE_BYTES;
-  if (!Number.isSafeInteger(maximum) || maximum < 1)
-    throw new ContentError(
-      'INVALID_MIGRATION_LIMIT',
-      'Migration file size limit must be a positive safe integer.',
-    );
   const filename = resolve(path);
-  await sourceFile(filename, maximum, options.signal);
-  assertNotAborted(options.signal);
+  await validateMigrationSource(filename, options);
   const moduleId = tsxRequire.resolve(filename, __filename);
   delete tsxRequire.cache[moduleId];
   try {
@@ -161,40 +169,51 @@ function receivedError(value: Record<string, unknown>): Error {
 
 // Trusted migration code runs with ordinary Node capabilities. Isolation here
 // releases compiler and module memory; it does not restrict access to secrets,
-// files, processes, or the network. Only the recording client crosses this IPC.
-const recordingWorker = `
+// files, processes, or the network. Only direct CMA method calls and their real results cross this IPC.
+const executionWorker = `
 const { executeMigrationPart } = require(process.argv[1]);
 const workerData = JSON.parse(process.argv[2]);
 const pending = new Map();
 let nextId = 0;
 let tail = Promise.resolve();
-let firstError;
+let failureEpoch = 0;
+let lastCallError;
 const errorValue = (error) => ({
   name: error instanceof Error ? error.name : 'Error',
   message: error instanceof Error ? error.message : String(error),
   stack: error instanceof Error ? error.stack : undefined,
   code: error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined,
+  cmaCallId: error instanceof Error && 'cmaCallId' in error ? error.cmaCallId : undefined,
 });
 process.on('message', (message) => {
   const item = pending.get(message.id);
   if (!item) return;
   pending.delete(message.id);
   if (message.error) {
-    const error = Object.assign(new Error(message.error.message), message.error);
+    const error = Object.assign(new Error(message.error.message), message.error, { cmaCallId: message.id });
     item.reject(error);
   } else item.resolve(message.result);
 });
 const invoke = (resource, method, args) => {
-  const result = tail.then(() => new Promise((resolve, reject) => {
-    const id = ++nextId;
-    pending.set(id, { resolve, reject });
-    process.send({ type: 'call', id, call: { resource, method, args } }, (error) => { if (error) { pending.delete(id); reject(error); } });
-  }));
-  tail = result.catch((error) => { firstError ??= error; });
+  const submittedEpoch = failureEpoch;
+  let dispatched = false;
+  const result = tail.then(() => {
+    if (submittedEpoch !== failureEpoch) throw lastCallError;
+    dispatched = true;
+    return new Promise((resolve, reject) => {
+      const id = ++nextId;
+      pending.set(id, { resolve, reject });
+      process.send({ type: 'call', id, call: { resource, method, args } }, (error) => { if (error) { pending.delete(id); reject(error); } });
+    });
+  });
+  tail = result.catch((error) => {
+    if (dispatched) { failureEpoch++; lastCallError = error; }
+  });
   return result;
 };
 const client = new Proxy({}, {
   get(_target, resource) {
+    if (resource === Symbol.for('datocms.contentMigration.transport')) return invoke;
     if (typeof resource !== 'string' || resource === 'then') return undefined;
     return new Proxy({}, {
       get(_resource, method) {
@@ -214,7 +233,6 @@ const complete = (message) => new Promise((resolve, reject) => {
   try {
     await executeMigrationPart(workerData.path, [client], { maxBytes: workerData.maxBytes });
     await tail;
-    if (firstError) throw firstError;
     await complete({ type: 'complete' });
   } catch (error) {
     await tail;
@@ -229,11 +247,11 @@ const complete = (message) => new Promise((resolve, reject) => {
 
 /**
  * Compile and execute one generated part in a disposable Node process. Each awaited
- * client.resource.method(...args) is recorded by the parent and receives its
+ * client.resource.method(...args) executes immediately in the parent and receives its
  * returned value. At most one handler runs at once, even for Promise.all calls.
  * Completion and cancellation both drain submitted handlers before teardown.
  */
-export async function executeRecordedMigrationPart(
+export async function executeDirectMigrationPart(
   path: string,
   onCall: MigrationCallHandler,
   options: MigrationLoadOptions = {},
@@ -252,7 +270,7 @@ export async function executeRecordedMigrationPart(
     [
       ...execArgv,
       '--eval',
-      recordingWorker,
+      executionWorker,
       __filename,
       JSON.stringify({ path: resolve(path), maxBytes: options.maxBytes }),
     ],
@@ -265,6 +283,7 @@ export async function executeRecordedMigrationPart(
     let finishing = false;
     let closed = false;
     let inFlight: Promise<void> | undefined;
+    const originalCallErrors = new Map<number, unknown>();
     const exited = new Promise<void>((resolveExit) => {
       worker.once('close', () => {
         closed = true;
@@ -315,12 +334,16 @@ export async function executeRecordedMigrationPart(
       const message = value as {
         type?: string;
         id?: number;
-        call?: RecordedMigrationCall;
+        call?: DirectMigrationCall;
         error?: Record<string, unknown>;
       };
       if (message.type === 'complete') void finish(undefined, true);
       else if (message.type === 'failure')
-        void finish(receivedError(message.error!), true);
+        void finish(
+          originalCallErrors.get(Number(message.error?.cmaCallId)) ??
+            receivedError(message.error!),
+          true,
+        );
       else if (message.type === 'call') {
         // Install the pending promise before a handler can synchronously abort.
         inFlight = Promise.resolve().then(async () => {
@@ -328,6 +351,7 @@ export async function executeRecordedMigrationPart(
             const result = await onCall(message.call!);
             reply({ id: message.id, result });
           } catch (error) {
+            originalCallErrors.set(message.id!, error);
             reply({ id: message.id, error: transferError(error) });
           }
         });
