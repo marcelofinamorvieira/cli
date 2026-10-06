@@ -10,7 +10,7 @@ This is the DatoCMS CLI - a monorepo containing CLI tools for managing DatoCMS p
 - `@datocms/cli` (`packages/cli-legacy/`): Legacy scoped alias that just depends on `datocms`
 - `@datocms/cli-plugin-wordpress`: WordPress import functionality
 - `@datocms/cli-plugin-contentful`: Contentful import functionality
-- `@datocms/cli-plugin-content-diff`: Editable TypeScript content migrations between environments or projects (`content:diff`, `content:apply`, and managed `migrations:run`)
+- `@datocms/cli-plugin-content-diff`: Editable TypeScript content migrations between environments or projects (`content:diff` and `content:apply`)
 - `@datocms/cli-utils`: Shared utilities and base commands
 
 ## Architecture
@@ -24,7 +24,6 @@ The packages live under `packages/` and are **npm workspaces**. **Turborepo** ru
 - Commands organized by topic: `environments`, `migrations`, `maintenance`, `profile`
 - Uses `environments-diff` utility for schema synchronization between environments
 - Migration system with timestamped files in `migrations/` directory
-- Managed migration context supplies fork ownership, cancellation, and tracking-model identity to content migrations
 
 **Plugin Architecture**:
 - WordPress and Contentful plugins extend base functionality
@@ -103,6 +102,10 @@ The CLI includes a migration system (`packages/cli/src/commands/migrations/`) fo
 - Timestamped migration files (format: `TIMESTAMP_description.ts`)
 - Use `datocms migrations:new` to create migrations; `--autogenerate` captures schema changes only
 - Use `datocms content:diff NAME` to generate editable content migrations containing actual CMA calls
-- Use `datocms migrations:run` to execute pending migrations, or `content:apply SCRIPT.ts` for the content-specific runner
+- Use `datocms migrations:run` for schema migrations and `content:apply SCRIPT.ts` for content migrations. Generated content scripts live in the `content/` subdirectory of the configured migrations directory.
 - Content migrations keep immutable baseline evidence and binaries in a sibling `.content` directory. TypeScript is authoritative; execution records its calls locally and rebuilds the guarded plan before remote content writes
-- Generated imports require the content plugin as a resolvable project dependency and a compatible native runner. Preserve the tracking-model projection, one-shot execution, and owned-fork cleanup contracts documented in the plugin README and `docs/rewrite-design.md`
+- Generated imports require the content plugin as a resolvable project dependency. Preserve the tracking-model projection, one-shot execution, and owned-fork cleanup contracts documented in the plugin README and `docs/rewrite-design.md`
+
+## Content diff boundary
+
+Keep content diff entirely within `@datocms/cli-plugin-content-diff`. It must work with the unmodified DatoCMS CLI and published shared utilities. Do not change, override, or patch native CLI commands or add content-specific contracts to `cli-utils`; generation and execution belong to `content:diff` and `content:apply`.

@@ -18,7 +18,7 @@ function client(update: (...args: unknown[]) => unknown): Client {
   return { items: { update } } as unknown as Client;
 }
 
-describe('managed migration part lifecycle', () => {
+describe('content migration part lifecycle', () => {
   let directory: string;
   beforeEach(async () => {
     directory = await mkdtemp(join(tmpdir(), 'migration-parts-lifecycle-'));
@@ -150,7 +150,7 @@ describe('managed migration part lifecycle', () => {
     );
   });
 
-  it('preserves native interruption metadata and drains before cancellation finishes', async () => {
+  it('preserves plugin interruption metadata and drains before cancellation finishes', async () => {
     await writeFile(
       filename(),
       "export default async function(client) { await client.items.update('active', {}); await client.items.update('forbidden-late', {}); }",
@@ -164,7 +164,7 @@ describe('managed migration part lifecycle', () => {
       await release.promise;
     });
     const controller = new AbortController();
-    const interruption = Object.assign(new Error('Native SIGINT'), {
+    const interruption = Object.assign(new Error('Content apply SIGINT'), {
       code: 'INTERRUPTED',
       exitCode: 130,
       oclif: { exit: 130 },

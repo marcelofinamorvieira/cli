@@ -1,5 +1,4 @@
 import { dirname, resolve } from 'node:path';
-import type { MigrationExecutionContext } from '@datocms/cli-utils';
 import { applyBundle } from './engine/apply';
 import { assertNotAborted } from './engine/cancellation';
 import { captureSnapshot } from './engine/capture';
@@ -34,9 +33,8 @@ import type {
 export interface ContentMigrationOptions {
   baseline: string;
   allowTemporarySchemaChanges?: boolean;
+  /** Concurrency for repair reads; content:apply execution uses its CLI flag. */
   concurrency?: number;
-  verification?: 'versions' | 'full';
-  scheduleWindowMinutes?: number;
 }
 
 export interface ContentMigrationDefinition {
@@ -45,10 +43,9 @@ export interface ContentMigrationDefinition {
   run: (client: Client, signal?: AbortSignal) => Promise<void>;
 }
 
-export type ContentMigration = ((
-  client: Client,
-  context?: MigrationExecutionContext,
-) => Promise<void>) & { contentMigration: ContentMigrationDefinition };
+export type ContentMigration = ((client: Client) => Promise<void>) & {
+  contentMigration: ContentMigrationDefinition;
+};
 
 interface RecordingSession {
   signal: AbortSignal;
@@ -109,9 +106,9 @@ export function runMigrationPart(client: Client, path: string): Promise<void> {
 }
 
 /**
- * A normal default-exported migration with an explicit managed execution
- * contract. Its CMA-shaped calls are recorded locally, replanned and guarded;
- * they are never executed against the API merely to discover their effects.
+ * Declare content intent for content:apply. The callable export rejects other
+ * runners before they can execute these operations directly against the CMA.
+ * content:apply records the descriptor's calls locally, replans and guards them.
  */
 export function defineContentMigration(
   options: ContentMigrationOptions,
@@ -165,42 +162,11 @@ export function defineContentMigration(
     },
   };
   return Object.assign(
-    async (
-      client: Client,
-      context?: MigrationExecutionContext,
-    ): Promise<void> => {
-      if (!context || context.version !== 1)
-        throw new ContentError(
-          'MIGRATION_RUNNER_REQUIRED',
-          'Run this content migration with content:apply or a DatoCMS migrations:run host supporting managed migration context version 1.',
-        );
-      context.activate({ discardOwnedForkOnFailure: true });
-      assertNotAborted(context.signal);
-      if (client.config.environment !== context.environmentId)
-        throw new ContentError(
-          'MIGRATION_CONTEXT_MISMATCH',
-          'The supplied client targets another environment.',
-        );
-      await executeDefinition({
-        definition,
-        scriptPath: context.migrationPath,
-        rootClient: context.rootClient,
-        buildEnvironmentClient: context.buildEnvironmentClient,
-        nativeContext: context,
-        options: {
-          inPlace: true,
-          allowPrimary: context.allowPrimary,
-          keepFailedFork: false,
-          allowTemporarySchemaChanges:
-            options.allowTemporarySchemaChanges === true,
-          destinationEnvironmentId: context.environmentId,
-          concurrency: options.concurrency ?? 8,
-          verification: options.verification ?? 'versions',
-          scheduleWindowMinutes: options.scheduleWindowMinutes ?? 120,
-          signal: context.signal,
-          log: context.log,
-        },
-      });
+    async (_client: Client): Promise<void> => {
+      throw new ContentError(
+        'CONTENT_APPLY_REQUIRED',
+        'Run this content migration with datocms content:apply <script.ts>. Native migrations:run does not support content migrations.',
+      );
     },
     { contentMigration: definition },
   );
@@ -250,7 +216,6 @@ export async function applyContentMigration(
 async function executeDefinition(
   args: ContentMigrationApplyArguments & {
     definition: ContentMigrationDefinition;
-    nativeContext?: MigrationExecutionContext;
   },
 ): Promise<ApplyResult> {
   const { options, definition } = args;
@@ -267,11 +232,7 @@ async function executeDefinition(
       options.destinationEnvironmentId ?? baseline.destination.environmentId;
     const client = args.buildEnvironmentClient(environmentId);
     const projection = (schema: Parameters<typeof projectMigrationSchema>[0]) =>
-      projectMigrationSchema(
-        schema,
-        baseline.destinationTracking,
-        args.nativeContext?.trackingModel,
-      );
+      projectMigrationSchema(schema, baseline.destinationTracking);
     const schema = await fetchSchema(client, environmentId, projection);
     if (
       schema.siteId !== baseline.destination.siteId ||

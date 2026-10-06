@@ -621,7 +621,7 @@ describe('TypeScript migration repair', () => {
         buildEnvironmentClient: () => remote.client,
         options: { allowPrimary: false },
       }),
-      /without native runner ownership/,
+      /migration tracking model appeared after generation/,
     );
     assert.deepEqual(remote.writes, []);
   });

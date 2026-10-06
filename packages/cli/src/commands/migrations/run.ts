@@ -1,19 +1,9 @@
 import { access, readdir } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
-import {
-  CmaClient,
-  CmaClientCommand,
-  type MigrationExecutionContext,
-  oclif,
-} from '@datocms/cli-utils';
+import { CmaClient, CmaClientCommand, oclif } from '@datocms/cli-utils';
 import { require as tsxRequire } from 'tsx/cjs/api';
-import { createMigrationExecution } from '../../utils/migration-execution';
 
 const MIGRATION_FILE_REGEXP = /^\d+.*\.(js|ts)$/;
-type TrackingModelResult = {
-  model: CmaClient.ApiTypes.ItemType | null;
-  createdByThisRun: boolean;
-};
 
 export default class Command extends CmaClientCommand {
   static description = 'Run migration scripts that have not run yet';
@@ -61,6 +51,8 @@ export default class Command extends CmaClientCommand {
         'Path of the tsconfig.json to use to run TS migrations scripts',
     }),
   };
+
+  private registeredTsNode?: boolean;
 
   async run(): Promise<{
     environmentId: string;
@@ -177,12 +169,11 @@ export default class Command extends CmaClientCommand {
 
     const envClient = await this.buildClient({ environment: destinationEnvId });
 
-    const tracking = await this.upsertMigrationModel(
+    const migrationModel = await this.upsertMigrationModel(
       envClient,
       migrationsModelApiKey,
       dryRun,
     );
-    const migrationModel = tracking.model;
 
     const migrationScriptsToRun = await this.migrationScriptsToRun(
       migrationModel,
@@ -222,31 +213,6 @@ export default class Command extends CmaClientCommand {
         migrationModel,
         migrationsDir,
         migrationsTsconfig,
-        {
-          environmentId: destinationEnvId,
-          sourceEnvironmentId: sourceEnv.id,
-          primaryEnvironmentId: primaryEnv?.id ?? null,
-          inPlace: !!inPlace,
-          allowPrimary: !!allowPrimary,
-          trackingModel: migrationModel
-            ? {
-                id: migrationModel.id,
-                apiKey: migrationModel.api_key,
-                createdByThisRun: tracking.createdByThisRun,
-              }
-            : null,
-          rootClient: this.client,
-          buildEnvironmentClient: (environment) =>
-            CmaClient.buildClient({ ...envClient.config, environment }),
-          log: (message) => {
-            // An active Oclif spinner buffers both streams. Pause it briefly
-            // so managed content progress is visible while the run is active.
-            oclif.ux.action.pause(() => this.log(message));
-          },
-          ...(!inPlace && !dryRun
-            ? { ownedForkEnvironmentId: destinationEnvId }
-            : {}),
-        },
       );
     }
 
@@ -272,16 +238,8 @@ export default class Command extends CmaClientCommand {
     migrationModel: CmaClient.ApiTypes.ItemType | null,
     migrationsDir: string,
     _migrationsTsconfig: string | undefined,
-    executionOptions: Omit<
-      MigrationExecutionContext,
-      'version' | 'signal' | 'activate' | 'migrationPath'
-    > & { ownedForkEnvironmentId?: string },
   ) {
     const relativePath = relative(migrationsDir, script.path);
-    const execution = createMigrationExecution({
-      ...executionOptions,
-      migrationPath: resolve(script.path),
-    });
 
     this.startSpinner(
       dryRun
@@ -293,12 +251,7 @@ export default class Command extends CmaClientCommand {
       if (!dryRun) {
         const exportedThing = tsxRequire(script.path, __filename);
 
-        const migration:
-          | ((
-              client: unknown,
-              context?: MigrationExecutionContext,
-            ) => Promise<void>)
-          | undefined =
+        const migration: (client: unknown) => Promise<void> | undefined =
           typeof exportedThing === 'function'
             ? exportedThing
             : 'default' in exportedThing &&
@@ -311,13 +264,8 @@ export default class Command extends CmaClientCommand {
         }
 
         try {
-          if (script.legacy) await migration(legacyEnvClient);
-          else await migration(envClient, execution.context);
-          execution.assertNotAborted();
+          await migration(script.legacy ? legacyEnvClient : envClient);
         } catch (e) {
-          // Managed migrations preserve their failure and signal exit status;
-          // cleanup below also covers a failed completion-receipt write.
-          if (execution.active) throw e;
           this.stopSpinnerWithFailure();
 
           if (e instanceof Error) {
@@ -333,21 +281,16 @@ export default class Command extends CmaClientCommand {
       }
 
       if (!dryRun && migrationModel) {
-        execution.assertNotAborted();
         await envClient.items.create({
           item_type: migrationModel,
           name: relativePath,
         });
-        execution.assertNotAborted();
       }
 
       this.stopSpinner();
     } catch (e) {
       this.stopSpinnerWithFailure();
-      await execution.cleanupAfterFailure(e);
       throw e;
-    } finally {
-      execution.dispose();
     }
   }
 
@@ -476,12 +419,9 @@ export default class Command extends CmaClientCommand {
     client: CmaClient.Client,
     migrationModelApiKey: string,
     dryRun: boolean,
-  ): Promise<TrackingModelResult> {
+  ): Promise<CmaClient.ApiTypes.ItemType | null> {
     try {
-      return {
-        model: await client.itemTypes.find(migrationModelApiKey),
-        createdByThisRun: false,
-      };
+      return await client.itemTypes.find(migrationModelApiKey);
     } catch (e) {
       if (e instanceof CmaClient.ApiError && e.response.status === 404) {
         this.startSpinner(
@@ -505,10 +445,7 @@ export default class Command extends CmaClientCommand {
           this.stopSpinnerWithFailure();
         }
 
-        return {
-          model: migrationItemType,
-          createdByThisRun: migrationItemType !== null,
-        };
+        return migrationItemType;
       }
 
       throw e;

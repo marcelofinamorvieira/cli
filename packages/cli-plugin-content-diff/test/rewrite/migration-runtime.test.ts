@@ -11,7 +11,6 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import type { MigrationExecutionContext } from '@datocms/cli-utils';
 import { afterEach, describe, it } from 'mocha';
 import * as execution from '../../src/engine/apply';
 import * as capture from '../../src/engine/capture';
@@ -239,7 +238,6 @@ function harness(test: Fixture) {
   const capturedStores: SnapshotStore[] = [];
   let primary = false;
   let wrongProject = false;
-  let nativeTracking = false;
   let captureCalls = 0;
   let schemaCalls = 0;
   let writes = 0;
@@ -289,21 +287,6 @@ function harness(test: Fixture) {
         siteId: wrongProject ? 'wrong-site' : test.state.siteId,
         models: [...test.state.models],
       };
-      if (nativeTracking)
-        raw.models.push({
-          ...raw.models[0],
-          id: id('native-tracking'),
-          apiKey: 'schema_migration',
-          name: 'Migration',
-          draftMode: false,
-          fields: [
-            {
-              ...field('name'),
-              id: id('native-tracking-name'),
-              validators: { required: {} },
-            },
-          ],
-        });
       raw.hash = schemaApi.schemaHash(raw);
       return projection ? projection(raw) : raw;
     },
@@ -362,9 +345,6 @@ function harness(test: Fixture) {
     },
     setWrongProject: (value: boolean) => {
       wrongProject = value;
-    },
-    setNativeTracking: () => {
-      nativeTracking = true;
     },
     counts: () => ({ schemaCalls, captureCalls, writes }),
     run: (overrides: Partial<ApplyOptions> = {}) =>
@@ -531,59 +511,37 @@ describe('generated TypeScript public runtime integration', () => {
     assert.equal(run.counts().writes, 0);
   });
 
-  it('activates native runner cleanup before preflight and binds the supplied environment', async () => {
-    const test = await fixture();
-    const run = harness(test);
-    run.setNativeTracking();
-    const module = await loadMigrationModule<{ default: ContentMigration }>(
-      test.output,
-    );
-    const environmentId = 'native-owned-fork';
-    const context: MigrationExecutionContext = {
-      version: 1,
-      migrationPath: test.output,
-      environmentId,
-      sourceEnvironmentId: 'destination',
-      inPlace: false,
-      allowPrimary: false,
-      primaryEnvironmentId: 'main',
-      signal: new AbortController().signal,
-      trackingModel: {
-        id: id('native-tracking'),
-        apiKey: 'schema_migration',
-        createdByThisRun: true,
-      },
-      rootClient: run.rootClient,
-      buildEnvironmentClient: run.client,
-      activate: (options) => {
-        assert.deepEqual(options, { discardOwnedForkOnFailure: true });
-        run.events.push('activate');
-      },
-      log: () => undefined,
-    };
-    await module.default(run.client(environmentId), context);
-    assert.equal(run.events[0], 'activate');
-    assert.deepEqual(run.events.slice(1), ['schema', 'capture', 'apply']);
-    assert.equal(run.plans[0].options.destinationEnvironmentId, environmentId);
-    assert.equal(run.plans[0].options.inPlace, true);
-    assert.equal(run.plans[0].options.keepFailedFork, false);
-    const calls = run.counts();
-    await assert.rejects(
-      module.default(run.client('another-environment'), context),
-      /targets another environment/,
-    );
-    assert.deepEqual(run.counts(), calls);
-  });
-
-  it('refuses a generated default export outside a managed migration runner', async () => {
+  it('rejects native runner invocation before client access and still supports content:apply', async () => {
     const test = await fixture();
     const run = harness(test);
     const module = await loadMigrationModule<{ default: ContentMigration }>(
       test.output,
     );
     await assert.rejects(
-      module.default(run.client('destination')),
-      /migration context version 1/,
+      module.default(
+        new Proxy({} as Client, {
+          get() {
+            assert.fail(
+              'unsupported native invocation must not access the client',
+            );
+          },
+        }),
+      ),
+      (error: unknown) => {
+        assert.equal(
+          (error as { code: string }).code,
+          'CONTENT_APPLY_REQUIRED',
+        );
+        assert.match(
+          (error as Error).message,
+          /datocms content:apply <script.ts>/,
+        );
+        assert.match(
+          (error as Error).message,
+          /migrations:run does not support/,
+        );
+        return true;
+      },
     );
     assert.deepEqual(run.counts(), {
       schemaCalls: 0,
@@ -591,5 +549,10 @@ describe('generated TypeScript public runtime integration', () => {
       writes: 0,
     });
     assert.equal(run.plans.length, 0);
+    assert.equal(module.default.contentMigration.version, 1);
+    await run.run();
+    assert.deepEqual(run.events, ['schema', 'capture', 'apply']);
+    assert.equal(run.plans[0].options.inPlace, false);
+    assert.equal(run.plans[0].options.keepFailedFork, false);
   });
 });

@@ -46,7 +46,7 @@ export default class ContentDiffCommand extends ContentCommand {
     'Compare DatoCMS environments and generate an editable TypeScript content migration';
   static examples = [
     '<%= config.bin %> <%= command.id %> syncContent --source=staging --destination=primary',
-    '<%= config.bin %> <%= command.id %> --source=main --destination=main --source-profile=source --destination-profile=target --output=./migrations/content.ts',
+    '<%= config.bin %> <%= command.id %> --source=main --destination=main --source-profile=source --destination-profile=target --output=./migrations/content/sync.ts',
   ];
   static args = {
     NAME: oclif.Args.string({
@@ -65,7 +65,7 @@ export default class ContentDiffCommand extends ContentCommand {
     }),
     output: oclif.Flags.string({
       description:
-        'TypeScript file or migration directory (defaults to the destination profile migration directory)',
+        'TypeScript file or directory (defaults to the content subdirectory of the destination profile migration directory)',
     }),
     'source-profile': oclif.Flags.string({
       description: 'Configured source project profile',
@@ -158,12 +158,15 @@ export default class ContentDiffCommand extends ContentCommand {
         'INVALID_MIGRATION_NAME',
         'The migration name must contain letters or numbers.',
       );
-    const defaultDirectory = destinationProfile?.migrations?.directory
+    const migrationsDirectory = destinationProfile?.migrations?.directory
       ? resolve(
           dirname(this.datoConfigPath ?? resolve('datocms.config.json')),
           destinationProfile.migrations.directory,
         )
       : resolve('./migrations');
+    // The native schema runner scans its directory for timestamped scripts.
+    // Keep plugin-only content scripts below it so they are not auto-discovered.
+    const defaultDirectory = join(migrationsDirectory, 'content');
     const requestedOutput = flags.output
       ? resolve(flags.output)
       : defaultDirectory;

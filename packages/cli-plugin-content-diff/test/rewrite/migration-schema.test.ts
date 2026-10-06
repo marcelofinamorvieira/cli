@@ -52,12 +52,6 @@ function fixture(models: ModelSchema[] = [tracking()]): SchemaState {
   return schema;
 }
 
-const runtimeTracking = {
-  id: 'tracking-model',
-  apiKey: 'custom_migration',
-  createdByThisRun: false,
-};
-
 function rejected(work: () => unknown): void {
   assert.throws(
     work,
@@ -97,41 +91,18 @@ describe('migration tracking schema projection', () => {
     );
   });
 
-  it('accepts the exact pre-existing identity under both execution hosts', () => {
+  it('accepts the exact pre-existing identity without a native runner context', () => {
     const source = fixture();
     const prepared = prepareMigrationSchema(source, 'custom_migration');
     assert.equal(
       projectMigrationSchema(source, prepared.tracking).hash,
       prepared.schema.hash,
     );
-    assert.equal(
-      projectMigrationSchema(source, prepared.tracking, runtimeTracking).hash,
-      prepared.schema.hash,
-    );
   });
 
-  it('allows an absent model only when the native host created this exact canonical model', () => {
+  it('rejects a tracking model that appeared after generation', () => {
     const before = prepareMigrationSchema(fixture([]), 'custom_migration');
-    const after = fixture();
-    assert.equal(
-      projectMigrationSchema(after, before.tracking, {
-        ...runtimeTracking,
-        createdByThisRun: true,
-      }).hash,
-      before.schema.hash,
-    );
-    rejected(() => projectMigrationSchema(after, before.tracking));
-    rejected(() =>
-      projectMigrationSchema(after, before.tracking, runtimeTracking),
-    );
-    rejected(() => projectMigrationSchema(after, before.tracking, null));
-    rejected(() =>
-      projectMigrationSchema(after, before.tracking, {
-        ...runtimeTracking,
-        createdByThisRun: true,
-        id: 'another-model',
-      }),
-    );
+    rejected(() => projectMigrationSchema(fixture(), before.tracking));
   });
 
   it('rejects replaced, renamed, missing, and wrongly bound tracking identities', () => {
@@ -148,19 +119,6 @@ describe('migration tracking schema projection', () => {
       ]),
     ])
       rejected(() => projectMigrationSchema(changed, prepared.tracking));
-    rejected(() =>
-      projectMigrationSchema(source, prepared.tracking, {
-        ...runtimeTracking,
-        id: 'another-model',
-      }),
-    );
-    rejected(() =>
-      projectMigrationSchema(source, prepared.tracking, {
-        ...runtimeTracking,
-        apiKey: 'other_migration',
-      }),
-    );
-    rejected(() => projectMigrationSchema(source, prepared.tracking, null));
   });
 
   it('rejects content models that merely share the configured API key', () => {
@@ -195,14 +153,10 @@ describe('migration tracking schema projection', () => {
         prepareMigrationSchema(fixture([model]), 'custom_migration'),
       );
       rejected(() =>
-        projectMigrationSchema(
-          fixture([model]),
-          {
-            apiKey: 'custom_migration',
-            model: null,
-          },
-          { ...runtimeTracking, createdByThisRun: true },
-        ),
+        projectMigrationSchema(fixture([model]), {
+          apiKey: 'custom_migration',
+          model: { id: model.id, nameFieldId: canonical.fields[0].id },
+        }),
       );
     }
   });
@@ -238,9 +192,7 @@ describe('migration tracking schema projection', () => {
           fixture(),
           'custom_migration',
         ).tracking;
-        rejected(() =>
-          projectMigrationSchema(source, binding, runtimeTracking),
-        );
+        rejected(() => projectMigrationSchema(source, binding));
       }
     }
   });

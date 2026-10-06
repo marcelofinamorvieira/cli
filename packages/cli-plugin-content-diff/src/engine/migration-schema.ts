@@ -1,4 +1,3 @@
-import type { MigrationExecutionContext } from '@datocms/cli-utils';
 import { hashJson, object } from './codec';
 import { ContentError } from './errors';
 import { schemaHash } from './schema';
@@ -9,8 +8,6 @@ export interface MigrationTrackingBinding {
   apiKey: string;
   model: { id: string; nameFieldId: string } | null;
 }
-
-type RuntimeTrackingModel = MigrationExecutionContext['trackingModel'];
 
 function invalid(message: string): never {
   throw new ContentError('INVALID_MIGRATION_TRACKING_MODEL', message);
@@ -105,38 +102,14 @@ export function prepareMigrationSchema(
   };
 }
 
-/**
- * Project the recorded identity during execution. Undefined host metadata is
- * the content:apply path; null explicitly means the native runner failed to
- * establish its tracking model and cannot safely execute this migration.
- */
+/** Project only the exact tracking identity validated during generation. */
 export function projectMigrationSchema(
   schema: SchemaState,
   binding: MigrationTrackingBinding,
-  runtimeTrackingModel?: RuntimeTrackingModel,
 ): SchemaState {
   if (!binding.apiKey)
     invalid('The recorded migration tracking API key is missing.');
-  if (runtimeTrackingModel === null)
-    invalid('The migration runner did not establish a tracking model.');
-  if (runtimeTrackingModel && runtimeTrackingModel.apiKey !== binding.apiKey)
-    invalid('The migration runner uses a different tracking model API key.');
-
-  const boundId = binding.model?.id;
-  if (boundId && runtimeTrackingModel && runtimeTrackingModel.id !== boundId)
-    invalid(
-      'The migration runner tracking model differs from the generated identity.',
-    );
-  if (
-    !boundId &&
-    runtimeTrackingModel &&
-    !runtimeTrackingModel.createdByThisRun
-  )
-    invalid(
-      'An unrecorded tracking model was not created by this migration run.',
-    );
-
-  const expectedId = boundId ?? runtimeTrackingModel?.id;
+  const expectedId = binding.model?.id;
   const candidates = schema.models.filter((model) =>
     expectedId
       ? model.id === expectedId || model.apiKey === binding.apiKey
@@ -145,7 +118,7 @@ export function projectMigrationSchema(
   if (!expectedId) {
     if (candidates.length)
       invalid(
-        'A tracking model appeared after generation without native runner ownership.',
+        'A migration tracking model appeared after generation. Regenerate the content migration.',
       );
     return withoutTrackingModel(schema, null);
   }

@@ -9,9 +9,9 @@ export default class ContentApplyCommand extends ContentCommand {
   static description =
     'Run a TypeScript content migration in a new isolated destination fork';
   static examples = [
-    '<%= config.bin %> <%= command.id %> ./migrations/content.ts',
-    '<%= config.bin %> <%= command.id %> ./migrations/content.ts --in-place',
-    '<%= config.bin %> <%= command.id %> ./migrations/content.ts --repair',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --in-place',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --repair',
   ];
   static args = {
     SCRIPT: oclif.Args.string({

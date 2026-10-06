@@ -2,15 +2,13 @@
 
 Generate editable TypeScript migrations from content differences between DatoCMS environments or projects. Review the actual CMA calls, edit them if needed, then apply with destination checks, dependency planning, and final verification.
 
-The plugin adds `content:diff` and `content:apply`. Generated files also work with the matching DatoCMS CLI's `migrations:run`. Normal `migrations:new --autogenerate` remains **schema-only**.
+The plugin adds `content:diff` and `content:apply` to the unmodified DatoCMS CLI. Generate and execute content migrations through these plugin commands. Native `migrations:new --autogenerate` and `migrations:run` remain the separate schema migration workflow.
 
 ## Setup
 
 Requires Node.js 22.13+ on the 22.x line, or Node.js 24+. Node 22 may print an experimental SQLite warning to stderr.
 
-Use compatible builds of `datocms` and this plugin. The native runner must support managed migration context version 1; older runners are rejected before executing the content migration.
-
-When testing an unreleased change, install matching local packages or tarballs from the same checkout in place of the registry packages below.
+No custom CLI build or native migration-runner extension is required. When testing an unreleased plugin, install its local package or tarball in place of the registry plugin below.
 
 Install both packages in the project containing your migrations, and register that local plugin with the CLI:
 
@@ -31,7 +29,7 @@ npx datocms content:diff syncContent \
   --destination=primary
 ```
 
-This creates a native-style file such as `migrations/1791200000_syncContent.ts` and its sibling `1791200000_syncContent.content/` directory. The default directory comes from the destination profile's `migrations.directory`, resolved relative to the configuration file, or `./migrations`. The optional name defaults to `contentMigration`.
+This creates a native-style file such as `migrations/content/1791200000_syncContent.ts` and its sibling `1791200000_syncContent.content/` directory. The default directory is the `content/` subdirectory of the destination profile's `migrations.directory`, resolved relative to the configuration file, or `./migrations/content`. This keeps content scripts outside native schema migration discovery. The optional name defaults to `contentMigration`.
 
 `--output=./review/content.ts` chooses an exact filename. `--output=./review` chooses a directory and keeps automatic timestamped naming. Existing scripts and companion directories are never overwritten.
 
@@ -106,7 +104,7 @@ Invalid drafts can be preserved where the model permits them. Writes that requir
 ## Apply
 
 ```sh
-npx datocms content:apply ./migrations/1791200000_syncContent.ts \
+npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
   --profile=target-project
 ```
 
@@ -126,24 +124,15 @@ Apply checks the companion, destination project/schema, and complete baseline, e
 
 Only records being written have their schedules cancelled and later restored to the exact intended future dates. Other schedules are left alone. The schedule window includes existing destination schedules and intended schedules. Temporary field settings are restored before success. On failure, an owned fork is deleted unless explicitly retained; pre-existing environments are never deleted.
 
-### Use the normal migration runner
+### Keep schema and content execution separate
 
-Put the generated timestamped `.ts` file and its companion in the configured migrations directory, then use the matching updated CLI:
+Use `migrations:run` for schema scripts and `content:apply SCRIPT.ts` for content scripts. Content execution owns its fork, authorization, interruption handling and cleanup entirely within the plugin. It does not create native migration receipts or participate in the native runner's pending-script queue.
 
-```sh
-npx datocms migrations:run \
-  --source=main \
-  --destination=content-review \
-  --profile=target-project
-```
+Keep content scripts in the default `migrations/content/` subdirectory or another directory outside native script discovery. If `--output` points into the schema migration directory, move the generated script and its companion together before running schema migrations. Direct invocation of a content script through `migrations:run` is rejected before content execution; that runner may already have created its own fork and tracking model.
 
-The native runner discovers timestamp-prefixed filenames. Use `content:apply` for an explicitly named file without that prefix.
+Run required schema migrations before generating the content diff, against the aligned environments. Subsequent schema or content changes can invalidate the captured baseline. Use the same `migrations.modelApiKey` as at generation: the plugin preserves existing, validated schema migration receipts by excluding their exact tracking-model identity from content synchronization. A missing, replaced or newly introduced tracking model fails the baseline checks.
 
-Here `--source` is the destination project's environment that the native runner forks. The content migration uses that runner's supplied environment and cleanup context; it does not create another fork. Its successful completion is recorded through the normal migration receipt system. A receipt marks a completed script, not progress within an interrupted content migration.
-
-Use the same `migrations.modelApiKey` as at generation. The runtime excludes only a validated tracking-model identity, including a new one the native runner explicitly owns. Ordinary models with a coincidentally matching name are not ignored. Earlier pending migrations that change the captured schema or content will cause baseline checks to fail; generate against the state this content migration will actually receive.
-
-The native runner's flags govern its fork and primary authorization. Content-specific runtime defaults are set in the generated `defineContentMigration` options: `concurrency`, `verification`, `scheduleWindowMinutes`, and `allowTemporarySchemaChanges`. Use `content:apply` for its explicit content flags. Calling the generated default export without a compatible managed runner is refused.
+Content application controls are flags on `content:apply`, including `--concurrency`, `--verification`, `--schedule-window` and `--allow-temporary-schema-changes`. Repair uses the script's optional `defineContentMigration` `concurrency` setting for reconstruction reads.
 
 ### Interruptions and repair
 
@@ -156,13 +145,13 @@ Forced termination can leave owned `content-diff-*` temporary directories or `.c
 After an interrupted in-place run, retain the exact script used for that run and execute:
 
 ```sh
-npx datocms content:apply ./migrations/1791200000_syncContent.ts \
+npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
   --repair --destination=main --allow-primary --profile=target-project
 ```
 
 Repair reconstructs the original baseline locally, replays the script to recover its intent, and restores only eligible field settings and schedules. It does not reapply record content or resume the failed run. Original-content records can receive their original schedules; records already matching the intended content can receive the intended schedules. Ambiguous states, expired schedules, and validity that would require saving a record are reported.
 
-Automatic repair requires enough original evidence. If a script edit changed a previously unchanged identity whose original payload was not stored, its live guard may no longer allow reconstruction. Repair also refuses unrelated schema changes, unknown migration-tracking ownership, and edited validity that cannot be checked while temporary rules remain. Keep the original script and companion, and investigate reported refusals rather than repeatedly applying the migration.
+Automatic repair requires enough original evidence. If a script edit changed a previously unchanged identity whose original payload was not stored, its live guard may no longer allow reconstruction. Repair also refuses unrelated schema changes, changed migration-tracking identity, and edited validity that cannot be checked while temporary rules remain. Keep the original script and companion, and investigate reported refusals rather than repeatedly applying the migration.
 
 ## Concurrency and verification
 
@@ -195,4 +184,4 @@ npm test
 npm run package:check
 ```
 
-Tests cover generation, executable TypeScript edits, baseline integrity, recorded intent, dependency planning, native runner integration, execution, interruption, repair, and cleanup. Memory and throughput claims require separate measurements: an incremental apply on a populated project does not establish full-transfer throughput, and synthetic scale tests do not establish a 600,000-record live TypeScript migration.
+Tests cover generation, executable TypeScript edits, baseline integrity, recorded intent, dependency planning, plugin-only execution, execution, interruption, repair, and cleanup. Memory and throughput claims require separate measurements: an incremental apply on a populated project does not establish full-transfer throughput, and synthetic scale tests do not establish a 600,000-record live TypeScript migration.

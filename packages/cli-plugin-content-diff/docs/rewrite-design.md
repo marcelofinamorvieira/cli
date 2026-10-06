@@ -1,6 +1,6 @@
 # TypeScript content migration design
 
-The public artifact is an editable TypeScript migration containing actual CMA calls. `content:diff` generates it; `content:apply` or a compatible native `migrations:run` executes it through the shared guarded content engine. Schema autogeneration remains schema-only.
+The public artifact is an editable TypeScript migration containing actual CMA calls. `content:diff` generates it; the plugin-owned `content:apply` executes it through the shared guarded content engine. Schema autogeneration remains schema-only.
 
 ## Artifact and authority
 
@@ -20,7 +20,7 @@ Generated code uses `defineContentMigration` from the plugin's public `migration
 4. Build the indexed dependency, uniqueness, ordering, publication, and temporary-schema plan. Reject unsafe changes unless a proven isolated partial closure is authorized.
 5. Emit readable CMA calls and original asset files into staged output. Publish a complete script/companion pair only after the baseline and binaries are complete; reject existing paths.
 
-`content:diff [NAME]` uses native `{unix_timestamp}_{camelCaseName}.ts` naming. The name defaults to `contentMigration`. `--output` accepts an exact `.ts` path or directory. Without it, use the destination profile's configured migration directory relative to the configuration file, or `./migrations`.
+`content:diff [NAME]` uses native `{unix_timestamp}_{camelCaseName}.ts` naming. The name defaults to `contentMigration`. `--output` accepts an exact `.ts` path or directory. Without it, use the `content/` subdirectory of the destination profile's configured migration directory relative to the configuration file, or `./migrations/content`. The native schema runner does not discover scripts in this subdirectory.
 
 The default TypeScript part target is 1 MiB. Never split a CMA operation. One large operation can occupy its own part, within the source-file ceiling. A small diff remains a short script even when its full-namespace guards are large.
 
@@ -39,15 +39,15 @@ DatoCMS has no persistent public sandbox write freeze. Maintenance mode applies 
 
 `versions` verification uses current versions and published-version timestamps to avoid redundant reads. Full verification rereads complete records. Managed schema changes and plugin-controlled upload rewrites receive additional checks, but external in-place rewrites can evade version-only comparison. Full reads strengthen verification without freezing the environment.
 
-## Native migration integration
+## Plugin-only execution boundary
 
-The normal runner provides managed execution context version 1: its chosen environment, original source environment, primary authorization, signal, logging, root client, client factory, and migration-tracking ownership. The generated default export activates managed cleanup before preflight and verifies that its supplied client targets that environment. Missing or incompatible context is refused.
+The plugin must work with the unmodified DatoCMS CLI and shared utilities. It registers only `content:diff` and `content:apply`, with no native command overrides, runtime patches or content-specific host contracts. The native schema migration runner remains separate.
 
-The native runner owns its fork. The content runtime writes within it and never creates a second fork or promotes it. Completion uses the ordinary migration receipt system; a receipt records a completed script and is not an interrupted-run checkpoint. Failure cleanup also covers failure to save the receipt after content execution.
+`content:apply` owns the complete content lifecycle: environment authorization, fork creation, cooperative cancellation, verification and failed-fork cleanup. Generated default exports carry the content definition; direct function invocation refuses with an instruction to use `content:apply`. The plugin does not write native migration receipts or maintain a pending-script queue.
 
-Tracking-model projection requires canonical schema and exact identity. If the model was absent at generation, only a matching model explicitly created by this native run may be introduced. Unrelated models or unknown ownership are not silently excluded. Prior pending migrations that change content/schema invalidate the captured baseline.
+Tracking-model projection requires canonical schema and the exact identity recorded at generation. A newly introduced, replaced or missing tracking model is rejected. Existing schema migration receipts remain outside content synchronization. Complete required schema changes before generating content; changes to captured schema or content invalidate the baseline.
 
-The plugin runtime must resolve as a project dependency from the generated script. A separately installed CLI plugin does not guarantee that import resolution. Use matching CLI/plugin builds; normal schema-only migrations retain their existing behavior.
+The plugin runtime must resolve as a project dependency from the generated script. A separately installed CLI plugin does not guarantee that import resolution. No modified native CLI build is required.
 
 ## Memory, lifecycle, and repair
 
@@ -63,7 +63,7 @@ Cancel schedules only for written records. Recreate their exact intended future 
 
 Repair uses the same script and immutable companion without saved run progress. Reconstruct original changed identities from stored originals; guard-only identities must still match their original guards. Replay the script locally and derive a fresh repair plan. Restore only eligible schedules and exactly recognized temporary field settings; never rewrite record content or save a new version merely to refresh validity. Report incomplete or ambiguous recovery.
 
-Repair must refuse missing original evidence, unrelated schema changes, unknown native tracking ownership, expired/ambiguous schedules, and edited validity that cannot be verified while changed field rules remain. Editing a previously unchanged identity can make later repair unreconstructable because its original payload was never saved. Retain the exact script used by the failed run.
+Repair must refuse missing original evidence, unrelated schema changes, changed tracking-model identity, expired/ambiguous schedules, and edited validity that cannot be verified while changed field rules remain. Editing a previously unchanged identity can make later repair unreconstructable because its original payload was never saved. Retain the exact script used by the failed run.
 
 ## Component boundaries and verification
 
@@ -78,9 +78,9 @@ Repair must refuse missing original evidence, unrelated schema changes, unknown 
 | `engine/migration-schema` | Explicit native tracking-model identity and schema projection. |
 | `engine/migration-repair` | Original-namespace reconstruction and fresh repair planning. |
 | `engine/apply*` | Guarded fork/in-place execution, restoration, verification, and cleanup. |
-| `migration` | Public generated-script runtime and native-runner integration. |
+| `migration` | Public generated-script definition and plugin-owned execution. |
 | `commands/content` | Profiles, flags, naming, interruptions, and terminal/JSON output. |
 
-Tests must execute real generated TypeScript, edit its payloads, and show that replanning follows those edits. Include inline and worker parts, unchanged namespace preservation, source-evidence cycles, unsupported edits, corrupted companions, project/primary guards, native receipts/context, repair refusals, interruption, cleanup, and package resolution. Retain meaningful failures while investigating them.
+Tests must execute real generated TypeScript, edit its payloads, and show that replanning follows those edits. Include inline and worker parts, unchanged namespace preservation, source-evidence cycles, unsupported edits, corrupted companions, project/primary guards, plugin-only invocation boundaries, repair refusals, interruption, cleanup, and package resolution. Retain meaningful failures while investigating them.
 
 Report scale evidence precisely. Parser/worker retention tests, synthetic planning, incremental live applies, and full live transfers prove different things. Do not infer 600,000-record TypeScript transfer throughput or production readiness from a small incremental apply. Live writes require explicit authorization and remain confined to the authorized projects and environments.

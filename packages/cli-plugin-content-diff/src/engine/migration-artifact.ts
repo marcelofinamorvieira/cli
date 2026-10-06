@@ -322,7 +322,7 @@ class ScriptWriter {
     return checkedScript(
       `import { join } from 'node:path';\nimport type { Client } from 'datocms/lib/cma-client-node';\nimport { defineContentMigration${
         this.parts ? ', runMigrationPart' : ''
-      } } from '@datocms/cli-plugin-content-diff/migration';\n\n// Review and edit these CMA operations. The runtime rebuilds their safe execution plan.\nexport default defineContentMigration(\n  { baseline: join(__dirname, ${JSON.stringify(
+      } } from '@datocms/cli-plugin-content-diff/migration';\n\n// Run this file with datocms content:apply.\n// Review and edit these CMA operations. The runtime rebuilds their safe execution plan.\nexport default defineContentMigration(\n  { baseline: join(__dirname, ${JSON.stringify(
         this.companionName,
       )}), allowTemporarySchemaChanges: ${allowTemporarySchemaChanges} },\n  async (client: Client): Promise<void> => {\n${
         body || '  // No content changes.\n'

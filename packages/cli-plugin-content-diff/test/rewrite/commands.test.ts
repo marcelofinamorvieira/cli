@@ -230,7 +230,7 @@ describe('content command integration', () => {
     }
   });
 
-  it('names TypeScript files like native migrations and uses the destination profile directory', async () => {
+  it('keeps default content scripts below the schema migration directory and honors explicit output', async () => {
     const directory = await realpath(
       await mkdtemp(join(tmpdir(), 'content-command-path-')),
     );
@@ -256,7 +256,12 @@ describe('content command integration', () => {
         output: undefined,
         profiles: undefined,
         selected: undefined,
-        path: join(directory, 'migrations', `${timestamp}_syncFaqContent.ts`),
+        path: join(
+          directory,
+          'migrations',
+          'content',
+          `${timestamp}_syncFaqContent.ts`,
+        ),
       },
       {
         output: undefined,
@@ -265,6 +270,7 @@ describe('content command integration', () => {
         path: join(
           directory,
           'single-profile',
+          'content',
           `${timestamp}_syncFaqContent.ts`,
         ),
       },
@@ -278,6 +284,7 @@ describe('content command integration', () => {
         path: join(
           directory,
           'destination-profile',
+          'content',
           `${timestamp}_syncFaqContent.ts`,
         ),
       },
