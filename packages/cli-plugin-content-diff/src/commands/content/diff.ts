@@ -10,10 +10,7 @@ import {
   DEFAULT_MIGRATION_CHUNK_BYTES,
   MAX_MIGRATION_CHUNK_BYTES,
 } from '../../engine/migration-limits';
-import {
-  prepareMigrationSchema,
-  projectMigrationSchema,
-} from '../../engine/migration-schema';
+import { prepareMigrationSchema } from '../../engine/migration-schema';
 import { assertSchemaCompatible, createPlan } from '../../engine/planner';
 import {
   assertApplyAccess,
@@ -101,12 +98,6 @@ export default class ContentDiffCommand extends ContentCommand {
       description: 'Plan supported temporary validator and default changes',
       default: false,
     }),
-    verification: oclif.Flags.custom<'versions' | 'full'>({
-      description:
-        'Skip rereading records whose version did not change ("versions"), or reread every record in each check ("full")',
-      options: ['versions', 'full'],
-      default: 'versions',
-    })(),
     concurrency: oclif.Flags.integer({
       description: 'Maximum concurrent independent requests (1–16)',
       default: 8,
@@ -270,15 +261,9 @@ export default class ContentDiffCommand extends ContentCommand {
           schema,
           store: target,
           side,
-          // DatoCMS cannot freeze sandbox environments, so every capture must
-          // recheck consistency before its state is used to generate a migration.
-          verify: flags.verification === 'versions' ? 'versions' : true,
+          // Generation assumes writes are prevented externally during capture.
+          verify: false,
           options: {
-            schemaProjection: (rawSchema) =>
-              projectMigrationSchema(
-                rawSchema,
-                side === 'source' ? sourceTracking : destinationTracking,
-              ),
             signal: captureSignal,
             modelIds: schema.models
               .filter((model) => !model.block)

@@ -9,3 +9,5 @@ Add precise content-client types, descriptive generated labels and project forma
 Reuse the public CMA identity validator, bulk schema reads and tsx loader, and keep authentication on public CLI and SDK APIs. Preserve uncertain fork IDs in sanitized errors, unify execution around the rebuilt plan, and remove retired JSON-plan and speculative environment-lock paths.
 
 Reject incompatible schemas before capturing content, avoiding unnecessary full-project reads when the environments need schema alignment.
+
+Read each environment once during content generation and remove the generation verification flag. Generation relies on external write controls; apply retains its destination conflict and verification checks.

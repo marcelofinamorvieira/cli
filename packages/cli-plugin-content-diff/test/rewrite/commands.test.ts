@@ -217,13 +217,8 @@ describe('content command integration', () => {
         working = args.store;
         assert.deepEqual(args.options.modelIds, ['article-id', 'page-id']);
         assert.equal(args.options.uploads, 'all');
-        assert.ok(args.options.schemaProjection);
-        assert.deepEqual(
-          args.options
-            .schemaProjection(schemaState())
-            .models.map((model) => model.id),
-          ['article-id', 'page-id', 'block-id'],
-        );
+        assert.equal(args.verify, false);
+        assert.equal(args.options.schemaProjection, undefined);
         captures.push(args.side);
       },
     );
@@ -323,6 +318,122 @@ describe('content command integration', () => {
       });
       await assert.rejects(command.run(), /download failed/);
       assert.equal(existsSync(working.directory), false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('generates with one capture per environment and no schema or content verification rereads', async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), 'content-command-single-pass-'),
+    );
+    const schemaReads: string[] = [];
+    const recordReads: string[] = [];
+    const assetReads: string[] = [];
+    const collectionReads: string[] = [];
+    const permissions: string[] = [];
+    const progress: string[] = [];
+    replace(
+      schema,
+      'fetchSchema',
+      async (
+        _client: unknown,
+        environment: string,
+        projection?: (state: SchemaState) => SchemaState,
+      ) => {
+        schemaReads.push(environment);
+        const state = schemaState(environment);
+        state.hash = schema.schemaHash(state);
+        return projection ? projection(state) : state;
+      },
+    );
+    replace(
+      schema,
+      'assertFullReadAccess',
+      async (_client: unknown, state: SchemaState) => {
+        permissions.push(state.environmentId);
+      },
+    );
+    replace(schema, 'assertApplyAccess', async () => undefined);
+    replace(
+      artifact,
+      'writeMigration',
+      async (args: Parameters<typeof artifact.writeMigration>[0]) =>
+        args.outputPath,
+    );
+    const command = Object.assign(Object.create(ContentDiffCommand.prototype), {
+      parse: async () => ({
+        args: { NAME: 'firstDiff' },
+        flags: {
+          source: 'source',
+          destination: 'target',
+          output: join(directory, 'migration.ts'),
+          'item-types': 'all',
+          uploads: 'referenced',
+          concurrency: 4,
+          'chunk-bytes': 1024,
+          'include-deletions': false,
+          'allow-partial': false,
+          'allow-temporary-schema-changes': false,
+        },
+      }),
+      endpoint: async () => ({
+        rootClient: {
+          environments: {
+            list: async () => [
+              { id: 'source', meta: { primary: false } },
+              { id: 'target', meta: { primary: true } },
+            ],
+          },
+        },
+        buildEnvironmentClient: (environment: string) => ({
+          request: async ({
+            queryParams,
+          }: {
+            queryParams: { filter: { type: string }; version: string };
+          }) => {
+            recordReads.push(
+              `${environment}:${queryParams.filter.type}:${queryParams.version}`,
+            );
+            return { data: [], meta: { total_count: 0 } };
+          },
+          uploads: {
+            rawList: async () => {
+              assetReads.push(environment);
+              return { data: [], meta: { total_count: 0 } };
+            },
+          },
+          uploadCollections: {
+            list: async () => {
+              collectionReads.push(environment);
+              return [];
+            },
+          },
+        }),
+      }),
+      progress: (message: string) => progress.push(message),
+      jsonEnabled: () => true,
+    });
+    try {
+      await command.run();
+      assert.deepEqual(schemaReads, ['source', 'target']);
+      assert.deepEqual(
+        recordReads,
+        ['source', 'target'].flatMap((environment) =>
+          ['article-id', 'page-id'].flatMap((model) =>
+            ['current', 'published'].map(
+              (version) => `${environment}:${model}:${version}`,
+            ),
+          ),
+        ),
+      );
+      assert.deepEqual(assetReads, ['source', 'target']);
+      assert.deepEqual(collectionReads, ['source', 'target']);
+      assert.deepEqual(permissions, ['source', 'target']);
+      assert.doesNotMatch(
+        progress.join('\n'),
+        /Checking capture consistency|Listing .* versions/,
+      );
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -475,10 +586,8 @@ describe('content command integration', () => {
           options.schema.models.map((model) => model.id),
           ['article-id', 'page-id', 'block-id'],
         );
-        const projected = options.options.schemaProjection!(
-          raw(options.environmentId),
-        );
-        assert.deepEqual(projected, options.schema);
+        assert.equal(options.verify, false);
+        assert.equal(options.options.schemaProjection, undefined);
         assert.deepEqual(options.options.modelIds, ['article-id', 'page-id']);
       },
     );
@@ -574,6 +683,7 @@ describe('content command integration', () => {
       capture,
       'captureSnapshot',
       async (args: Parameters<typeof capture.captureSnapshot>[0]) => {
+        assert.equal(args.verify, false);
         active++;
         maximum = Math.max(maximum, active);
         stores.set(args.side, args.store);
@@ -1083,6 +1193,15 @@ describe('content command integration', () => {
         code?: string;
         status: number;
       }[] = [
+        ...['versions', 'full'].map((verification) => ({
+          args: [
+            'content:diff',
+            '--source=a',
+            `--verification=${verification}`,
+          ],
+          message: /Nonexistent flag: --verification/,
+          status: 2,
+        })),
         {
           args: [
             'content:diff',

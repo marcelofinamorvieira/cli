@@ -65,7 +65,7 @@ Generated migrations are **trusted executable Node.js code**. Only calls made th
 
 ### Generation options
 
-`--source` accepts an environment ID or `primary`; `--destination` defaults to `primary`. Generation captures both complete managed namespaces, including expanded current and published blocks, and checks consistency. Model selection limits intended changes, while other content supplies dependency and preservation evidence.
+`--source` accepts an environment ID or `primary`; `--destination` defaults to `primary`. Generation checks schema compatibility before capturing both complete managed namespaces, including expanded current and published blocks. Each environment is captured once, without subsequent version scans, full-content rereads, or schema/asset consistency rereads. Keep content and schema unchanged in both environments throughout generation using external write controls; the plugin does not acquire an environment lock. Model selection limits intended changes, while other content supplies dependency and preservation evidence.
 
 | Flag | Default | Behavior |
 | --- | --- | --- |
@@ -74,7 +74,6 @@ Generated migrations are **trusted executable Node.js code**. Only calls made th
 | `--include-deletions` | Off | Emit safe destination-only deletions within scope. |
 | `--allow-partial` | Off | Allow only proven isolated skips and their dependency closure. |
 | `--allow-temporary-schema-changes` | Off | Permit planning supported temporary validator/default changes. |
-| `--verification=versions` | `versions` | Choose version-based or full consistency checks. |
 | `--concurrency=8` | `8` | Bound independent requests to 1–16. |
 | `--chunk-bytes=1048576` | `1048576` | Target TypeScript part size, from 1 to 16,776,192 bytes; never split an operation. |
 
@@ -178,9 +177,11 @@ Automatic repair requires enough original evidence. If a script edit changed a p
 
 ## Concurrency and verification
 
-DatoCMS provides no persistent public sandbox write freeze. Maintenance mode applies only to primary and is not an immutable snapshot or transaction. Capture checks, focused live guards, and final verification detect observed conflicts; another writer can still act between a check and its write. Stop competing writes for generation and execution.
+Generation assumes content and schema remain unchanged through external write controls and performs no post-capture verification. Initial schema compatibility, read permissions, pagination completeness, and payload integrity are still checked.
 
-`--verification=versions` uses current-version IDs and published-version timestamps to avoid rereading unchanged records. Changed versions are read fully and compared. `--verification=full` rereads every record in each consistency/final check and costs more requests.
+During apply, destination capture checks, baseline comparison, focused live guards, and final verification detect observed conflicts. DatoCMS provides no persistent public sandbox write freeze; maintenance mode applies only to primary and is not an immutable snapshot or transaction. Stop competing writes during execution too, since another writer can act between a check and its write.
+
+`content:apply --verification=versions` uses current-version IDs and published-version timestamps to avoid rereading unchanged records. Changed versions are read fully and compared. `content:apply --verification=full` rereads every record in each consistency/final check and costs more requests. `content:diff` has no `--verification` flag.
 
 Some native operations rewrite values without a new record version, including upload URL changes and schema-driven changes. Schema fingerprints catch managed schema changes, and apply forces full record checks when its asset changes require them. An unrelated writer's URL rewrite can still escape a version-based capture check. Full verification gives stronger reads but does not freeze the environment.
 
