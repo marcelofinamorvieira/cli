@@ -14,7 +14,7 @@ import {
   prepareMigrationSchema,
   projectMigrationSchema,
 } from '../../engine/migration-schema';
-import { createPlan } from '../../engine/planner';
+import { assertSchemaCompatible, createPlan } from '../../engine/planner';
 import {
   assertApplyAccess,
   assertSchemaEditAccess,
@@ -238,6 +238,8 @@ export default class ContentDiffCommand extends ContentCommand {
       );
     const modelIds = selectedModels(sourceSchema, flags['item-types']);
     assertNotAborted(signal);
+    // Reject incompatible schemas before reading either content namespace.
+    assertSchemaCompatible(sourceSchema, destinationSchema, new Set(modelIds));
     const store = new SnapshotStore();
     try {
       // Full namespaces prove inbound dependencies and preservation. The model

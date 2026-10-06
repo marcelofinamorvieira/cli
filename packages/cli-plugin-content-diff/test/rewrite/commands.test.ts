@@ -14,6 +14,7 @@ import * as artifact from '../../src/engine/migration-artifact';
 import { MAX_MIGRATION_CHUNK_BYTES } from '../../src/engine/migration-limits';
 import * as planner from '../../src/engine/planner';
 import * as schema from '../../src/engine/schema';
+import * as storage from '../../src/engine/store';
 import type { SnapshotStore } from '../../src/engine/store';
 import type {
   ApplyPreviewResult,
@@ -89,6 +90,102 @@ describe('content command integration', () => {
     for (const invalid of [0, 17, 1.5, Number.NaN])
       assert.throws(() => concurrency(invalid));
   });
+
+  for (const pairedProfiles of [false, true]) {
+    it(`rejects incompatible schemas before capturing content with ${
+      pairedProfiles ? 'paired profiles' : 'one profile'
+    }`, async () => {
+      const directory = await mkdtemp(
+        join(tmpdir(), 'content-command-schema-'),
+      );
+      const source = schemaState('source');
+      const destination = schemaState('target');
+      const reads: string[] = [];
+      replace(
+        schema,
+        'fetchSchema',
+        async (_client: unknown, environment: string) => {
+          reads.push(environment);
+          return environment === 'source' ? source : destination;
+        },
+      );
+      replace(
+        storage,
+        'SnapshotStore',
+        class {
+          constructor() {
+            assert.fail(
+              'An incompatible schema must fail before allocating SQLite',
+            );
+          }
+        },
+      );
+      replace(capture, 'captureSnapshot', async () => {
+        assert.fail('Neither environment should have its content read');
+      });
+      const endpoint = {
+        rootClient: {
+          environments: {
+            list: async () => [
+              { id: 'source', meta: { primary: false } },
+              { id: 'target', meta: { primary: true } },
+            ],
+          },
+        },
+        buildEnvironmentClient: (id: string) => ({ id }),
+      };
+      const command = Object.assign(
+        Object.create(ContentDiffCommand.prototype),
+        {
+          parse: async () => ({
+            args: { NAME: 'firstDiff' },
+            flags: {
+              source: 'source',
+              destination: 'target',
+              output: join(directory, 'migration.ts'),
+              'item-types': 'article',
+              concurrency: 4,
+              'chunk-bytes': 1024,
+              ...(pairedProfiles
+                ? {
+                    'source-profile': 'source',
+                    'destination-profile': 'target',
+                  }
+                : {}),
+            },
+          }),
+          endpoint: async () => ({ ...endpoint }),
+          progress: () => undefined,
+          jsonEnabled: () => true,
+        },
+      );
+      try {
+        for (const mismatch of ['locales', 'selected-model', 'block-model']) {
+          destination.locales = mismatch === 'locales' ? ['it'] : ['en'];
+          destination.models = schemaState('target').models.filter(
+            (model) =>
+              model.id !==
+              (mismatch === 'selected-model'
+                ? 'article-id'
+                : mismatch === 'block-model'
+                  ? 'block-id'
+                  : undefined),
+          );
+          reads.length = 0;
+          await assert.rejects(command.run(), (error: unknown) => {
+            assert.ok(error instanceof ContentError, String(error));
+            assert.equal(error.code, 'SCHEMA_INCOMPATIBLE', mismatch);
+            return true;
+          });
+          assert.deepEqual(reads, ['source', 'target']);
+          assert.equal(existsSync(join(directory, 'migration.ts')), false);
+          assert.equal(existsSync(join(directory, 'migration.content')), false);
+        }
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
 
   it('captures complete namespaces, plans only selected models, and removes its temporary store', async () => {
     replace(

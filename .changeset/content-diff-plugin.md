@@ -7,3 +7,5 @@ Add content migrations as editable TypeScript CMA scripts. `content:diff` genera
 Add precise content-client types, descriptive generated labels and project formatting, a read-only apply preview, and optional names for owned result forks. Preview rebuilds and checks the edited plan without applying it; execution reports verified progress by model and resource.
 
 Reuse the public CMA identity validator, bulk schema reads and tsx loader, and keep authentication on public CLI and SDK APIs. Preserve uncertain fork IDs in sanitized errors, unify execution around the rebuilt plan, and remove retired JSON-plan and speculative environment-lock paths.
+
+Reject incompatible schemas before capturing content, avoiding unnecessary full-project reads when the environments need schema alignment.

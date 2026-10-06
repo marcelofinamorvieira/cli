@@ -293,7 +293,7 @@ function recordSafety(
   };
 }
 
-function schemaCompatible(
+export function assertSchemaCompatible(
   source: SchemaState,
   target: SchemaState,
   selected: Set<string>,
@@ -2898,7 +2898,7 @@ export async function createPlan(
   targetSchema: SchemaState,
   options: PlanOptions,
 ): Promise<PlanMetadata> {
-  schemaCompatible(sourceSchema, targetSchema, new Set(options.modelIds));
+  assertSchemaCompatible(sourceSchema, targetSchema, new Set(options.modelIds));
   // This private working database has no competing readers or network awaits.
   // One disk-backed transaction avoids a journal/fsync cycle for every index
   // and plan write while leaving no partially planned result after an error.
