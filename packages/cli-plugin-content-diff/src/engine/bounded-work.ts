@@ -46,16 +46,3 @@ export async function boundedWork<T>(
   if (failed) throw failure;
   assertNotAborted(signal);
 }
-
-/** Groups of at most 30 values, the limit of one nested record read. */
-export function* batches<T>(values: Iterable<T>): Generator<T[]> {
-  let batch: T[] = [];
-  for (const value of values) {
-    batch.push(value);
-    if (batch.length === 30) {
-      yield batch;
-      batch = [];
-    }
-  }
-  if (batch.length) yield batch;
-}

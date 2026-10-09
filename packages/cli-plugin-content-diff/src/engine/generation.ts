@@ -1,12 +1,26 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 import { assertNotAborted } from './cancellation';
-import { captureSnapshot } from './capture';
+import { type CaptureSink, captureEnvironment } from './capture';
+import {
+  canonicalCollection,
+  canonicalRecordLine,
+  canonicalUpload,
+  itemTypeId,
+} from './codec';
+import { writeDiff } from './diff-file';
+import { DumpFile } from './dump';
+import { planOperations } from './emit';
 import { ContentError } from './errors';
-import { writeMigration } from './migration-artifact';
-import { prepareMigrationSchema } from './migration-schema';
-import { assertSchemaCompatible, createPlan } from './planner';
+import {
+  type MigrationTrackingBinding,
+  prepareMigrationSchema,
+} from './migration-schema';
+import { type Plan, assertSchemaCompatible, createPlan } from './planner';
 import { fetchSchema } from './schema';
+import { SideIndex } from './side';
 import { assertSourceRecordsValid } from './source-validity';
-import { SnapshotStore } from './store';
 import {
   type Client,
   KINDS,
@@ -14,8 +28,10 @@ import {
   type PlanCounts,
   type PlanOptions,
   type SchemaState,
-  type Side,
 } from './types';
+
+/** Records are spread over this many files per side, read one at a time. */
+const BUCKETS = 1024;
 
 interface GenerationEndpoint {
   rootClient: Client;
@@ -23,38 +39,62 @@ interface GenerationEndpoint {
 }
 
 export interface ContentGenerationArguments {
-  source: GenerationEndpoint;
-  /** Reuse source when both environments use the same configured endpoint. */
-  destination: GenerationEndpoint;
-  sourceEnvironment: string;
-  destinationEnvironment: string;
+  /** A live environment, or a dump file. */
+  source:
+    | { endpoint: GenerationEndpoint; environment: string }
+    | { dump: string };
+  /** Reuse the source endpoint when both sides use the same profile. */
+  destination: { endpoint: GenerationEndpoint; environment: string };
   sourceMigrationModelApiKey?: string;
   destinationMigrationModelApiKey?: string;
-  outputPath: string;
+  /** Where to write the diff, by whether it carries asset files. */
+  outputPath: (includesAssets: boolean) => string;
   options: Omit<PlanOptions, 'modelIds'> & {
     itemTypes: string;
     concurrency: number;
-    chunkBytes: number;
   };
   signal: AbortSignal;
   progress?: (message: string) => void;
 }
 
 export interface ContentGenerationResult {
-  scriptPath: string;
+  diffPath: string;
   sourceEnvironmentId: string;
   destinationEnvironmentId: string;
   counts: PlanCounts;
-  /** Why each entry --allow-partial left out of the script was skipped. */
+  operations: number;
+  /** Why each entry --allow-partial left out of the diff was skipped. */
   skipped: Array<{ kind: Kind; id: string; code: string; message: string }>;
 }
 
-/** Own generation ordering and temporary stores until the artifact is written. */
-export async function generateContentMigration({
+/** A capture sink that puts canonical states into a side index. */
+function indexSink(index: SideIndex, skipModel?: string): CaptureSink {
+  return {
+    async record(line) {
+      if (itemTypeId(line.current) === skipModel) return;
+      await index.record(canonicalRecordLine(line, index.schema));
+    },
+    upload: (upload) => index.upload(canonicalUpload(upload)),
+    collection: (collection) =>
+      index.collection(canonicalCollection(collection)),
+  };
+}
+
+/** Whether a plan uploads a new or replaced file. */
+function uploadsFiles(plan: Plan): boolean {
+  return [...plan.uploads.values()].some(
+    (entry) =>
+      entry.action === 'create' ||
+      (entry.action === 'update' &&
+        (entry.baseline?.md5 !== entry.desired?.md5 ||
+          entry.baseline?.size !== entry.desired?.size)),
+  );
+}
+
+/** Own generation ordering and temporary files until the diff is written. */
+export async function generateContentDiff({
   source,
   destination,
-  sourceEnvironment,
-  destinationEnvironment,
   sourceMigrationModelApiKey,
   destinationMigrationModelApiKey,
   outputPath,
@@ -62,109 +102,130 @@ export async function generateContentMigration({
   signal,
   progress = () => {},
 }: ContentGenerationArguments): Promise<ContentGenerationResult> {
-  const maximum = options.concurrency;
-  const [sourceEnvironments, destinationEnvironments] = await Promise.all([
-    source.rootClient.environments.list(),
-    destination === source
-      ? Promise.resolve(undefined)
-      : destination.rootClient.environments.list(),
-  ]);
-  const sourceEnvironmentId = environmentId(
-    sourceEnvironment,
-    sourceEnvironments,
-  );
-  const destinationEnvironmentId = environmentId(
-    destinationEnvironment,
-    destinationEnvironments ?? sourceEnvironments,
-  );
-  const sourceClient = source.buildEnvironmentClient(sourceEnvironmentId);
-  const destinationClient = destination.buildEnvironmentClient(
-    destinationEnvironmentId,
-  );
-  const [sourceRawSchema, destinationRawSchema] = await Promise.all([
-    fetchSchema(sourceClient, sourceEnvironmentId),
-    fetchSchema(destinationClient, destinationEnvironmentId),
-  ]);
-  const { schema: sourceSchema, tracking: sourceTracking } =
-    prepareMigrationSchema(sourceRawSchema, sourceMigrationModelApiKey);
-  const { schema: destinationSchema, tracking: destinationTracking } =
-    prepareMigrationSchema(
-      destinationRawSchema,
-      destinationMigrationModelApiKey,
-    );
-  if (
-    sourceSchema.siteId === destinationSchema.siteId &&
-    sourceEnvironmentId === destinationEnvironmentId
-  )
-    throw new ContentError(
-      'SAME_ENVIRONMENT',
-      'Source and destination must be different environments or projects.',
-    );
-  const modelIds = selectedModels(sourceSchema, options.itemTypes);
-  assertNotAborted(signal);
-  // Reject incompatible schemas before reading either content namespace.
-  assertSchemaCompatible(sourceSchema, destinationSchema, new Set(modelIds));
-  const store = new SnapshotStore();
+  const live = 'endpoint' in source ? source : undefined;
+  const dumpPath = 'dump' in source ? source.dump : undefined;
+  const dump = dumpPath ? await DumpFile.open(dumpPath) : undefined;
+  const directory = await mkdtemp(join(tmpdir(), 'content-diff-'));
   try {
-    // Full namespaces give the planner every inbound reference and retained
-    // state. The model selection limits planned mutations, not the capture.
+    const sameEndpoint = live?.endpoint === destination.endpoint;
+    const [sourceEnvironments, destinationEnvironments] = await Promise.all([
+      live?.endpoint.rootClient.environments.list(),
+      sameEndpoint
+        ? undefined
+        : destination.endpoint.rootClient.environments.list(),
+    ]);
+    const destinationEnvironmentId = environmentId(
+      destination.environment,
+      destinationEnvironments ?? sourceEnvironments!,
+    );
+    const sourceEnvironmentId = live
+      ? environmentId(live.environment, sourceEnvironments!)
+      : dump!.manifest.site.environment;
+    const sourceClient =
+      live?.endpoint.buildEnvironmentClient(sourceEnvironmentId);
+    const destinationClient = destination.endpoint.buildEnvironmentClient(
+      destinationEnvironmentId,
+    );
+    const [sourceRawSchema, destinationRawSchema] = await Promise.all([
+      sourceClient
+        ? fetchSchema(sourceClient, sourceEnvironmentId)
+        : dump!.schema,
+      fetchSchema(destinationClient, destinationEnvironmentId),
+    ]);
+    const { schema: sourceSchema, tracking: sourceTracking } =
+      prepareMigrationSchema(sourceRawSchema, sourceMigrationModelApiKey);
+    const { schema: destinationSchema, tracking: destinationTracking } =
+      prepareMigrationSchema(
+        destinationRawSchema,
+        destinationMigrationModelApiKey,
+      );
+    // A dump may be a backup of the destination itself.
+    if (
+      live &&
+      sourceSchema.siteId === destinationSchema.siteId &&
+      sourceEnvironmentId === destinationEnvironmentId
+    )
+      throw new ContentError(
+        'SAME_ENVIRONMENT',
+        'Source and destination must be different environments or projects.',
+      );
+    const modelIds = selectedModels(sourceSchema, options.itemTypes);
+    assertNotAborted(signal);
+    // Reject incompatible schemas before reading either side's content.
+    assertSchemaCompatible(sourceSchema, destinationSchema, new Set(modelIds));
+    const models = new Set(modelIds);
+    const sourceIndex = new SideIndex(
+      join(directory, 'source'),
+      sourceSchema,
+      BUCKETS,
+      { models, payloadSchema: destinationSchema },
+    );
+    const targetIndex = new SideIndex(
+      join(directory, 'target'),
+      destinationSchema,
+      BUCKETS,
+      { models },
+    );
+    // Both sides are read in full: the model selection limits what changes,
+    // while every record supplies incoming links and retained state.
     const capture = (
-      side: Side,
-      target: SnapshotStore,
+      label: string,
+      client: Client,
+      schema: SchemaState,
+      index: SideIndex,
       captureSignal: AbortSignal,
     ) => {
-      const [client, environment, schema, label]: [
-        typeof sourceClient,
-        string,
-        SchemaState,
-        string,
-      ] =
-        side === 'source'
-          ? [sourceClient, sourceEnvironmentId, sourceSchema, 'Source']
-          : [
-              destinationClient,
-              destinationEnvironmentId,
-              destinationSchema,
-              'Destination',
-            ];
-      progress(`Capturing ${label.toLowerCase()} "${environment}".`);
-      return captureSnapshot({
+      progress(`Capturing ${label.toLowerCase()} "${schema.environmentId}".`);
+      return captureEnvironment({
         client,
-        environmentId: environment,
         schema,
-        store: target,
-        side,
-        // Generation assumes writes are prevented externally during capture.
-        verify: 'none',
+        sink: indexSink(index),
         options: {
           signal: captureSignal,
-          concurrency: maximum,
+          concurrency: options.concurrency,
           progress: (message) => progress(`${label}: ${message}`),
         },
       });
     };
-    if (destination === source) {
+    const readers: Array<(signal: AbortSignal) => Promise<void>> = [
+      (captureSignal) => {
+        if (!dump)
+          return capture(
+            'Source',
+            sourceClient!,
+            sourceSchema,
+            sourceIndex,
+            captureSignal,
+          );
+        progress(`Reading dump "${basename(dumpPath!)}".`);
+        return dump.read(
+          indexSink(sourceIndex, sourceTracking.model?.id),
+          captureSignal,
+        );
+      },
+      (captureSignal) =>
+        capture(
+          'Destination',
+          destinationClient,
+          destinationSchema,
+          targetIndex,
+          captureSignal,
+        ),
+    ];
+    if (sameEndpoint) {
       // One project shares one API rate limit, so reading both environments
       // at once would only trade time for retries.
-      await capture('source', store, signal);
-      await capture('target', store, signal);
+      for (const read of readers) await read(signal);
     } else {
-      // Two projects have separate rate limits. Read both at once, each into
-      // its own store so neither writes tables the other is reading, and
-      // stop the other read as soon as one fails.
-      const destinationStore = new SnapshotStore();
+      // Separate projects, or a dump, are read at once; one failure stops
+      // the other read.
       const shared = new AbortController();
       const forward = () => shared.abort();
       signal.addEventListener('abort', forward, { once: true });
       try {
         const results = await Promise.allSettled(
-          (
-            [
-              ['source', store],
-              ['target', destinationStore],
-            ] as const
-          ).map(([side, target]) =>
-            capture(side, target, shared.signal).catch((error) => {
+          readers.map((read) =>
+            read(shared.signal).catch((error: unknown) => {
               shared.abort();
               throw error;
             }),
@@ -183,45 +244,74 @@ export async function generateContentMigration({
                 ),
             ) ?? failures[0]
           );
-        store.importSide(destinationStore, 'target');
       } finally {
         signal.removeEventListener('abort', forward);
-        destinationStore.dispose();
       }
     }
-    const metadata = createPlan(store, sourceSchema, destinationSchema, {
+    assertNotAborted(signal);
+    await Promise.all([sourceIndex.flush(), targetIndex.flush()]);
+    progress('Planning.');
+    const plan = await createPlan(sourceIndex, targetIndex, {
       modelIds,
       uploads: options.uploads,
       includeDeletions: options.includeDeletions,
       allowPartial: options.allowPartial,
     });
-    // Only records this migration writes matter, so check after planning and
+    // Only records the diff writes matter, so check after planning and
     // before any file is written.
-    assertSourceRecordsValid(store, sourceSchema, destinationSchema);
-    progress('Writing TypeScript content migration.');
-    const scriptPath = await writeMigration({
-      signal,
-      store,
-      metadata,
-      outputPath,
-      sourceTracking,
-      destinationTracking,
-      chunkBytes: options.chunkBytes,
+    assertSourceRecordsValid(plan, sourceSchema, destinationSchema);
+    const assetFiles = !!dump?.manifest.includesAssets && uploadsFiles(plan);
+    const diffPath = outputPath(assetFiles);
+    progress('Writing the diff.');
+    const operations = await writeDiff({
+      path: diffPath,
+      manifest: {
+        includesAssets: assetFiles,
+        source: {
+          kind: dump ? 'dump' : 'environment',
+          siteId: sourceSchema.siteId,
+          environmentId: sourceEnvironmentId,
+          ...(dumpPath && { dump: basename(dumpPath) }),
+        },
+        destination: plan.metadata.destination,
+        schemaHash: destinationSchema.hash,
+        sourceTracking,
+        destinationTracking,
+        options: plan.metadata.options,
+        counts: plan.metadata.counts,
+      },
+      operations: planOperations({
+        plan,
+        source: sourceIndex,
+        target: targetIndex,
+        directory,
+        assetFiles,
+        signal,
+      }),
+      files: assetFiles ? dump!.zip : undefined,
     });
     const skipped: ContentGenerationResult['skipped'] = [];
     for (const kind of KINDS)
-      for (const entry of store.planEntries(kind, 'skip'))
-        for (const { code, message } of entry.diagnostics)
-          skipped.push({ kind, id: entry.id, code, message });
+      for (const entry of (kind === 'record'
+        ? plan.records
+        : kind === 'upload'
+          ? plan.uploads
+          : plan.collections
+      ).values())
+        if (entry.action === 'skip')
+          for (const { code, message } of entry.diagnostics)
+            skipped.push({ kind, id: entry.id, code, message });
     return {
-      scriptPath,
+      diffPath,
       sourceEnvironmentId,
       destinationEnvironmentId,
-      counts: metadata.counts,
+      counts: plan.metadata.counts,
+      operations,
       skipped,
     };
   } finally {
-    store.dispose();
+    dump?.close();
+    await rm(directory, { recursive: true, force: true });
   }
 }
 

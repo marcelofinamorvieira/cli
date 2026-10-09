@@ -16,8 +16,8 @@ export interface FieldSchema {
   type: string;
   localized: boolean;
   /**
-   * Validators and default value are hashed into the destination binding and
-   * never interpreted: the CMA validates every write.
+   * Validators and default value are hashed into the destination schema hash
+   * and never interpreted: the CMA validates every write.
    */
   validators: JsonObject;
   defaultValue: JsonValue;
@@ -32,7 +32,7 @@ export interface ModelSchema {
   tree: boolean;
   draftMode: boolean;
   /**
-   * Hashed into the destination binding. Generation also reads the
+   * Hashed into the destination schema hash. Generation also reads the
    * destination's setting to accept source records whose draft the CMA
    * reports invalid; required locales are never interpreted.
    */
@@ -88,16 +88,6 @@ export interface RecordState {
   invalid?: { current: boolean; published: boolean };
   hash: string;
 }
-/**
- * What apply compares for a destination record: its content hash, plus the
- * version metadata and position the hash leaves out.
- */
-export interface RecordGuard {
-  hash: string;
-  currentVersion: string | null;
-  publishedUpdatedAt: string | null;
-  position: number | null;
-}
 export interface UploadState {
   id: string;
   hash: string;
@@ -122,6 +112,38 @@ export interface Reference {
   path: string;
   fieldId: string;
 }
+
+/**
+ * What planning keeps of a captured record: its identity, hash, publication
+ * and place, but not its field values, which stay on disk until the
+ * operations are written. A reference keeps the top-level field it sits in
+ * (`root`, or `parentId` for a tree parent) instead of its full path.
+ */
+export interface RecordFacts {
+  id: string;
+  modelId: string;
+  hash: string;
+  published: boolean;
+  parentId: string | null;
+  position: number | null;
+  invalid?: { current: boolean; published: boolean };
+  /** The value of the record's `title` or `name` field, for labels. */
+  title?: string;
+  /** Read only for records the plan creates, updates or deletes. */
+  references: ReferenceFact[];
+  /** Keys in the record's values the SDK would corrupt through a write. */
+  unsupportedKeys?: string[];
+  /** Size of the record's JSON, to size operation files. */
+  bytes: number;
+}
+export type ReferenceFact = Omit<Reference, 'ownerId' | 'path'> & {
+  root: string;
+};
+export type UploadFacts = Pick<
+  UploadState,
+  'id' | 'hash' | 'md5' | 'size' | 'collectionId' | 'filename'
+>;
+
 export interface Diagnostic {
   code: string;
   message: string;
@@ -131,22 +153,26 @@ export interface RecordPlan {
   id: string;
   modelId: string;
   action: Action;
-  /** Whether the record exists in the destination baseline. */
+  /** Whether the record exists in the destination. */
   inDestination: boolean;
-  baseline?: RecordState | null;
-  desired?: RecordState | null;
+  baseline?: RecordFacts | null;
+  desired?: RecordFacts | null;
   diagnostics: Diagnostic[];
   execution?: {
     createOrder?: number;
     publishOrder?: number;
     deleteOrder?: number;
-    creationFields?: JsonObject;
     /**
-     * Published fields for a first publication that omits links to other
-     * records in a publication cycle; the full desired published fields are
-     * published again once those records are published.
+     * Top-level fields a create leaves empty because they reference records
+     * not created (or, for models without draft mode, not published) yet.
      */
-    provisionalPublished?: JsonObject;
+    deferredFields?: string[];
+    /**
+     * Records whose links a first publication leaves out of the top-level
+     * link fields, because they are in a publication cycle with this one;
+     * the full published fields are published again once they are published.
+     */
+    provisionalTargets?: string[];
   };
 }
 export interface UploadPlan {
@@ -154,8 +180,8 @@ export interface UploadPlan {
   id: string;
   action: Action;
   inDestination: boolean;
-  baseline?: UploadState | null;
-  desired?: UploadState | null;
+  baseline?: UploadFacts | null;
+  desired?: UploadFacts | null;
   diagnostics: Diagnostic[];
 }
 export interface CollectionPlan {
@@ -182,21 +208,7 @@ export interface PlanMetadata {
   options: PlanOptions;
   counts: PlanCounts;
 }
-export interface ArtifactChunk {
-  file: string;
-  sha256: string;
-  bytes: number;
-  entries: number;
-}
-export interface ArtifactChunkIndex {
-  file: 'chunks.jsonl';
-  sha256: string;
-  bytes: number;
-  count: number;
-}
 export interface CaptureOptions {
-  /** Excludes the configured migration tracking model, bound by ID at generation. */
-  schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
   concurrency: number;
   progress?: (message: string) => void;
@@ -210,7 +222,7 @@ export interface ApplyOptions {
   destinationEnvironmentId?: string;
   /** Requested ID of a newly created fork; never an existing environment. */
   forkName?: string;
-  /** Check original artifacts and destination state without executing the script. */
+  /** Check the diff and the destination without running it. */
   preflightOnly?: boolean;
   concurrency: number;
   /**
@@ -218,24 +230,21 @@ export interface ApplyOptions {
    * writes while it copies; false creates a regular fork.
    */
   fastFork: boolean;
-  /**
-   * 'versions' (the default) skips rereading records whose version did not
-   * change; 'full' rereads every record in each check.
-   */
-  verification?: 'versions' | 'full';
   log?: (message: string) => void;
 }
 interface ApplyResult {
   environmentId: string;
-  scriptExecuted: true;
+  executed: true;
+  operations: number;
   partial: boolean;
 }
 export interface PreflightResult {
   environmentId: string;
   preflightOnly: true;
-  scriptExecuted: false;
+  executed: false;
+  operations: number;
   partial: boolean;
-  /** Original generation summary, not a prediction of edited TypeScript effects. */
+  /** Generation summary, not a prediction of the effects of edited lines. */
   generatedCounts: PlanCounts;
 }
 export type ApplyOutcome = ApplyResult | PreflightResult;

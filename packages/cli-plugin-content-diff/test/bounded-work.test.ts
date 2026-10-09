@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { batches, boundedWork } from '../src/engine/bounded-work';
+import { boundedWork } from '../src/engine/bounded-work';
 import { ContentError } from '../src/engine/errors';
 
 describe('bounded work', () => {
@@ -85,17 +85,5 @@ describe('bounded work', () => {
         error instanceof ContentError && error.code === 'INTERRUPTED',
     );
     assert.deepEqual(order, ['start:0', 'start:1', 'finish:0', 'finish:1']);
-  });
-
-  it('never places more than 30 IDs in a full nested read batch', () => {
-    const result = [...batches(Array.from({ length: 67 }, (_, id) => id))];
-    assert.deepEqual(
-      result.map((batch) => batch.length),
-      [30, 30, 7],
-    );
-    assert.deepEqual(
-      result.flat(),
-      Array.from({ length: 67 }, (_, id) => id),
-    );
   });
 });

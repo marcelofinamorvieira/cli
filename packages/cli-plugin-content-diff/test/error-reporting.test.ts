@@ -7,6 +7,7 @@ import { CmaClient } from '@datocms/cli-utils';
 import { describe, it } from 'mocha';
 import ContentApplyCommand from '../src/commands/content/apply';
 import ContentDiffCommand from '../src/commands/content/diff';
+import ContentExportCommand from '../src/commands/content/export';
 import {
   ContentError,
   DESTINATION_CHANGED_MESSAGE,
@@ -15,6 +16,11 @@ import {
 } from '../src/engine/errors';
 
 const root = resolve(__dirname, '..');
+const commands = [
+  ContentApplyCommand,
+  ContentDiffCommand,
+  ContentExportCommand,
+];
 
 type NativeError = { suggestions?: string[]; oclif?: { exit?: number } };
 
@@ -106,31 +112,35 @@ describe('content error reporting contract', () => {
           }),
           context,
         );
-      const reported: unknown[] = [];
-      const json = Object.assign(Object.create(ContentApplyCommand.prototype), {
-        jsonEnabled: () => true,
-        logJson: (value: unknown) => reported.push(value),
-      });
-      const previousExitCode = process.exitCode;
-      try {
-        process.exitCode = undefined;
-        await json.catch(failure({ keptForkEnvironmentId: 'retained-review' }));
-        assert.equal(process.exitCode, 1);
-      } finally {
-        process.exitCode = previousExitCode;
+      for (const Command of commands) {
+        const reported: unknown[] = [];
+        const json = Object.assign(Object.create(Command.prototype), {
+          jsonEnabled: () => true,
+          logJson: (value: unknown) => reported.push(value),
+        });
+        const previousExitCode = process.exitCode;
+        try {
+          process.exitCode = undefined;
+          await json.catch(
+            failure({ keptForkEnvironmentId: 'retained-review' }),
+          );
+          assert.equal(process.exitCode, 1);
+        } finally {
+          process.exitCode = previousExitCode;
+        }
+        const output = JSON.stringify(reported);
+        const [{ error }] = JSON.parse(output);
+        assert.equal(error.code, code);
+        assert.equal(error.keptForkEnvironmentId, 'retained-review');
+        assert.doesNotMatch(output, /cma-error-token|Authorization|request/);
       }
-      const output = JSON.stringify(reported);
-      const [{ error }] = JSON.parse(output);
-      assert.equal(error.code, code);
-      assert.equal(error.keptForkEnvironmentId, 'retained-review');
-      assert.doesNotMatch(output, /cma-error-token|Authorization|request/);
       // Human output goes through CmaClientCommand's handler, which dumps the
       // error before replacing it with its own message and suggestions.
       const { log, dir } = console;
       console.log = () => undefined;
       console.dir = () => undefined;
       try {
-        for (const Command of [ContentApplyCommand, ContentDiffCommand]) {
+        for (const Command of commands) {
           const human = Object.assign(Object.create(Command.prototype), {
             jsonEnabled: () => false,
           });
@@ -175,7 +185,7 @@ describe('content error reporting contract', () => {
     const human = Object.assign(Object.create(ContentApplyCommand.prototype), {
       jsonEnabled: () => false,
     });
-    const failure = Object.assign(new Error('Script failed'), {
+    const failure = Object.assign(new Error('Operation failed'), {
       outcome: 'The fork "review" was deleted; "main" was not changed.',
     });
     const dumped: unknown[] = [];
@@ -186,14 +196,14 @@ describe('content error reporting contract', () => {
       await assert.rejects(human.catch(failure), (error: Error) => {
         assert.equal(
           error.message,
-          'Script failed\nThe fork "review" was deleted; "main" was not changed.',
+          'Operation failed\nThe fork "review" was deleted; "main" was not changed.',
         );
         return true;
       });
     } finally {
       Object.assign(console, { log, dir });
     }
-    // The stack of the failing line stays visible for debugging edited scripts.
+    // The stack of the failure stays visible for debugging.
     assert.equal(dumped.length, 1);
     assert.equal((dumped[0] as { stack?: string }).stack, failure.stack);
   });
@@ -314,7 +324,7 @@ describe('content error reporting contract', () => {
         const apply = require(${JSON.stringify(
           join(root, 'src/engine/apply.ts'),
         )});
-        apply.applyContentMigration = async () => {
+        apply.applyContentDiff = async () => {
           throw Object.assign(new Error('Fork request failed.'), {
             keptForkEnvironmentId: 'kept-review',
             request: { headers: { authorization: 'Bearer fixture-api-token' } },
@@ -332,7 +342,7 @@ describe('content error reporting contract', () => {
           preload,
           join(root, 'bin/dev'),
           'content:apply',
-          './migration.ts',
+          './diff.zip',
           '--json',
           '--api-token=fixture-api-token',
         ],

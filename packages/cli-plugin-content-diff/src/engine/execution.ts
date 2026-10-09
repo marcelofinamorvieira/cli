@@ -1,49 +1,22 @@
+import { createWriteStream } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { CmaClient } from '@datocms/cli-utils';
+import { boundedWork } from './bounded-work';
 import { assertNotAborted } from './cancellation';
-import { ContentError } from './errors';
-import type { Client } from './types';
-
-function requestMethod(input: Parameters<typeof fetch>[0], init?: RequestInit) {
-  return (
-    init?.method ??
-    (typeof Request !== 'undefined' && input instanceof Request
-      ? input.method
-      : 'GET')
-  ).toUpperCase();
-}
-
-const isRead = (method: string) => method === 'GET' || method === 'HEAD';
-
-/**
- * Keeps a rejection nobody handled, such as a call the script never awaited
- * that failed, from ending the process (Node's default) while the migration
- * runs. A rejection the script handles later (a call it awaits after it
- * failed) is forgotten again; the first one still unhandled is kept.
- */
-function observeUnhandledRejections(): {
-  readonly first: { reason: unknown } | undefined;
-  dispose(): void;
-} {
-  const unhandled = new Map<Promise<unknown>, unknown>();
-  const onUnhandled = (reason: unknown, promise: Promise<unknown>) => {
-    unhandled.set(promise, reason);
-  };
-  const onHandled = (promise: Promise<unknown>) => {
-    unhandled.delete(promise);
-  };
-  process.on('unhandledRejection', onUnhandled);
-  process.on('rejectionHandled', onHandled);
-  return {
-    get first() {
-      for (const reason of unhandled.values()) return { reason };
-      return undefined;
-    },
-    dispose() {
-      process.off('unhandledRejection', onUnhandled);
-      process.off('rejectionHandled', onHandled);
-    },
-  };
-}
+import { canonicalCollection, canonicalUpload } from './codec';
+import type { DiffFile } from './diff-file';
+import { ContentError, destinationChanged } from './errors';
+import {
+  CREATES,
+  type Expectation,
+  type Operation,
+  operationKind,
+} from './operations';
+import { type RecordOrder, reorderRecords } from './reorder-records';
+import type { Client, Kind } from './types';
 
 function requestPath(url: string): string {
   try {
@@ -55,7 +28,7 @@ function requestPath(url: string): string {
 
 const REFERENCE_CODE = /LINK|REFERENC|UNPUBLISHED|^VALIDATION_ITEMS?_/;
 
-/** Turns a CMA rejection raised by the script into a reportable error. */
+/** Turns a CMA rejection into a reportable error. */
 export function cmaFailure(error: unknown): unknown {
   if (error instanceof CmaClient.TimeoutError) {
     const { method, url } = error.request;
@@ -83,7 +56,7 @@ export function cmaFailure(error: unknown): unknown {
     const id = /\/items\/([^/]+)/.exec(path)?.[1] ?? 'unknown';
     return new ContentError(
       'RECORD_CHANGED_DURING_APPLY',
-      `Record ${id} was modified by someone else while the migration was running.`,
+      `Record ${id} was modified by someone else while the diff was running.`,
       details,
     );
   }
@@ -107,11 +80,11 @@ export function cmaFailure(error: unknown): unknown {
   const hints: string[] = [];
   if (codes.includes('VALIDATION_UNIQUE'))
     hints.push(
-      'A unique value may still be held by another record; reorder or edit the script so that record releases it first.',
+      'A unique value may still be held by another record; reorder or edit the diff so that record releases it first.',
     );
   if (codes.some((code) => REFERENCE_CODE.test(code)))
     hints.push(
-      'A referenced record or asset may be missing or unpublished; make sure the script creates or publishes it first.',
+      'A referenced record or asset may be missing or unpublished; make sure the diff creates or publishes it first.',
     );
   return new ContentError(
     'CMA_VALIDATION_FAILED',
@@ -120,80 +93,270 @@ export function cmaFailure(error: unknown): unknown {
   );
 }
 
-/**
- * Runs a migration callback with a client whose requests are tracked, and
- * returns or throws only once every request the script started has settled,
- * so apply never reports, or removes a fork, while a write is still running.
- * The SDK sends every request (retries, job polling and file transfers
- * included) through `fetchFn`; the client's `request` is tracked too, so a
- * call waiting between attempts, or before polling its job, counts as in
- * flight. After an interrupt new writes are refused, while reads continue so
- * jobs already submitted can be observed. A call the script did not await
- * still runs to completion; if one fails without being handled, the
- * migration fails.
- */
-export async function runTrackedMigration(
-  run: (client: Client) => Promise<void>,
-  buildClient: (fetchFn: typeof fetch) => Client,
-  signal?: AbortSignal,
-  baseFetch?: typeof fetch,
-): Promise<void> {
-  const inFlight = new Set<Promise<unknown>>();
-  // The caller gets a derived promise, so a rejection it never handles is
-  // still reported as unhandled; draining waits on `work` itself.
-  const track = <T>(work: Promise<T>): Promise<T> => {
-    inFlight.add(work);
-    return work.finally(() => inFlight.delete(work));
-  };
-  const client = buildClient((input, init) => {
-    if (!isRead(requestMethod(input, init))) {
-      try {
-        assertNotAborted(signal);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-    }
-    return track((baseFetch ?? globalThis.fetch)(input, init));
-  });
-  const request = client.request;
-  if (typeof request === 'function')
-    client.request = ((options) =>
-      track(request.call(client, options))) as Client['request'];
-  const floating = observeUnhandledRejections();
-  try {
-    let failure: { error: unknown } | undefined;
-    try {
-      assertNotAborted(signal);
-      await run(client);
-    } catch (error) {
-      failure = { error };
-    }
-    do {
-      while (inFlight.size) await Promise.allSettled([...inFlight]);
-      // A settled call can resume a chain whose next call starts after
-      // pending callbacks run.
-      await new Promise((resolve) => setImmediate(resolve));
-    } while (inFlight.size);
-    assertNotAborted(signal);
-    if (failure)
-      throw failure.error instanceof Error
-        ? cmaFailure(failure.error)
-        : new ContentError(
-            'MIGRATION_FAILED',
-            `The migration callback failed: ${String(failure.error)}`,
-          );
-    if (!floating.first) return;
-    const unseen = cmaFailure(floating.first.reason);
-    throw new ContentError(
-      'UNAWAITED_MIGRATION_CALL',
-      `A call the migration did not await failed: ${
-        unseen instanceof Error ? unseen.message : String(unseen)
-      } Await every client call.`,
-      unseen instanceof ContentError
-        ? { cause: { code: unseen.code, details: unseen.details } }
-        : undefined,
+/** What one record, upload or folder must be before the diff runs. */
+interface Check {
+  kind: Kind;
+  id: string;
+  /** Null: the ID must be free, because the diff creates it. */
+  expect: Expectation | null;
+}
+
+const BATCH = 100;
+
+/** Compares what the destination holds now with what each check expects. */
+async function compareBatch(client: Client, kind: Kind, checks: Check[]) {
+  const ids = checks.map((check) => check.id).join(',');
+  const found = new Map<string, Expectation>();
+  if (kind === 'record') {
+    const listing = (version: 'current' | 'published') =>
+      client.items.rawList({
+        filter: { ids },
+        version,
+        page: { limit: checks.length },
+      });
+    const [current, published] = await Promise.all([
+      listing('current'),
+      listing('published'),
+    ]);
+    const updated = new Map(
+      published.data.map((record) => [
+        record.id,
+        typeof record.meta.updated_at === 'string'
+          ? record.meta.updated_at
+          : null,
+      ]),
     );
+    for (const record of current.data)
+      found.set(record.id, {
+        currentVersion: record.meta.current_version ?? null,
+        publishedUpdatedAt: updated.get(record.id) ?? null,
+      });
+  } else {
+    for (const upload of await client.uploads.list({
+      filter: { ids },
+      page: { limit: checks.length },
+    }))
+      found.set(upload.id, { hash: canonicalUpload(upload).hash });
+  }
+  return found;
+}
+
+/**
+ * Checks, before any write, that every line of the diff is a known
+ * operation, that every ID it creates is free, and that every record,
+ * upload and folder it touches is still as it was when the diff was
+ * generated. Nothing else in the destination is compared.
+ */
+export async function assertExpectations(
+  client: Client,
+  diff: DiffFile,
+  options: { concurrency: number; signal?: AbortSignal },
+): Promise<number> {
+  const checks: Record<Kind, Check[]> = {
+    record: [],
+    upload: [],
+    collection: [],
+  };
+  let operations = 0;
+  for await (const { operation } of diff.operations()) {
+    operations++;
+    const kind = operationKind(operation.op);
+    if (!kind || !operation.id) continue;
+    if (CREATES.has(operation.op))
+      checks[kind].push({ kind, id: operation.id, expect: null });
+    else if (operation.expect)
+      checks[kind].push({ kind, id: operation.id, expect: operation.expect });
+  }
+  const differs = (check: Check, found: Expectation | undefined) => {
+    const { kind, id } = check;
+    if (!check.expect) {
+      if (found) throw destinationChanged({ kind, id, reason: 'added' });
+      return;
+    }
+    if (!found) throw destinationChanged({ kind, id, reason: 'removed' });
+    const fields = (value: Expectation) =>
+      'hash' in value
+        ? [value.hash]
+        : [value.currentVersion, value.publishedUpdatedAt];
+    if (fields(found).join('\0') !== fields(check.expect).join('\0'))
+      throw destinationChanged({ kind, id, reason: 'changed' });
+  };
+  for (const kind of ['record', 'upload'] as const) {
+    const batches: Check[][] = [];
+    for (let start = 0; start < checks[kind].length; start += BATCH)
+      batches.push(checks[kind].slice(start, start + BATCH));
+    await boundedWork(
+      batches,
+      options.concurrency,
+      async (batch) => {
+        const found = await compareBatch(client, kind, batch);
+        for (const check of batch) differs(check, found.get(check.id));
+      },
+      options.signal,
+    );
+  }
+  if (checks.collection.length) {
+    const folders = new Map<string, Expectation>(
+      (await client.uploadCollections.list()).map((folder) => [
+        folder.id,
+        { hash: canonicalCollection(folder).hash },
+      ]),
+    );
+    for (const check of checks.collection)
+      differs(check, folders.get(check.id));
+  }
+  return operations;
+}
+
+/** The body an operation passes to the SDK. */
+const body = (operation: Operation) => operation.data as never;
+/**
+ * The fields of an operation's body, merged before what apply itself
+ * controls (the ID it creates), so a line cannot override it.
+ */
+const fields = (operation: Operation) =>
+  operation.data as Record<string, never>;
+
+/** Runs one operation; `files` extracts the diff's asset files. */
+async function runOperation(
+  client: Client,
+  operation: Operation,
+  files: (name: string) => Promise<string>,
+): Promise<void> {
+  const id = operation.id!;
+  switch (operation.op) {
+    case 'folder.create':
+      await client.uploadCollections.create({
+        ...fields(operation),
+        id,
+      } as never);
+      return;
+    case 'folder.update':
+      await client.uploadCollections.update(id, body(operation));
+      return;
+    case 'folder.delete':
+      await client.uploadCollections.destroy(id);
+      return;
+    case 'folders.reorder':
+      await client.uploadCollections.reorder(body(operation));
+      return;
+    case 'upload.create':
+    case 'upload.replace': {
+      const localPath = operation.file && (await files(operation.file));
+      try {
+        // Where the file comes from is the line's `file` or `url`, never a
+        // path in its body: the SDK upload helpers read `localPath`.
+        const { localPath: _path, url: _url, ...data } = fields(operation);
+        const upload =
+          operation.op === 'upload.create'
+            ? localPath
+              ? await client.uploads.createFromLocalFile({
+                  ...data,
+                  id,
+                  localPath,
+                })
+              : await client.uploads.createFromUrl({
+                  ...data,
+                  id,
+                  url: operation.url!,
+                })
+            : localPath
+              ? await client.uploads.updateFromLocalFile(id, {
+                  ...data,
+                  localPath,
+                })
+              : await client.uploads.updateFromUrl(id, {
+                  ...data,
+                  url: operation.url!,
+                });
+        if (upload.md5.toLowerCase() !== operation.md5!.toLowerCase())
+          throw new ContentError(
+            'ASSET_CHANGED',
+            `Asset ${id} was uploaded with a different file than the diff expects: it changed in the source since the diff generation. Please re-generate a diff to apply.`,
+          );
+      } finally {
+        if (localPath) await rm(localPath, { force: true });
+      }
+      return;
+    }
+    case 'upload.update':
+      await client.uploads.update(id, body(operation));
+      return;
+    case 'upload.delete':
+      await client.uploads.destroy(id);
+      return;
+    case 'record.create':
+      await client.items.create({ ...fields(operation), id } as never);
+      return;
+    case 'record.update':
+      await client.items.update(id, body(operation));
+      return;
+    case 'record.publish':
+      await client.items.publish(id, undefined, { recursive: false });
+      return;
+    case 'record.unpublish':
+      await client.items.unpublish(id, undefined, { recursive: false });
+      return;
+    case 'record.delete':
+      await client.items.destroy(id);
+      return;
+    case 'records.reorder':
+      await reorderRecords(client, operation.data as unknown as RecordOrder);
+      return;
+    case 'schedule.publication.create':
+      await client.scheduledPublication.create(id, body(operation));
+      return;
+    case 'schedule.publication.delete':
+      await client.scheduledPublication.destroy(id);
+      return;
+    case 'schedule.unpublishing.create':
+      await client.scheduledUnpublishing.create(id, body(operation));
+      return;
+    case 'schedule.unpublishing.delete':
+      await client.scheduledUnpublishing.destroy(id);
+      return;
+  }
+}
+
+/**
+ * Runs every operation of a diff in order, one at a time. An interrupt stops
+ * the run between operations; a failure names the line that caused it.
+ */
+export async function runOperations(
+  client: Client,
+  diff: DiffFile,
+  options: { signal?: AbortSignal; log?: (message: string) => void },
+): Promise<number> {
+  const total = diff.manifest.operations;
+  const directory = await mkdtemp(join(tmpdir(), 'content-apply-'));
+  let extracted = 0;
+  const files = async (name: string) => {
+    const path = join(directory, String(++extracted));
+    await pipeline(await diff.zip.stream(name), createWriteStream(path));
+    return path;
+  };
+  let count = 0;
+  try {
+    for await (const { operation, where } of diff.operations()) {
+      assertNotAborted(options.signal);
+      try {
+        await runOperation(client, operation, files);
+      } catch (error) {
+        const failure = cmaFailure(error);
+        if (!(failure instanceof ContentError)) throw failure;
+        throw new ContentError(
+          failure.code,
+          `${where}, ${operation.label}: ${failure.message}`,
+          { ...failure.details, operation: { where, label: operation.label } },
+        );
+      }
+      if (++count % 500 === 0)
+        options.log?.(`Ran ${count} of ${total} operations.`);
+    }
+    // An interrupt during the last operation still fails the run.
+    assertNotAborted(options.signal);
+    return count;
   } finally {
-    floating.dispose();
+    await rm(directory, { recursive: true, force: true });
   }
 }

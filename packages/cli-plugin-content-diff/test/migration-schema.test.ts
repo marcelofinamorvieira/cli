@@ -96,7 +96,7 @@ describe('migration tracking schema projection', () => {
     );
   });
 
-  it('leaves a tracking model that appeared after generation to the baseline check', () => {
+  it('leaves a tracking model that appeared after generation to the schema hash check', () => {
     const before = prepareMigrationSchema(fixture([]), 'custom_migration');
     const after = fixture();
     assert.equal(

@@ -1,6 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
 import { CmaClient } from '@datocms/cli-utils';
 import { buildBlockRecord } from '@datocms/cma-client';
 import { buildClient } from '@datocms/cma-client-node';
@@ -8,25 +6,26 @@ import {
   deserializeJsonEntity,
   serializeRawRequestBodyWithItems,
 } from '@datocms/rest-client-utils';
+import { type CaptureSink, captureEnvironment } from '../src/engine/capture';
 import {
-  captureSnapshot,
-  readRecordBatch,
-  readSchedules,
-} from '../src/engine/capture';
-import {
+  type RecordLine,
+  type ScheduleResource,
   canonicalCollection,
   canonicalFields,
   canonicalRecord,
+  canonicalRecordLine,
+  canonicalSchedules,
   canonicalUpload,
   hashJson,
   recordPayloadFields,
   recordReferences,
+  recordTitle,
   unsupportedRecordPayloadKey,
 } from '../src/engine/codec';
 import { ContentError } from '../src/engine/errors';
 import { assertFullReadAccess, fetchSchema } from '../src/engine/schema';
-import { SnapshotStore } from '../src/engine/store';
 import type {
+  CaptureOptions,
   Client,
   FieldSchema,
   JsonObject,
@@ -34,9 +33,8 @@ import type {
   SchemaState,
 } from '../src/engine/types';
 import { withBulkSchema } from './bulk-schema-fixture';
+import { fixtureId as identity } from './fixture-id';
 
-const identity = (name: string) =>
-  createHash('sha256').update(name).digest('base64url').slice(0, 22);
 const MODEL = identity('model');
 const BLOCK = identity('block');
 const NESTED = identity('nested');
@@ -45,6 +43,23 @@ const LINKED = identity('linked');
 const ASSET = identity('asset');
 const DATE = '2020-01-01T00:00:00.000Z';
 const FUTURE = '2090-01-01T12:30:00.000Z';
+const LATER = '2090-02-01T12:30:00.000Z';
+const PUBLICATION: ScheduleResource = {
+  id: 'pub',
+  type: 'scheduled_publication',
+  attributes: {
+    publication_scheduled_at: FUTURE,
+    selective_publication: {
+      content_in_locales: ['it', 'en'],
+      non_localized_content: false,
+    },
+  },
+};
+const UNPUBLISHING: ScheduleResource = {
+  id: 'unpub',
+  type: 'scheduled_unpublishing',
+  attributes: { unpublishing_scheduled_at: LATER, content_in_locales: ['it'] },
+};
 
 function field(
   apiKey: string,
@@ -147,15 +162,49 @@ function response(
 ): Record<string, unknown> {
   return { data: rows, meta: { total_count: total } };
 }
+/** The CMA's current-vs-published state of a record with these schedules. */
+function scheduleResponse(...resources: ScheduleResource[]) {
+  const relationship = (type: string) => {
+    const resource = resources.find((entry) => entry.type === type);
+    return { data: resource ? { type, id: resource.id } : null };
+  };
+  return {
+    data: {
+      relationships: {
+        scheduled_publication: relationship('scheduled_publication'),
+        scheduled_unpublishing: relationship('scheduled_unpublishing'),
+      },
+    },
+    included: resources,
+  };
+}
 function errorCode(code: string) {
   return (error: unknown) =>
     error instanceof ContentError && error.code === code;
+}
+/** A real SDK client whose requests `answer` serves offline, as JSON. */
+function sdkClient(
+  answer: (url: URL, init?: RequestInit) => unknown,
+  environment?: string,
+) {
+  return buildClient({
+    apiToken: 'offline-fixture-token',
+    environment,
+    fetchFn: async (input, init) => {
+      const body = answer(new URL(String(input)), init);
+      return new Response(
+        typeof body === 'string' ? body : JSON.stringify(body),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    },
+  });
 }
 
 type ListArgs = {
   filter: { type?: string; ids?: string };
   nested: boolean;
   version: 'current' | 'published';
+  order_by?: string;
   page: { offset?: number; limit: number };
 };
 function mockClient(
@@ -243,7 +292,7 @@ function mockClient(
           filtered.length,
         );
       },
-      rawCurrentVsPublishedState: async (_id: string) => {
+      rawCurrentVsPublishedState: async (_id: string): Promise<unknown> => {
         throw new Error('No schedules expected.');
       },
     },
@@ -251,13 +300,62 @@ function mockClient(
       rawList: async () => response([]),
       list: async () => [] as unknown[],
     },
-    uploadCollections: { list: async () => [] },
+    uploadCollections: { list: async () => [] as unknown[] },
   };
   withBulkSchema(mock as unknown as Client);
   return { mock, client: mock as unknown as Client, calls };
 }
 
-describe('expanded capture and native payload codec', () => {
+/** A capture sink that keeps what it receives, in order. */
+interface Recorder extends CaptureSink {
+  records: RecordLine[];
+  uploads: unknown[];
+  collections: unknown[];
+}
+function recorder(): Recorder {
+  const sink: Recorder = {
+    records: [],
+    uploads: [],
+    collections: [],
+    async record(line) {
+      sink.records.push(line);
+    },
+    async upload(upload) {
+      sink.uploads.push(upload);
+    },
+    async collection(collection) {
+      sink.collections.push(collection);
+    },
+  };
+  return sink;
+}
+/** Captures the environment of `client`, with the schema it reports. */
+async function capture(
+  client: Client,
+  options: Partial<CaptureOptions> = {},
+  sink = recorder(),
+): Promise<Recorder> {
+  await captureEnvironment({
+    client,
+    schema: await fetchSchema(client, 'source'),
+    sink,
+    options: { concurrency: 4, ...options },
+  });
+  return sink;
+}
+/** Captures `models`, reading their records through a real SDK client. */
+async function captureNative(
+  models: ModelSchema[],
+  native: ReturnType<typeof buildClient>,
+): Promise<RecordLine[]> {
+  const fixture = mockClient(models);
+  Reflect.set(fixture.mock, 'request', native.request.bind(native));
+  fixture.mock.items.rawList = async () =>
+    assert.fail('Native capture must avoid the lossy item adapter');
+  return (await capture(fixture.client)).records;
+}
+
+describe('native payload codec', () => {
   it('records only the versions the CMA itself reports invalid', () => {
     const schema = state();
     const valid = canonicalRecord(rawRecord(), null, schema);
@@ -574,13 +672,7 @@ describe('expanded capture and native payload codec', () => {
       },
       relationships: { upload_collection: { data: null } },
     };
-    const client = buildClient({
-      apiToken: 'offline-fixture-token',
-      fetchFn: async () =>
-        new Response(JSON.stringify(response([raw])), {
-          headers: { 'content-type': 'application/json' },
-        }),
-    });
+    const client = sdkClient(() => response([raw]));
     const [upload] = await client.uploads.list();
     assert.deepEqual(
       canonicalUpload(upload).attributes.default_field_metadata,
@@ -594,84 +686,7 @@ describe('expanded capture and native payload codec', () => {
     );
   });
 
-  it('pages uploads through the SDK by ID and rejects totals, lengths or identities that change meanwhile', async () => {
-    const uploads = Array.from({ length: 501 }, (_, index) => ({
-      id: identity(`upload-${index}`),
-      type: 'upload',
-      basename: `image-${index}`,
-      filename: `image-${index}.png`,
-      md5: '0123456789abcdef0123456789abcdef',
-      size: 100,
-      url: `https://example.invalid/image-${index}.png`,
-      default_field_metadata: {},
-      upload_collection: null,
-    }));
-    for (const scenario of [
-      'complete',
-      'page-total',
-      'short',
-      'duplicate',
-      'final-total',
-      'removed-from-first-page',
-    ] as const) {
-      const fixture = mockClient();
-      const live = [...uploads];
-      const listed: unknown[] = [];
-      let counts = 0;
-      fixture.mock.uploads.rawList = async () => {
-        counts += 1;
-        const changed =
-          (scenario === 'page-total' && counts === 2) ||
-          (scenario === 'final-total' && counts === 3);
-        return response([], changed ? 502 : live.length);
-      };
-      fixture.mock.uploads.list = async (args?: {
-        page: { offset: number; limit: number };
-      }) => {
-        listed.push(structuredClone(args));
-        const { offset, limit } = args!.page;
-        if (offset > 0 && scenario === 'short') return [];
-        if (offset > 0 && scenario === 'duplicate') return [uploads[0]];
-        const page = live.slice(offset, offset + limit);
-        // An upload of the first page is deleted right after it is listed,
-        // so every later read sees the remaining uploads shifted left.
-        if (offset === 0 && scenario === 'removed-from-first-page')
-          live.splice(10, 1);
-        return page;
-      };
-      const store = new SnapshotStore();
-      try {
-        const schema = await fetchSchema(fixture.client, 'source');
-        const capture = captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          options: { concurrency: 1 },
-          verify: 'none',
-        });
-        if (scenario !== 'complete') {
-          await assert.rejects(capture, errorCode('CAPTURE_DRIFT'), scenario);
-          continue;
-        }
-        await capture;
-        assert.deepEqual(listed, [
-          { order_by: 'id_ASC', page: { offset: 0, limit: 500 } },
-          { order_by: 'id_ASC', page: { offset: 500, limit: 500 } },
-        ]);
-        assert.equal(counts, 3);
-        assert.deepEqual(
-          [...store.uploads('source')].map((upload) => upload.id).sort(),
-          uploads.map((upload) => upload.id).sort(),
-        );
-      } finally {
-        store.dispose();
-      }
-    }
-  });
-
-  it('retains native collection positions in fingerprints, including sparse negative indexes', () => {
+  it('retains native collection positions in collection hashes, including sparse negative indexes', () => {
     const input = {
       id: identity('positioned-collection'),
       label: 'Collection',
@@ -685,39 +700,6 @@ describe('expanded capture and native payload codec', () => {
       canonicalCollection({ ...input, position: 1.5 }).position,
       1.5,
     );
-  });
-
-  it('rejects collection-position-only drift during the independent capture check', async () => {
-    const fixture = mockClient();
-    let reads = 0;
-    fixture.client.uploadCollections.list = async () => [
-      {
-        id: identity('moving-collection'),
-        type: 'upload_collection',
-        label: 'Collection',
-        position: ++reads,
-        parent: null,
-        children: [],
-      },
-    ];
-    const store = new SnapshotStore();
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      await assert.rejects(
-        captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          options: { concurrency: 1 },
-          verify: 'full',
-        }),
-        /changed during capture/,
-      );
-    } finally {
-      store.dispose();
-    }
   });
 
   it('rejects metadata mistaken for an item by SDK response adaptation while allowing real blocks and JSON strings', async () => {
@@ -777,20 +759,14 @@ describe('expanded capture and native payload codec', () => {
         };
       const canonical = canonicalFields(fields, MODEL, schema);
       let writes = 0;
-      const client = buildClient({
-        apiToken: 'offline-fixture-token',
-        fetchFn: async (_url, init) => {
-          writes++;
-          const body = JSON.parse(String(init?.body)) as {
-            data: { attributes: JsonObject };
-          };
-          // The native write succeeds, but the SDK adapter then mistakes the
-          // custom_data object for a record and throws after the transport.
-          return new Response(
-            JSON.stringify({ data: rawRecord(RECORD, body.data.attributes) }),
-            { headers: { 'content-type': 'application/json' } },
-          );
-        },
+      const client = sdkClient((_url, init) => {
+        writes++;
+        const body = JSON.parse(String(init?.body)) as {
+          data: { attributes: JsonObject };
+        };
+        // The native write succeeds, but the SDK adapter then mistakes the
+        // custom_data object for a record and throws after the transport.
+        return { data: rawRecord(RECORD, body.data.attributes) };
       });
       await assert.rejects(
         client.items.rawUpdate(RECORD, {
@@ -808,153 +784,6 @@ describe('expanded capture and native payload codec', () => {
         'type',
         placement,
       );
-    }
-  });
-
-  it('captures 30-record nested pages with backpressure and the complete unselected namespace', async () => {
-    const other = model(identity('other'));
-    other.fields[0].id = identity('other-title');
-    const records = Array.from({ length: 125 }, (_, index) =>
-      rawRecord(identity(`r${index}`), {
-        title: `record ${index}`,
-        blocks: [],
-      }),
-    );
-    records.push(
-      rawRecord(identity('outside'), { title: 'outside' }, false, other.id),
-    );
-    const fixture = mockClient([pagedModel(), other], records);
-    const original = fixture.mock.items.rawList;
-    let active = 0;
-    let maximum = 0;
-    fixture.mock.items.rawList = async (args) => {
-      active++;
-      maximum = Math.max(maximum, active);
-      // Only models with block fields need expanded 30-record pages.
-      if (args.filter.type === MODEL) {
-        assert.equal(args.nested, true);
-        assert.equal(args.page.limit, 30);
-      } else {
-        assert.equal(args.nested, false);
-        assert.equal(args.page.limit, 500);
-      }
-      try {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        return await original(args);
-      } finally {
-        active--;
-      }
-    };
-    const store = new SnapshotStore();
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      await captureSnapshot({
-        client: fixture.client,
-        environmentId: 'source',
-        schema,
-        store,
-        side: 'source',
-        options: { concurrency: 2 },
-        verify: 'none',
-      });
-      assert.equal([...store.records('source')].length, 126);
-      assert.equal(
-        store.getRecord('source', identity('outside'))?.current.title,
-        'outside',
-      );
-      assert.equal(maximum, 2);
-      assert.deepEqual(
-        fixture.calls
-          .filter(
-            (call) => call.filter.type === MODEL && call.version === 'current',
-          )
-          .map((call) => call.page.offset)
-          .sort((a, b) => (a ?? 0) - (b ?? 0)),
-        [0, 30, 60, 90, 120],
-      );
-      assert.equal(
-        store.database
-          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
-          .get()?.count,
-        0,
-      );
-    } finally {
-      const directory = store.directory;
-      store.dispose();
-      assert.equal(existsSync(directory), false);
-    }
-  });
-
-  it('rejects unsafe native INTEGER wire values before capture can merge distinct integers', async () => {
-    const schema = state([
-      model(MODEL, [
-        field('counter', 'integer'),
-        field('opaque', 'json'),
-        field('fraction', 'float'),
-      ]),
-    ]);
-    const opaque = '{"counter":9007199254740993}';
-    for (const literal of [
-      '9007199254740992',
-      '9007199254740993',
-      '-9007199254740993',
-    ]) {
-      for (const slice of ['current', 'published']) {
-        const client = buildClient({
-          apiToken: 'offline-fixture-token',
-          fetchFn: async (input) => {
-            const version = new URL(String(input)).searchParams.get('version');
-            const row = rawRecord(
-              RECORD,
-              {
-                counter: version === slice ? '__WIRE_INTEGER__' : 1,
-                opaque,
-                fraction: 1e30,
-              },
-              true,
-            );
-            const wire = JSON.stringify(response([row])).replace(
-              '"__WIRE_INTEGER__"',
-              literal,
-            );
-            return new Response(wire, {
-              headers: { 'content-type': 'application/json' },
-            });
-          },
-        });
-        await assert.rejects(
-          readRecordBatch(client, [RECORD], schema),
-          errorCode('UNSUPPORTED_INTEGER_PRECISION'),
-        );
-      }
-    }
-    for (const value of [
-      Number.MAX_SAFE_INTEGER,
-      Number.MIN_SAFE_INTEGER,
-      0,
-      null,
-    ]) {
-      const client = buildClient({
-        apiToken: 'offline-fixture-token',
-        fetchFn: async () =>
-          new Response(
-            JSON.stringify(
-              response([
-                rawRecord(
-                  RECORD,
-                  { counter: value, opaque, fraction: 1e30 },
-                  true,
-                ),
-              ]),
-            ),
-            { headers: { 'content-type': 'application/json' } },
-          ),
-      });
-      const [captured] = await readRecordBatch(client, [RECORD], schema);
-      assert.equal(captured.current.counter, value);
-      assert.equal(captured.published!.counter, value);
-      assert.equal(captured.current.opaque, opaque);
-      assert.equal(captured.current.fraction, 1e30);
     }
   });
 
@@ -1004,695 +833,6 @@ describe('expanded capture and native payload codec', () => {
     }
   });
 
-  it('captures exact native custom_data through the authenticated SDK request path before serializer diagnostics', async () => {
-    const models = [
-      model(MODEL, [
-        field('image', 'file'),
-        field('images', 'gallery'),
-        field('blocks', 'rich_text'),
-      ]),
-      model(
-        BLOCK,
-        [{ ...field('localized_image', 'file'), localized: true }],
-        true,
-      ),
-    ];
-    const customData = JSON.parse(
-      '{"ordinary":"kept","__proto__":"native-proto-value","__itemTypeId":"native-item-type-value"}',
-    ) as JsonObject;
-    const file = {
-      upload_id: ASSET,
-      alt: null,
-      title: null,
-      custom_data: customData,
-      focal_point: null,
-      poster_time: null,
-    };
-    const row = rawRecord(RECORD, {
-      image: file,
-      images: [file],
-      blocks: [
-        {
-          id: NESTED,
-          type: 'item',
-          attributes: { localized_image: { en: file } },
-          relationships: {
-            item_type: { data: { id: BLOCK, type: 'item_type' } },
-          },
-        },
-      ],
-    });
-    let fetches = 0;
-    const native = buildClient({
-      apiToken: 'offline-fixture-token',
-      environment: 'native-capture',
-      fetchFn: async (input, init) => {
-        fetches++;
-        const url = new URL(String(input));
-        assert.equal(url.pathname, '/items');
-        assert.equal(url.searchParams.get('nested'), 'true');
-        const headers = new Headers(init?.headers);
-        assert.equal(
-          headers.get('authorization'),
-          'Bearer offline-fixture-token',
-        );
-        assert.equal(headers.get('x-environment'), 'native-capture');
-        return new Response(
-          JSON.stringify(
-            response(
-              url.searchParams.get('version') === 'published' ? [] : [row],
-            ),
-          ),
-          { headers: { 'content-type': 'application/json' } },
-        );
-      },
-    });
-    // Even the SDK rawList adapter loses this own key before returning data.
-    const lossy = await native.items.rawList({
-      nested: true,
-      version: 'current',
-    });
-    assert.equal(
-      Object.hasOwn(
-        (lossy.data[0].attributes.image as JsonObject)
-          .custom_data as JsonObject,
-        '__proto__',
-      ),
-      false,
-    );
-    const fixture = mockClient(models);
-    Reflect.set(fixture.mock, 'request', native.request.bind(native));
-    fixture.mock.items.rawList = async () =>
-      assert.fail('Native capture must avoid the lossy item adapter');
-    const store = new SnapshotStore();
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      await captureSnapshot({
-        client: fixture.client,
-        environmentId: 'source',
-        schema,
-        store,
-        side: 'source',
-        options: { concurrency: 4 },
-        verify: 'none',
-      });
-      const captured = store.getRecord('source', RECORD)!;
-      assert.deepEqual(
-        (captured.current.image as JsonObject).custom_data,
-        customData,
-      );
-      assert.deepEqual(
-        (captured.current.images as JsonObject[])[0].custom_data,
-        customData,
-      );
-      const block = (captured.current.blocks as JsonObject[])[0];
-      assert.deepEqual(
-        (
-          ((block.attributes as JsonObject).localized_image as JsonObject)
-            .en as JsonObject
-        ).custom_data,
-        customData,
-      );
-      assert.equal(
-        Object.getPrototypeOf(
-          (captured.current.image as JsonObject).custom_data,
-        ),
-        Object.prototype,
-      );
-      assert.notEqual(
-        unsupportedRecordPayloadKey(captured.current, MODEL, schema),
-        undefined,
-      );
-      assert.deepEqual(
-        await readRecordBatch(fixture.client, [RECORD], schema),
-        [captured],
-      );
-      assert.equal(fetches, 5);
-    } finally {
-      store.dispose();
-    }
-  });
-
-  it('rejects changed page totals, duplicated identities, and missing publication slices', async () => {
-    for (const scenario of ['total', 'duplicate', 'publication'] as const) {
-      const records = Array.from({ length: 31 }, (_, index) =>
-        rawRecord(
-          identity(`r${index}`),
-          { title: 'record', blocks: [] },
-          scenario === 'publication',
-        ),
-      );
-      const fixture = mockClient([pagedModel()], records);
-      const original = fixture.mock.items.rawList;
-      fixture.mock.items.rawList = async (args) => {
-        const body = await original(args);
-        if ((args.page.offset ?? 0) > 0 && args.version === 'current') {
-          if (scenario === 'total') return response(body.data as unknown[], 32);
-          if (scenario === 'duplicate') return response([records[0]], 31);
-        }
-        return body;
-      };
-      const store = new SnapshotStore();
-      try {
-        const schema = await fetchSchema(fixture.client, 'source');
-        await assert.rejects(
-          captureSnapshot({
-            client: fixture.client,
-            environmentId: 'source',
-            schema,
-            store,
-            side: 'source',
-            options: { concurrency: 4 },
-            verify: 'none',
-          }),
-          errorCode('CAPTURE_DRIFT'),
-        );
-        assert.equal(
-          store.database
-            .prepare('SELECT COUNT(*) AS count FROM capture_raw')
-            .get()?.count,
-          0,
-        );
-      } finally {
-        store.dispose();
-      }
-    }
-  });
-
-  it('keeps SQLite failures while storing capture pages instead of reporting drift', async () => {
-    for (const scenario of ['full', 'error'] as const) {
-      const records = Array.from({ length: 31 }, (_, index) =>
-        rawRecord(identity(`stored-${index}`), { title: 'x'.repeat(2048) }),
-      );
-      const fixture = mockClient([model()], records);
-      const store = new SnapshotStore();
-      try {
-        const schema = await fetchSchema(fixture.client, 'source');
-        // Capture reuses an existing raw page table with this layout.
-        store.database.exec(
-          'CREATE TEMP TABLE capture_raw(side TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,slice,id)) WITHOUT ROWID',
-        );
-        if (scenario === 'full') {
-          const pages = store.database.prepare('PRAGMA temp.page_count').get()!
-            .page_count as number;
-          store.database.exec(`PRAGMA temp.max_page_count = ${pages}`);
-        } else {
-          store.database.exec(`
-            CREATE TEMP TRIGGER capture_unavailable BEFORE INSERT ON capture_raw
-            BEGIN SELECT json('unavailable'); END;
-          `);
-        }
-        await assert.rejects(
-          captureSnapshot({
-            client: fixture.client,
-            environmentId: 'source',
-            schema,
-            store,
-            side: 'source',
-            options: { concurrency: 4 },
-            verify: 'none',
-          }),
-          (error: unknown) =>
-            !(error instanceof ContentError) &&
-            (scenario === 'full'
-              ? /database or disk is full/
-              : /malformed JSON/
-            ).test((error as Error).message),
-          scenario,
-        );
-        assert.equal([...store.records('source')].length, 0);
-      } finally {
-        store.dispose();
-      }
-    }
-  });
-
-  it('stores captured records without building the indexes the planner rebuilds', async () => {
-    const models = [
-      model(MODEL, [field('blocks', 'rich_text')]),
-      model(BLOCK, [field('related', 'link')], true),
-    ];
-    const records = Array.from({ length: 31 }, (_, index) =>
-      rawRecord(identity(`batch-${index}`), {
-        blocks: [
-          nativeBlock(identity(`block-${index}`), BLOCK, { related: LINKED }),
-        ],
-      }),
-    );
-    const fixture = mockClient(models, records);
-    const store = new SnapshotStore();
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      await captureSnapshot({
-        client: fixture.client,
-        environmentId: 'source',
-        schema,
-        store,
-        side: 'source',
-        options: { concurrency: 4 },
-        verify: 'none',
-      });
-      assert.equal([...store.records('source')].length, 31);
-      assert.equal(
-        store.database.prepare('SELECT COUNT(*) AS count FROM refs').get()
-          ?.count,
-        0,
-      );
-      assert.equal(
-        store.database
-          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
-          .get()?.count,
-        0,
-      );
-    } finally {
-      store.dispose();
-    }
-  });
-
-  it('drains active capture pages on cancellation without starting queued requests', async () => {
-    const fixture = mockClient(
-      [pagedModel()],
-      Array.from({ length: 125 }, (_, index) =>
-        rawRecord(identity(`abort-${index}`), { title: 'record', blocks: [] }),
-      ),
-    );
-    const controller = new AbortController();
-    const original = fixture.mock.items.rawList;
-    let release!: () => void;
-    const pending = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let ready!: () => void;
-    const active = new Promise<void>((resolve) => {
-      ready = resolve;
-    });
-    let started = 0;
-    let completed = 0;
-    let finished = false;
-    fixture.mock.items.rawList = async (args) => {
-      if ((args.page.offset ?? 0) > 0) {
-        if (++started === 2) ready();
-        await pending;
-        completed++;
-      }
-      return original(args);
-    };
-    const store = new SnapshotStore();
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      const capture = captureSnapshot({
-        client: fixture.client,
-        environmentId: 'source',
-        schema,
-        store,
-        side: 'source',
-        verify: 'full',
-        options: {
-          concurrency: 2,
-          signal: controller.signal,
-        },
-      });
-      const rejected = assert
-        .rejects(capture, errorCode('INTERRUPTED'))
-        .then(() => {
-          finished = true;
-        });
-      await active;
-      controller.abort();
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(finished, false);
-      assert.equal(completed, 0);
-      release();
-      await rejected;
-      assert.equal(started, 2);
-      assert.equal(completed, 2);
-      assert.deepEqual(
-        fixture.calls
-          .map((call) => call.page.offset)
-          .sort((a, b) => (a ?? 0) - (b ?? 0)),
-        [0, 30, 60],
-      );
-      assert.equal(
-        store.database
-          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
-          .get()?.count,
-        0,
-      );
-    } finally {
-      release();
-      store.dispose();
-    }
-  });
-
-  it('processes cancellation between SQLite record batches even when schedule reads resolve immediately', async () => {
-    const fixture = mockClient(
-      [model()],
-      Array.from({ length: 65 }, (_, index) =>
-        rawRecord(identity(`yield-${index}`)),
-      ),
-    );
-    const store = new SnapshotStore();
-    const controller = new AbortController();
-    const original = store.putRecord.bind(store);
-    let written = 0;
-    store.putRecord = (side, state) => {
-      original(side, state);
-      if (++written === 1) setImmediate(() => controller.abort());
-    };
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      await assert.rejects(
-        captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          options: {
-            signal: controller.signal,
-            concurrency: 4,
-          },
-          verify: 'none',
-        }),
-        errorCode('INTERRUPTED'),
-      );
-      assert.equal(written, 30);
-      assert.equal(
-        store.database
-          .prepare('SELECT COUNT(*) AS count FROM capture_raw')
-          .get()?.count,
-        0,
-      );
-    } finally {
-      const directory = store.directory;
-      store.dispose();
-      assert.equal(existsSync(directory), false);
-    }
-  });
-
-  it('verifies complete expanded content twice and rejects changed versions or schema', async () => {
-    for (const scenario of ['stable', 'version', 'schema'] as const) {
-      const fixture = mockClient([model()], [rawRecord()]);
-      const original = fixture.mock.items.rawList;
-      let currentPass = 0;
-      fixture.mock.items.rawList = async (args) => {
-        const body = await original(args);
-        if (args.version === 'current') {
-          currentPass++;
-          if (currentPass > 1 && scenario === 'version') {
-            const rows = structuredClone(body.data) as Record<
-              string,
-              unknown
-            >[];
-            (rows[0].meta as Record<string, unknown>).current_version = 'v2';
-            return response(rows);
-          }
-        }
-        return body;
-      };
-      const originalSite = fixture.mock.site.find;
-      let sites = 0;
-      fixture.mock.site.find = async () => {
-        const site = await originalSite();
-        if (++sites > 1 && scenario === 'schema')
-          return { ...site, locales: ['en'] };
-        return site;
-      };
-      const store = new SnapshotStore();
-      try {
-        const schema = await fetchSchema(fixture.client, 'source');
-        const capture = captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          verify: 'full',
-          options: { concurrency: 4 },
-        });
-        if (scenario === 'stable') {
-          await capture;
-          assert.equal(currentPass, 2);
-        } else await assert.rejects(capture, errorCode('CAPTURE_DRIFT'));
-        assert.equal(
-          store.database
-            .prepare('SELECT COUNT(*) AS count FROM capture_raw')
-            .get()?.count,
-          0,
-        );
-      } finally {
-        store.dispose();
-      }
-    }
-  });
-
-  it('checks consistency by version, rereading only records with a new version', async () => {
-    for (const edit of ['none', 'version', 'content'] as const) {
-      const records = Array.from({ length: 3 }, (_, index) =>
-        rawRecord(identity(`v${index}`), { title: `record ${index}` }),
-      );
-      const fixture = mockClient([model()], records);
-      const original = fixture.mock.items.rawList;
-      let calls = 0;
-      let focused = 0;
-      fixture.mock.items.rawList = async (args) => {
-        if (args.filter.ids) focused++;
-        // The record is saved after the first pass read it, before the
-        // version listing that follows: a new version, and maybe new content.
-        else if (
-          args.filter.type === MODEL &&
-          ++calls === 3 &&
-          edit !== 'none'
-        ) {
-          const meta = records[0].meta as Record<string, unknown>;
-          meta.current_version = 'v2';
-          if (edit === 'content')
-            (records[0].attributes as JsonObject).title = 'edited';
-        }
-        return original(args);
-      };
-      const store = new SnapshotStore();
-      try {
-        const schema = await fetchSchema(fixture.client, 'source');
-        const capture = captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          options: { concurrency: 4 },
-          verify: 'versions',
-        });
-        if (edit === 'content')
-          await assert.rejects(capture, errorCode('CAPTURE_DRIFT'));
-        else await capture;
-        // Only the record with a new version is read again in full.
-        assert.equal(focused, edit === 'none' ? 0 : 2);
-      } finally {
-        store.dispose();
-      }
-    }
-  });
-
-  it('reads schedule details for a whole capture concurrently, not per 30-record batch', async () => {
-    // One scheduled record in each of three 30-record batches.
-    const records = Array.from({ length: 90 }, (_, index) => {
-      const record = rawRecord(identity(`s${index}`), { title: `${index}` });
-      if (index % 30 === 0)
-        (record.meta as Record<string, unknown>).publication_scheduled_at =
-          FUTURE;
-      return record;
-    });
-    const fixture = mockClient([model()], records);
-    let active = 0;
-    let maximum = 0;
-    Reflect.set(fixture.mock.items, 'rawCurrentVsPublishedState', async () => {
-      active++;
-      maximum = Math.max(maximum, active);
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      active--;
-      return {
-        data: {
-          relationships: {
-            scheduled_publication: {
-              data: { type: 'scheduled_publication', id: 'pub' },
-            },
-            scheduled_unpublishing: { data: null },
-          },
-        },
-        included: [
-          {
-            id: 'pub',
-            type: 'scheduled_publication',
-            attributes: {
-              publication_scheduled_at: FUTURE,
-              selective_publication: null,
-            },
-          },
-        ],
-      };
-    });
-    const store = new SnapshotStore();
-    try {
-      const schema = await fetchSchema(fixture.client, 'source');
-      await captureSnapshot({
-        client: fixture.client,
-        environmentId: 'source',
-        schema,
-        store,
-        side: 'source',
-        options: { concurrency: 4 },
-        verify: 'none',
-      });
-      assert.equal(maximum, 3);
-      for (const index of [0, 30, 60])
-        assert.deepEqual(
-          store.getRecord('source', identity(`s${index}`))?.schedules,
-          {
-            publication: { at: FUTURE, selective: null },
-            unpublishing: null,
-          },
-        );
-      assert.equal(
-        store.database
-          .prepare('SELECT COUNT(*) AS count FROM capture_schedules')
-          .get()?.count,
-        0,
-      );
-    } finally {
-      store.dispose();
-    }
-  });
-
-  it('captures exact private selective schedules and rejects drifting state', async () => {
-    const fixture = mockClient();
-    const current = rawRecord();
-    (current.meta as Record<string, unknown>).publication_scheduled_at = FUTURE;
-    (current.meta as Record<string, unknown>).unpublishing_scheduled_at =
-      '2090-02-01T12:30:00.000Z';
-    const body = {
-      data: {
-        relationships: {
-          scheduled_publication: {
-            data: { type: 'scheduled_publication', id: 'pub' },
-          },
-          scheduled_unpublishing: {
-            data: { type: 'scheduled_unpublishing', id: 'unpub' },
-          },
-        },
-      },
-      included: [
-        {
-          id: 'pub',
-          type: 'scheduled_publication',
-          attributes: {
-            publication_scheduled_at: FUTURE,
-            selective_publication: {
-              content_in_locales: ['it', 'en'],
-              non_localized_content: false,
-            },
-          },
-        },
-        {
-          id: 'unpub',
-          type: 'scheduled_unpublishing',
-          attributes: {
-            unpublishing_scheduled_at: '2090-02-01T12:30:00.000Z',
-            content_in_locales: ['it'],
-          },
-        },
-      ],
-    };
-    Reflect.set(
-      fixture.mock.items,
-      'rawCurrentVsPublishedState',
-      async () => body,
-    );
-    assert.deepEqual(await readSchedules(fixture.client, current), {
-      publication: {
-        at: FUTURE,
-        selective: { locales: ['en', 'it'], nonLocalized: false },
-      },
-      unpublishing: { at: '2090-02-01T12:30:00.000Z', locales: ['it'] },
-    });
-    Reflect.set(fixture.mock.items, 'rawCurrentVsPublishedState', async () => ({
-      ...body,
-      included: [
-        {
-          ...body.included[0],
-          attributes: {
-            ...body.included[0].attributes,
-            publication_scheduled_at: '2091-01-01T12:30:00.000Z',
-          },
-        },
-        body.included[1],
-      ],
-    }));
-    await assert.rejects(
-      readSchedules(fixture.client, current),
-      errorCode('CAPTURE_DRIFT'),
-    );
-    // A record deleted after the listing is drift, not a CMA failure.
-    Reflect.set(fixture.mock.items, 'rawCurrentVsPublishedState', async () => {
-      throw new CmaClient.ApiError({
-        request: { method: 'GET', url: '/items/x', headers: {} },
-        response: {
-          status: 404,
-          statusText: 'Not Found',
-          headers: {},
-          body: { data: [] },
-        },
-      });
-    });
-    await assert.rejects(
-      readSchedules(fixture.client, current),
-      errorCode('CAPTURE_DRIFT'),
-    );
-  });
-
-  it('proves full namespace permissions before any content read', async () => {
-    const fixture = mockClient([model()], [rawRecord()]);
-    const schema = await fetchSchema(fixture.client, 'source');
-    Reflect.set(fixture.mock.users, 'findMe', async () => ({
-      type: 'access_token',
-      role: {
-        id: 'role',
-        meta: {
-          final_permissions: {
-            can_manage_upload_collections: true,
-            positive_item_type_permissions: [],
-            negative_item_type_permissions: [],
-            positive_upload_permissions: [],
-            negative_upload_permissions: [],
-          },
-        },
-      },
-    }));
-    const store = new SnapshotStore();
-    try {
-      await assert.rejects(
-        captureSnapshot({
-          client: fixture.client,
-          environmentId: 'source',
-          schema,
-          store,
-          side: 'source',
-          verify: 'full',
-          options: { concurrency: 4 },
-        }),
-        errorCode('UNPROVEN_FULL_ACCESS'),
-      );
-      assert.equal(fixture.calls.length, 0);
-      Reflect.set(fixture.mock.users, 'findMe', async () => ({
-        type: 'access_token',
-        hardcoded_type: 'admin',
-      }));
-      await assertFullReadAccess(fixture.client, schema);
-    } finally {
-      store.dispose();
-    }
-  });
-
   it('hashes canonical content independently from object insertion order', () => {
     assert.equal(
       hashJson({ b: 1, a: { z: true, x: null } }),
@@ -1730,5 +870,714 @@ describe('expanded capture and native payload codec', () => {
       ),
     );
     assert.notEqual(hashJson(opaque), hashJson({ normal: true }));
+  });
+
+  it('canonicalizes schedule resources with sorted locales and UTC instants', () => {
+    assert.deepEqual(canonicalSchedules(null, null), {
+      publication: null,
+      unpublishing: null,
+    });
+    assert.deepEqual(canonicalSchedules(PUBLICATION, UNPUBLISHING), {
+      publication: {
+        at: FUTURE,
+        selective: { locales: ['en', 'it'], nonLocalized: false },
+      },
+      unpublishing: { at: LATER, locales: ['it'] },
+    });
+    // Sorting copies the locales the CMA returned.
+    assert.deepEqual(
+      (PUBLICATION.attributes.selective_publication as JsonObject)
+        .content_in_locales,
+      ['it', 'en'],
+    );
+    // An unpublishing of every locale has no locale list, null or missing.
+    for (const locales of [{ content_in_locales: null }, {}] as JsonObject[])
+      assert.deepEqual(
+        canonicalSchedules(
+          {
+            ...PUBLICATION,
+            attributes: {
+              publication_scheduled_at: '2090-01-01T13:30:00+01:00',
+              selective_publication: null,
+            },
+          },
+          {
+            ...UNPUBLISHING,
+            attributes: {
+              unpublishing_scheduled_at: '2090-02-01T12:30:00Z',
+              ...locales,
+            },
+          },
+        ),
+        {
+          publication: { at: FUTURE, selective: null },
+          unpublishing: { at: LATER, locales: null },
+        },
+      );
+  });
+
+  it('canonicalizes a record line with both versions and its schedules', () => {
+    const schema = state();
+    const current = rawRecord(RECORD, { title: 'draft' }, true);
+    const published = rawRecord(RECORD, { title: 'live' }, true);
+    const line: RecordLine = {
+      id: RECORD,
+      current,
+      published,
+      scheduledPublication: PUBLICATION,
+      scheduledUnpublishing: null,
+    };
+    const record = canonicalRecordLine(line, schema);
+    assert.deepEqual(
+      record,
+      canonicalRecord(
+        current,
+        published,
+        schema,
+        canonicalSchedules(PUBLICATION, null),
+      ),
+    );
+    assert.equal(record.current.title, 'draft');
+    assert.equal(record.published?.title, 'live');
+    assert.equal(record.schedules.publication?.at, FUTURE);
+    // Schedules are part of the record's hash.
+    assert.notEqual(
+      record.hash,
+      canonicalRecordLine({ ...line, scheduledPublication: null }, schema).hash,
+    );
+  });
+
+  it('labels records with their title or name string field in schema locale order', () => {
+    const plain = identity('plain');
+    const localized = identity('localized');
+    const text = identity('text');
+    const schema = state([
+      model(plain, [field('name'), field('title')]),
+      model(localized, [{ ...field('title'), localized: true }]),
+      model(text, [field('title', 'text'), field('name')]),
+    ]);
+    assert.equal(recordTitle(plain, schema, { name: 'N', title: 'T' }), 'T');
+    assert.equal(recordTitle(plain, schema, { name: 'N', title: null }), 'N');
+    assert.equal(
+      recordTitle(plain, schema, { name: '', title: '' }),
+      undefined,
+    );
+    assert.equal(
+      recordTitle(plain, schema, { title: 'x'.repeat(200) }),
+      'x'.repeat(121),
+    );
+    // The first locale of the schema with a value, not the first key.
+    assert.equal(
+      recordTitle(localized, schema, { title: { it: 'Titolo', en: 'Title' } }),
+      'Title',
+    );
+    assert.equal(
+      recordTitle(localized, schema, { title: { it: 'Titolo', en: '' } }),
+      'Titolo',
+    );
+    // Only string fields label a record.
+    assert.equal(recordTitle(text, schema, { title: 'T', name: 'N' }), 'N');
+    assert.equal(recordTitle(plain, schema, undefined), undefined);
+    assert.equal(recordTitle(MODEL, schema, { title: 'T' }), undefined);
+  });
+});
+
+describe('environment capture', () => {
+  it('pages uploads through the SDK by ID and rejects totals, lengths or identities that change meanwhile', async () => {
+    const uploads = Array.from({ length: 501 }, (_, index) => ({
+      id: identity(`upload-${index}`),
+      type: 'upload',
+      basename: `image-${index}`,
+      filename: `image-${index}.png`,
+      md5: '0123456789abcdef0123456789abcdef',
+      size: 100,
+      url: `https://example.invalid/image-${index}.png`,
+      default_field_metadata: {},
+      upload_collection: null,
+    }));
+    const folder = {
+      id: identity('folder'),
+      type: 'upload_collection',
+      label: 'Images',
+      position: 1,
+      parent: null,
+      children: [],
+    };
+    for (const scenario of [
+      'complete',
+      'page-total',
+      'short',
+      'duplicate',
+      'final-total',
+      'removed-from-first-page',
+    ] as const) {
+      const fixture = mockClient();
+      const live = [...uploads];
+      const listed: unknown[] = [];
+      let counts = 0;
+      fixture.mock.uploads.rawList = async () => {
+        counts += 1;
+        const changed =
+          (scenario === 'page-total' && counts === 2) ||
+          (scenario === 'final-total' && counts === 3);
+        return response([], changed ? 502 : live.length);
+      };
+      fixture.mock.uploads.list = async (args?: {
+        page: { offset: number; limit: number };
+      }) => {
+        listed.push(structuredClone(args));
+        const { offset, limit } = args!.page;
+        if (offset > 0 && scenario === 'short') return [];
+        if (offset > 0 && scenario === 'duplicate') return [uploads[0]];
+        const page = live.slice(offset, offset + limit);
+        // An upload of the first page is deleted right after it is listed,
+        // so every later read sees the remaining uploads shifted left.
+        if (offset === 0 && scenario === 'removed-from-first-page')
+          live.splice(10, 1);
+        return page;
+      };
+      fixture.mock.uploadCollections.list = async () => [folder];
+      const captured = capture(fixture.client, { concurrency: 1 });
+      if (scenario !== 'complete') {
+        await assert.rejects(captured, errorCode('CAPTURE_DRIFT'), scenario);
+        continue;
+      }
+      const sink = await captured;
+      assert.deepEqual(listed, [
+        { order_by: 'id_ASC', page: { offset: 0, limit: 500 } },
+        { order_by: 'id_ASC', page: { offset: 500, limit: 500 } },
+      ]);
+      assert.equal(counts, 3);
+      // The sink receives each upload and folder as the SDK returns it.
+      assert.deepEqual(sink.uploads, uploads);
+      assert.deepEqual(sink.collections, [folder]);
+    }
+  });
+
+  it('captures 30-record nested pages with backpressure and the complete unselected namespace', async () => {
+    const other = model(identity('other'));
+    other.fields[0].id = identity('other-title');
+    const records = Array.from({ length: 125 }, (_, index) =>
+      rawRecord(identity(`r${index}`), {
+        title: `record ${index}`,
+        blocks: [],
+      }),
+    );
+    records.push(
+      rawRecord(identity('outside'), { title: 'outside' }, false, other.id),
+    );
+    const fixture = mockClient([pagedModel(), other], records);
+    const original = fixture.mock.items.rawList;
+    let active = 0;
+    let maximum = 0;
+    fixture.mock.items.rawList = async (args) => {
+      active++;
+      maximum = Math.max(maximum, active);
+      // Only models with block fields need expanded 30-record pages.
+      if (args.filter.type === MODEL) {
+        assert.equal(args.nested, true);
+        assert.equal(args.page.limit, 30);
+      } else {
+        assert.equal(args.nested, false);
+        assert.equal(args.page.limit, 500);
+      }
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return await original(args);
+      } finally {
+        active--;
+      }
+    };
+    const { records: lines } = await capture(fixture.client, {
+      concurrency: 2,
+    });
+    assert.equal(lines.length, 126);
+    assert.deepEqual(
+      lines.find((line) => line.id === identity('outside')),
+      {
+        id: identity('outside'),
+        current: records[125],
+        published: null,
+        scheduledPublication: null,
+        scheduledUnpublishing: null,
+      },
+    );
+    assert.equal(maximum, 2);
+    assert.deepEqual(
+      fixture.calls
+        .filter(
+          (call) => call.filter.type === MODEL && call.version === 'current',
+        )
+        .map((call) => call.page.offset)
+        .sort((a, b) => (a ?? 0) - (b ?? 0)),
+      [0, 30, 60, 90, 120],
+    );
+  });
+
+  it('reads the published versions of each listed page by ID, 100 at a time or 30 when nested', async () => {
+    const flat = model(identity('flat'));
+    flat.fields[0].id = identity('flat-title');
+    const nestedIds = Array.from({ length: 31 }, (_, index) =>
+      identity(`nested-${index}`),
+    );
+    const flatIds = Array.from({ length: 160 }, (_, index) =>
+      identity(`flat-${index}`),
+    );
+    const current = [
+      ...nestedIds.map((id) => rawRecord(id, { title: 'draft' }, true)),
+      // The first flat record is not published.
+      ...flatIds.map((id, index) =>
+        rawRecord(id, { title: 'draft' }, index > 0, flat.id),
+      ),
+    ];
+    const published = current
+      .filter((record) => (record.meta as JsonObject).published_at)
+      .map((record) => ({
+        ...record,
+        attributes: { title: 'published' },
+      }));
+    const fixture = mockClient([pagedModel(), flat], current, published);
+    const { records: lines } = await capture(fixture.client, {
+      concurrency: 1,
+    });
+    const read = (ids: string[], nested: boolean) => ({
+      filter: { ids: ids.join(',') },
+      nested,
+      version: 'published',
+      page: { limit: ids.length },
+    });
+    // Models are read one after another, each page by page.
+    const reads = (nested: boolean) =>
+      fixture.calls.filter(
+        (call) => call.version === 'published' && call.nested === nested,
+      );
+    assert.deepEqual(reads(true), [
+      read(nestedIds.slice(0, 30), true),
+      read(nestedIds.slice(30), true),
+    ]);
+    assert.deepEqual(reads(false), [
+      read(flatIds.slice(1, 101), false),
+      read(flatIds.slice(101), false),
+    ]);
+    const line = (id: string) => lines.find((entry) => entry.id === id);
+    assert.equal(lines.length, current.length);
+    assert.deepEqual(line(flatIds[0]), {
+      id: flatIds[0],
+      current: current[31],
+      published: null,
+      scheduledPublication: null,
+      scheduledUnpublishing: null,
+    });
+    assert.deepEqual(line(flatIds[1])?.current, current[32]);
+    assert.deepEqual(line(flatIds[1])?.published, published[31]);
+  });
+
+  it('rejects unsafe native INTEGER wire values before capture can merge distinct integers', async () => {
+    const models = [
+      model(MODEL, [
+        field('counter', 'integer'),
+        field('opaque', 'json'),
+        field('fraction', 'float'),
+      ]),
+    ];
+    const schema = state(models);
+    const opaque = '{"counter":9007199254740993}';
+    for (const literal of [
+      '9007199254740992',
+      '9007199254740993',
+      '-9007199254740993',
+    ]) {
+      for (const slice of ['current', 'published']) {
+        const [line] = await captureNative(
+          models,
+          sdkClient((url) => {
+            const row = rawRecord(
+              RECORD,
+              {
+                counter:
+                  url.searchParams.get('version') === slice
+                    ? '__WIRE_INTEGER__'
+                    : 1,
+                opaque,
+                fraction: 1e30,
+              },
+              true,
+            );
+            return JSON.stringify(response([row])).replace(
+              '"__WIRE_INTEGER__"',
+              literal,
+            );
+          }),
+        );
+        assert.throws(
+          () => canonicalRecordLine(line, schema),
+          errorCode('UNSUPPORTED_INTEGER_PRECISION'),
+        );
+      }
+    }
+    for (const value of [
+      Number.MAX_SAFE_INTEGER,
+      Number.MIN_SAFE_INTEGER,
+      0,
+      null,
+    ]) {
+      const [line] = await captureNative(
+        models,
+        sdkClient(() =>
+          response([
+            rawRecord(RECORD, { counter: value, opaque, fraction: 1e30 }, true),
+          ]),
+        ),
+      );
+      const captured = canonicalRecordLine(line, schema);
+      assert.equal(captured.current.counter, value);
+      assert.equal(captured.published!.counter, value);
+      assert.equal(captured.current.opaque, opaque);
+      assert.equal(captured.current.fraction, 1e30);
+    }
+  });
+
+  it('captures exact native custom_data through the authenticated SDK request path before serializer diagnostics', async () => {
+    const models = [
+      model(MODEL, [
+        field('image', 'file'),
+        field('images', 'gallery'),
+        field('blocks', 'rich_text'),
+      ]),
+      model(
+        BLOCK,
+        [{ ...field('localized_image', 'file'), localized: true }],
+        true,
+      ),
+    ];
+    const customData = JSON.parse(
+      '{"ordinary":"kept","__proto__":"native-proto-value","__itemTypeId":"native-item-type-value"}',
+    ) as JsonObject;
+    const file = {
+      upload_id: ASSET,
+      alt: null,
+      title: null,
+      custom_data: customData,
+      focal_point: null,
+      poster_time: null,
+    };
+    const row = rawRecord(
+      RECORD,
+      {
+        image: file,
+        images: [file],
+        blocks: [nativeBlock(NESTED, BLOCK, { localized_image: { en: file } })],
+      },
+      true,
+    );
+    const requests: URL[] = [];
+    const native = sdkClient((url, init) => {
+      requests.push(url);
+      assert.equal(url.pathname, '/items');
+      assert.equal(url.searchParams.get('nested'), 'true');
+      const headers = new Headers(init?.headers);
+      assert.equal(
+        headers.get('authorization'),
+        'Bearer offline-fixture-token',
+      );
+      assert.equal(headers.get('x-environment'), 'native-capture');
+      return response([row]);
+    }, 'native-capture');
+    // Even the SDK rawList adapter loses this own key before returning data.
+    const lossy = await native.items.rawList({
+      nested: true,
+      version: 'current',
+    });
+    assert.equal(
+      Object.hasOwn(
+        (lossy.data[0].attributes.image as JsonObject)
+          .custom_data as JsonObject,
+        '__proto__',
+      ),
+      false,
+    );
+    const [line] = await captureNative(models, native);
+    const schema = state(models);
+    const captured = canonicalRecordLine(line, schema);
+    // Both versions travel the native request path.
+    for (const fields of [captured.current, captured.published!]) {
+      assert.deepEqual((fields.image as JsonObject).custom_data, customData);
+      assert.deepEqual(
+        (fields.images as JsonObject[])[0].custom_data,
+        customData,
+      );
+      const block = (fields.blocks as JsonObject[])[0];
+      assert.deepEqual(
+        (
+          ((block.attributes as JsonObject).localized_image as JsonObject)
+            .en as JsonObject
+        ).custom_data,
+        customData,
+      );
+      assert.equal(
+        Object.getPrototypeOf((fields.image as JsonObject).custom_data),
+        Object.prototype,
+      );
+    }
+    assert.notEqual(
+      unsupportedRecordPayloadKey(captured.current, MODEL, schema),
+      undefined,
+    );
+    assert.deepEqual(
+      requests.map((url) => [
+        url.searchParams.get('version'),
+        url.searchParams.get('filter[ids]'),
+      ]),
+      [
+        ['current', null],
+        ['current', null],
+        ['published', RECORD],
+      ],
+    );
+  });
+
+  it('rejects changed page totals, duplicated identities, and missing publication slices', async () => {
+    for (const scenario of ['total', 'duplicate', 'publication'] as const) {
+      const records = Array.from({ length: 31 }, (_, index) =>
+        rawRecord(
+          identity(`r${index}`),
+          { title: 'record', blocks: [] },
+          scenario === 'publication',
+        ),
+      );
+      const fixture = mockClient([pagedModel()], records);
+      const original = fixture.mock.items.rawList;
+      fixture.mock.items.rawList = async (args) => {
+        const body = await original(args);
+        if ((args.page.offset ?? 0) > 0 && args.version === 'current') {
+          if (scenario === 'total') return response(body.data as unknown[], 32);
+          if (scenario === 'duplicate') return response([records[0]], 31);
+        }
+        return body;
+      };
+      await assert.rejects(
+        capture(fixture.client),
+        errorCode('CAPTURE_DRIFT'),
+        scenario,
+      );
+    }
+  });
+
+  it('keeps sink failures instead of reporting drift', async () => {
+    const fixture = mockClient([model()], [rawRecord()]);
+    const failure = new Error('No space left on device');
+    const sink = recorder();
+    sink.record = async () => {
+      throw failure;
+    };
+    await assert.rejects(
+      capture(fixture.client, {}, sink),
+      (error) => error === failure,
+    );
+  });
+
+  it('drains active capture pages on cancellation without starting queued requests', async () => {
+    const fixture = mockClient(
+      [pagedModel()],
+      Array.from({ length: 125 }, (_, index) =>
+        rawRecord(identity(`abort-${index}`), { title: 'record', blocks: [] }),
+      ),
+    );
+    const controller = new AbortController();
+    const original = fixture.mock.items.rawList;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let ready!: () => void;
+    const active = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    let started = 0;
+    let completed = 0;
+    let finished = false;
+    fixture.mock.items.rawList = async (args) => {
+      if ((args.page.offset ?? 0) > 0) {
+        if (++started === 2) ready();
+        await pending;
+        completed++;
+      }
+      return original(args);
+    };
+    try {
+      const rejected = assert
+        .rejects(
+          capture(fixture.client, {
+            concurrency: 2,
+            signal: controller.signal,
+          }),
+          errorCode('INTERRUPTED'),
+        )
+        .then(() => {
+          finished = true;
+        });
+      await active;
+      controller.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(finished, false);
+      assert.equal(completed, 0);
+      release();
+      await rejected;
+      assert.equal(started, 2);
+      assert.equal(completed, 2);
+      assert.deepEqual(
+        fixture.calls
+          .map((call) => call.page.offset)
+          .sort((a, b) => (a ?? 0) - (b ?? 0)),
+        [0, 30, 60],
+      );
+    } finally {
+      release();
+    }
+  });
+
+  it('stops before the next record once cancelled', async () => {
+    const fixture = mockClient(
+      [model()],
+      Array.from({ length: 65 }, (_, index) =>
+        rawRecord(identity(`yield-${index}`)),
+      ),
+    );
+    const controller = new AbortController();
+    const sink = recorder();
+    const record = sink.record;
+    sink.record = async (line) => {
+      await record(line);
+      controller.abort();
+    };
+    await assert.rejects(
+      capture(fixture.client, { signal: controller.signal }, sink),
+      errorCode('INTERRUPTED'),
+    );
+    assert.equal(sink.records.length, 1);
+  });
+
+  it('reads schedule details concurrently, not one record at a time', async () => {
+    // Three scheduled records in one listed page.
+    const records = Array.from({ length: 90 }, (_, index) => {
+      const record = rawRecord(identity(`s${index}`), { title: `${index}` });
+      if (index % 30 === 0)
+        (record.meta as JsonObject).publication_scheduled_at = FUTURE;
+      return record;
+    });
+    const fixture = mockClient([model()], records);
+    const publication = {
+      ...PUBLICATION,
+      attributes: { publication_scheduled_at: FUTURE },
+    };
+    let active = 0;
+    let maximum = 0;
+    fixture.mock.items.rawCurrentVsPublishedState = async () => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      active--;
+      return scheduleResponse(publication);
+    };
+    const { records: lines } = await capture(fixture.client, {
+      concurrency: 4,
+    });
+    for (const index of [0, 30, 60]) {
+      const line = lines.find((entry) => entry.id === identity(`s${index}`))!;
+      assert.deepEqual(line.scheduledPublication, publication);
+      assert.deepEqual(canonicalRecordLine(line, state()).schedules, {
+        publication: { at: FUTURE, selective: null },
+        unpublishing: null,
+      });
+    }
+    assert.equal(maximum, 3);
+  });
+
+  it('captures exact private selective schedules and rejects drifting state', async () => {
+    const current = rawRecord();
+    Object.assign(current.meta as JsonObject, {
+      publication_scheduled_at: FUTURE,
+      unpublishing_scheduled_at: LATER,
+    });
+    const fixture = mockClient([model()], [current]);
+    const read = (answer: () => Promise<unknown>) => {
+      fixture.mock.items.rawCurrentVsPublishedState = answer;
+      return capture(fixture.client);
+    };
+    const failing = (status: number) =>
+      read(async () => {
+        throw new CmaClient.ApiError({
+          request: { method: 'GET', url: '/items/x', headers: {} },
+          response: { status, statusText: '', headers: {}, body: {} },
+        });
+      });
+    const {
+      records: [line],
+    } = await read(async () => scheduleResponse(PUBLICATION, UNPUBLISHING));
+    assert.deepEqual(line.scheduledPublication, PUBLICATION);
+    assert.deepEqual(line.scheduledUnpublishing, UNPUBLISHING);
+    assert.deepEqual(canonicalRecordLine(line, state()).schedules, {
+      publication: {
+        at: FUTURE,
+        selective: { locales: ['en', 'it'], nonLocalized: false },
+      },
+      unpublishing: { at: LATER, locales: ['it'] },
+    });
+    // The listing's markers and the details are two requests.
+    for (const resources of [
+      [
+        {
+          ...PUBLICATION,
+          attributes: {
+            ...PUBLICATION.attributes,
+            publication_scheduled_at: '2091-01-01T12:30:00.000Z',
+          },
+        },
+        UNPUBLISHING,
+      ],
+      [PUBLICATION],
+    ])
+      await assert.rejects(
+        read(async () => scheduleResponse(...resources)),
+        errorCode('CAPTURE_DRIFT'),
+      );
+    // A record deleted after the listing is drift, not a CMA failure.
+    await assert.rejects(failing(404), errorCode('CAPTURE_DRIFT'));
+    await assert.rejects(
+      failing(500),
+      (error) => error instanceof CmaClient.ApiError,
+    );
+  });
+
+  it('proves full namespace permissions before any content read', async () => {
+    const fixture = mockClient([model()], [rawRecord()]);
+    Reflect.set(fixture.mock.users, 'findMe', async () => ({
+      type: 'access_token',
+      role: {
+        id: 'role',
+        meta: {
+          final_permissions: {
+            can_manage_upload_collections: true,
+            positive_item_type_permissions: [],
+            negative_item_type_permissions: [],
+            positive_upload_permissions: [],
+            negative_upload_permissions: [],
+          },
+        },
+      },
+    }));
+    await assert.rejects(
+      capture(fixture.client),
+      errorCode('UNPROVEN_FULL_ACCESS'),
+    );
+    assert.equal(fixture.calls.length, 0);
+    Reflect.set(fixture.mock.users, 'findMe', async () => ({
+      type: 'access_token',
+      hardcoded_type: 'admin',
+    }));
+    await assertFullReadAccess(
+      fixture.client,
+      await fetchSchema(fixture.client, 'source'),
+    );
   });
 });

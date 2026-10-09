@@ -6,7 +6,6 @@ import type {
   JsonObject,
   JsonValue,
   ModelSchema,
-  RecordGuard,
   RecordState,
   Reference,
   Schedules,
@@ -102,7 +101,7 @@ export function referenceId(value: unknown): string | null {
 }
 
 /** The model of a record or block in the CMA's JSON:API shape. */
-function itemTypeId(resource: Record<string, unknown>): string {
+export function itemTypeId(resource: unknown): string {
   return (
     resource as { relationships: { item_type: { data: { id: string } } } }
   ).relationships.item_type.data.id;
@@ -424,102 +423,73 @@ export function recordHash(
   });
 }
 
-export function recordGuard(record: RecordState): RecordGuard {
-  return {
-    hash: record.hash,
-    currentVersion: record.currentVersion,
-    publishedUpdatedAt: record.publishedUpdatedAt,
-    position: record.position,
-  };
-}
-
-/**
- * Version metadata that identifies a record's content without reading it:
- * every CMA edit creates a new current version, and every publication change
- * moves the published version's update time. Schedules are compared by time,
- * which is all a plain listing exposes.
- */
-interface RecordVersion {
-  modelId: string;
-  currentVersion: string | null;
-  publishedUpdatedAt: string | null;
-  published: boolean;
-  createdAt: string;
-  firstPublishedAt: string | null;
-  parentId: string | null;
-  position: number | null;
-  stage: string | null;
-  publicationAt: string | null;
-  unpublishingAt: string | null;
-}
-
-/** The version fingerprint of a fully read record. */
-export function stateFingerprint(record: RecordState): string {
-  const version: RecordVersion = {
-    modelId: record.modelId,
-    currentVersion: record.currentVersion,
-    publishedUpdatedAt: record.publishedUpdatedAt,
-    published: record.published !== null,
-    createdAt: record.createdAt,
-    firstPublishedAt: record.firstPublishedAt,
-    parentId: record.parentId,
-    position: record.position,
-    stage: record.stage,
-    publicationAt: record.schedules.publication?.at ?? null,
-    unpublishingAt: record.schedules.unpublishing?.at ?? null,
-  };
-  return hashJson(version);
-}
-
 type NativeRecord = Record<string, unknown> & {
   id: string;
   attributes: Record<string, unknown>;
   meta: Record<string, unknown>;
 };
 
+/** A record's scheduled publication or unpublishing as the CMA returns it. */
+export interface ScheduleResource {
+  id: string;
+  type: string;
+  attributes: JsonObject;
+}
+
+/**
+ * One record as the CMA returns it: its current version, its published
+ * version, and its schedules. This is a line of a dump's `records` entries.
+ */
+export interface RecordLine {
+  id: string;
+  current: unknown;
+  published: unknown | null;
+  scheduledPublication: ScheduleResource | null;
+  scheduledUnpublishing: ScheduleResource | null;
+}
+
 function optionalTimestamp(value: unknown): string | null {
   return typeof value === 'string' ? timestamp(value) : null;
 }
 
-/**
- * The version of a record from its native current resource and, when
- * published, its published resource. A plain listing and a full read yield
- * the same version for the same record.
- */
-function nativeVersion(
-  current: NativeRecord,
-  published: NativeRecord | null,
-): RecordVersion {
-  const { meta, attributes } = current;
-  return {
-    modelId: itemTypeId(current),
-    currentVersion: nullableString(meta.current_version),
-    publishedUpdatedAt: published
-      ? nullableString(published.meta.updated_at)
-      : null,
-    published: published !== null,
-    createdAt: timestamp(meta.created_at as string),
-    firstPublishedAt: optionalTimestamp(meta.first_published_at),
-    parentId: nullableString(attributes.parent_id),
-    position:
-      typeof attributes.position === 'number' ? attributes.position : null,
-    stage: nullableString(meta.stage),
-    publicationAt: optionalTimestamp(meta.publication_scheduled_at),
-    unpublishingAt: optionalTimestamp(meta.unpublishing_scheduled_at),
-  };
-}
+const sortedLocales = (value: unknown) => [...(value as string[])].sort();
 
-/**
- * The version fingerprint of a record from a plain listing of its current
- * version and, when published, its published version.
- */
-export function listingFingerprint(
-  current: unknown,
-  published: unknown | null,
-): string {
-  return hashJson(
-    nativeVersion(current as NativeRecord, published as NativeRecord | null),
-  );
+/** A record's schedules from the resources the CMA returns for them. */
+export function canonicalSchedules(
+  publication: ScheduleResource | null,
+  unpublishing: ScheduleResource | null,
+): Schedules {
+  const selective = publication?.attributes.selective_publication as {
+    content_in_locales: string[];
+    non_localized_content: boolean;
+  } | null;
+  const locales = unpublishing?.attributes.content_in_locales;
+  return {
+    publication: publication
+      ? {
+          at: timestamp(
+            publication.attributes.publication_scheduled_at as string,
+          ),
+          selective: selective
+            ? {
+                locales: sortedLocales(selective.content_in_locales),
+                nonLocalized: selective.non_localized_content,
+              }
+            : null,
+        }
+      : null,
+    unpublishing: unpublishing
+      ? {
+          at: timestamp(
+            unpublishing.attributes.unpublishing_scheduled_at as string,
+          ),
+          locales:
+            locales === null || locales === undefined
+              ? null
+              : sortedLocales(locales),
+        }
+      : null,
+  };
 }
 
 /** A record's state from its native current and published resources. */
@@ -529,33 +499,74 @@ export function canonicalRecord(
   schema: SchemaState,
   schedules: Schedules = { publication: null, unpublishing: null },
 ): RecordState {
-  const native = current as NativeRecord;
+  const { id, meta, attributes } = current as NativeRecord;
   const pub = published as NativeRecord | null;
-  const version = nativeVersion(native, pub);
+  const modelId = itemTypeId(current as NativeRecord);
   const state: RecordState = {
-    id: native.id,
-    modelId: version.modelId,
-    current: canonicalFields(native.attributes, version.modelId, schema),
-    published: pub
-      ? canonicalFields(pub.attributes, version.modelId, schema)
-      : null,
-    currentVersion: version.currentVersion,
-    publishedUpdatedAt: version.publishedUpdatedAt,
-    createdAt: version.createdAt,
-    firstPublishedAt: version.firstPublishedAt,
-    parentId: version.parentId,
-    position: version.position,
-    stage: version.stage,
+    id,
+    modelId,
+    current: canonicalFields(attributes, modelId, schema),
+    published: pub ? canonicalFields(pub.attributes, modelId, schema) : null,
+    currentVersion: nullableString(meta.current_version),
+    publishedUpdatedAt: pub ? nullableString(pub.meta.updated_at) : null,
+    createdAt: timestamp(meta.created_at as string),
+    firstPublishedAt: optionalTimestamp(meta.first_published_at),
+    parentId: nullableString(attributes.parent_id),
+    position:
+      typeof attributes.position === 'number' ? attributes.position : null,
+    stage: nullableString(meta.stage),
     schedules,
     hash: '',
   };
   const invalid = {
-    current: native.meta.is_current_version_valid === false,
-    published: native.meta.is_published_version_valid === false,
+    current: meta.is_current_version_valid === false,
+    published: meta.is_published_version_valid === false,
   };
   if (invalid.current || invalid.published) state.invalid = invalid;
   state.hash = recordHash(state);
   return state;
+}
+
+/** A record's state from a dump or capture line. */
+export function canonicalRecordLine(
+  line: RecordLine,
+  schema: SchemaState,
+): RecordState {
+  return canonicalRecord(
+    line.current,
+    line.published,
+    schema,
+    canonicalSchedules(line.scheduledPublication, line.scheduledUnpublishing),
+  );
+}
+
+/**
+ * The value of a record's `title` or `name` string field, in the first
+ * locale that has one, shortened for labels.
+ */
+export function recordTitle(
+  modelId: string,
+  schema: SchemaState,
+  current: JsonObject | undefined,
+): string | undefined {
+  const fields = modelIndex(schema).get(modelId)?.fields;
+  for (const key of ['title', 'name']) {
+    const field = fields?.find(
+      (field) => field.apiKey === key && field.type === 'string',
+    );
+    if (!field) continue;
+    const value = current?.[key];
+    let title: string | undefined;
+    if (typeof value === 'string') title = value;
+    else if (field.localized && object(value))
+      for (const locale of schema.locales)
+        if (typeof value[locale] === 'string' && value[locale]) {
+          title = value[locale];
+          break;
+        }
+    if (title) return title.length > 121 ? title.slice(0, 121) : title;
+  }
+  return undefined;
 }
 
 /**

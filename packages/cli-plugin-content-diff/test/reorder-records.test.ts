@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'mocha';
 import { ContentError } from '../src/engine/errors';
-import { type ContentMigrationClient, reorderRecords } from '../src/migration';
+import { reorderRecords } from '../src/engine/reorder-records';
+import type { Client } from '../src/engine/types';
 
 interface Row {
   id: string;
@@ -62,7 +63,7 @@ function mockClient(rows: Row[], options: { ignoreMoves?: boolean } = {}) {
       .sort((a, b) => a.position - b.position)
       .map((row) => row.id);
   return {
-    client: client as unknown as ContentMigrationClient,
+    client: client as unknown as Client,
     writes,
     order,
     get listings() {

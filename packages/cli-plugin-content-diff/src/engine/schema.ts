@@ -15,11 +15,13 @@ export function schemaHash(
   });
 }
 
-export async function fetchSchema(
-  client: Client,
-  environmentId: string,
-  project?: (schema: SchemaState) => SchemaState,
-): Promise<SchemaState> {
+/** A schema as the CMA returns it; a dump's `schema.json`. */
+export interface RawSchema {
+  site: Awaited<ReturnType<Client['site']['rawFind']>>;
+  workflows: Awaited<ReturnType<Client['workflows']['list']>>;
+}
+
+export async function readRawSchema(client: Client): Promise<RawSchema> {
   // Every consistency check makes a fresh bulk read. A retained SDK schema
   // cache would hide concurrent changes.
   const results = await Promise.allSettled([
@@ -28,8 +30,24 @@ export async function fetchSchema(
   ]);
   if (results[0].status === 'rejected') throw results[0].reason;
   if (results[1].status === 'rejected') throw results[1].reason;
-  const response = results[0].value;
-  const workflows = results[1].value;
+  return { site: results[0].value, workflows: results[1].value };
+}
+
+export async function fetchSchema(
+  client: Client,
+  environmentId: string,
+  project?: (schema: SchemaState) => SchemaState,
+): Promise<SchemaState> {
+  const schema = schemaFromRaw(await readRawSchema(client), environmentId);
+  return project ? project(schema) : schema;
+}
+
+/** The schema the plugin compares, from what the CMA returns. */
+export function schemaFromRaw(
+  raw: RawSchema,
+  environmentId: string,
+): SchemaState {
+  const { site: response, workflows } = raw;
   const site = {
     ...response.data.attributes,
     id: response.data.id,
@@ -117,7 +135,7 @@ export async function fetchSchema(
     hash: '',
   };
   schema.hash = schemaHash(schema);
-  return project ? project(schema) : schema;
+  return schema;
 }
 
 function rules(value: unknown): Record<string, unknown>[] {

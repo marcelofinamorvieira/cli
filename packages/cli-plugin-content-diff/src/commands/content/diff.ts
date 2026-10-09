@@ -1,18 +1,11 @@
-import { stat } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
-import { camelCase } from 'lodash';
-import { ContentError } from '../../engine/errors';
 import {
   type ContentGenerationResult,
-  generateContentMigration,
+  generateContentDiff,
 } from '../../engine/generation';
-import {
-  DEFAULT_MIGRATION_CHUNK_BYTES,
-  MAX_MIGRATION_CHUNK_BYTES,
-  assertOutputAbsent,
-} from '../../engine/migration-artifact';
 import { KINDS } from '../../engine/types';
+import { outputPath } from '../../utils/command-helpers';
 import { withInterruptHandling } from '../../utils/interruption';
 import { PairedProfileCommand } from '../../utils/paired-profile-command';
 
@@ -20,21 +13,28 @@ type ContentDiffCommandResult = ContentGenerationResult;
 
 export default class ContentDiffCommand extends PairedProfileCommand {
   static description =
-    'Compare DatoCMS environments and generate an editable TypeScript content migration';
+    'Compare a DatoCMS environment or project dump with an environment and write a content diff';
   static examples = [
     '<%= config.bin %> <%= command.id %> syncContent --source=staging --destination=primary',
-    '<%= config.bin %> <%= command.id %> --source=main --destination=main --source-profile=source --destination-profile=target --output=./migrations/content/sync.ts',
+    '<%= config.bin %> <%= command.id %> restore --source-dump=./1791556200_backup.dump-records.zip --destination=main',
+    '<%= config.bin %> <%= command.id %> --source=main --destination=main --source-profile=source --destination-profile=target --output=./sync.zip',
   ];
   static args = {
     NAME: oclif.Args.string({
-      description: 'Migration name used for a timestamped TypeScript filename',
+      description: 'Name used for the timestamped diff file name',
       default: 'contentMigration',
     }),
   };
   static flags = {
     source: oclif.Flags.string({
       description: 'Source environment ID, or "primary"',
-      required: true,
+      exactlyOne: ['source', 'source-dump'],
+    }),
+    'source-dump': oclif.Flags.string({
+      description: 'Project dump to use as the source, from content:export',
+      // --source-api-token needs --source-profile, so it is refused too,
+      // without an error that repeats the token.
+      exclusive: ['source-profile'],
     }),
     destination: oclif.Flags.string({
       description: 'Destination environment ID, or "primary"',
@@ -42,7 +42,7 @@ export default class ContentDiffCommand extends PairedProfileCommand {
     }),
     output: oclif.Flags.string({
       description:
-        'TypeScript file or directory (defaults to the content subdirectory of the destination profile migration directory)',
+        'Diff .zip file, or directory for a timestamped name (defaults to the content subdirectory of the destination profile migration directory)',
     }),
     'source-profile': oclif.Flags.string({
       description: 'Configured source project profile',
@@ -75,7 +75,7 @@ export default class ContentDiffCommand extends PairedProfileCommand {
     }),
     'allow-partial': oclif.Flags.boolean({
       description:
-        'Skip content the generated script cannot reproduce, and the writes that need it, instead of failing',
+        'Skip content the diff cannot reproduce, and the writes that need it, instead of failing',
       default: false,
     }),
     concurrency: oclif.Flags.integer({
@@ -84,20 +84,13 @@ export default class ContentDiffCommand extends PairedProfileCommand {
       min: 1,
       max: 16,
     }),
-    'chunk-bytes': oclif.Flags.integer({
-      description:
-        'Target size of each TypeScript part and baseline chunk file; a single operation is never split',
-      default: DEFAULT_MIGRATION_CHUNK_BYTES,
-      min: 1,
-      max: MAX_MIGRATION_CHUNK_BYTES,
-    }),
   };
 
   async run(): Promise<ContentDiffCommandResult> {
     return withInterruptHandling(
       (signal) => this.runOperation(signal),
       () =>
-        this.progress(
+        this.logToStderr(
           'Interrupted. Waiting for active requests and cleaning up temporary state.',
         ),
     );
@@ -113,12 +106,6 @@ export default class ContentDiffCommand extends PairedProfileCommand {
     const destinationProfile = flags['destination-profile']
       ? this.datoConfig?.profiles[flags['destination-profile']]
       : this.datoProfileConfig;
-    const migrationName = camelCase(args?.NAME ?? 'contentMigration');
-    if (!migrationName)
-      throw new ContentError(
-        'INVALID_MIGRATION_NAME',
-        'The migration name must contain letters or numbers.',
-      );
     const migrationsDirectory = destinationProfile?.migrations?.directory
       ? resolve(
           dirname(this.datoConfigPath ?? resolve('datocms.config.json')),
@@ -126,77 +113,66 @@ export default class ContentDiffCommand extends PairedProfileCommand {
         )
       : resolve('./migrations');
     // The native schema runner scans its directory for timestamped scripts.
-    // Keep plugin-only content scripts below it so they are not auto-discovered.
-    const defaultDirectory = join(migrationsDirectory, 'content');
-    const requestedOutput = flags.output
-      ? resolve(flags.output)
-      : defaultDirectory;
-    // A path with another extension is refused rather than created as a
-    // directory, unless it already is one.
-    const outputIsFile = extname(requestedOutput) === '.ts';
-    if (
-      !outputIsFile &&
-      extname(requestedOutput) &&
-      !(await stat(requestedOutput).then(
-        (entry) => entry.isDirectory(),
-        () => false,
-      ))
-    )
-      throw new ContentError(
-        'INVALID_MIGRATION_PATH',
-        'Content migration output must be a .ts file or a directory.',
-      );
-    const outputPath = outputIsFile
-      ? requestedOutput
-      : join(
-          requestedOutput,
-          `${Math.floor(Date.now() / 1000)}_${migrationName}.ts`,
-        );
-    // Checked again when the files are written; this fails before reading.
-    await assertOutputAbsent(outputPath);
-    const source = await this.endpoint(
-      flags['source-profile'],
-      flags['source-api-token'],
-    );
-    const destination = flags['destination-profile']
-      ? await this.endpoint(
-          flags['destination-profile'],
-          flags['destination-api-token'],
-        )
-      : source;
-    const result = await generateContentMigration({
+    // Keep content diffs below it, where it does not look.
+    const path = await outputPath({
+      output: flags.output,
+      directory: join(migrationsDirectory, 'content'),
+      name: args.NAME,
+      kind: 'diff',
+    });
+    const destination = {
+      endpoint: flags['destination-profile']
+        ? await this.endpoint(
+            flags['destination-profile'],
+            flags['destination-api-token'],
+          )
+        : await this.endpoint(),
+      environment: flags.destination,
+    };
+    const source = flags['source-dump']
+      ? { dump: resolve(flags['source-dump']) }
+      : {
+          endpoint: flags['source-profile']
+            ? await this.endpoint(
+                flags['source-profile'],
+                flags['source-api-token'],
+              )
+            : destination.endpoint,
+          environment: flags.source!,
+        };
+    const result = await generateContentDiff({
       source,
       destination,
-      sourceEnvironment: flags.source,
-      destinationEnvironment: flags.destination,
-      sourceMigrationModelApiKey: sourceProfile?.migrations?.modelApiKey,
+      sourceMigrationModelApiKey: (flags['source-dump']
+        ? destinationProfile
+        : sourceProfile
+      )?.migrations?.modelApiKey,
       destinationMigrationModelApiKey:
         destinationProfile?.migrations?.modelApiKey,
-      outputPath,
+      outputPath: path,
       options: {
         itemTypes: flags['item-types'],
         uploads: flags.uploads,
         includeDeletions: flags['include-deletions'],
         allowPartial: flags['allow-partial'],
         concurrency: flags.concurrency,
-        chunkBytes: flags['chunk-bytes'],
       },
       signal,
-      progress: (message) => this.progress(message),
+      progress: (message) => this.logToStderr(message),
     });
-    if (!this.jsonEnabled()) {
-      this.log(`TypeScript content migration: ${result.scriptPath}`);
-      for (const kind of KINDS)
-        this.log(
-          `${kind}: ${Object.entries(result.counts[kind])
-            .map(([action, count]) => `${count} ${action}`)
-            .join(', ')}`,
-        );
-      for (const skip of result.skipped)
-        this.logToStderr(
-          `Skipped ${skip.kind} ${skip.id} (${skip.code}): ${skip.message}`,
-        );
-    }
+    this.log(
+      `Content diff: ${result.diffPath} (${result.operations} operations)`,
+    );
+    for (const kind of KINDS)
+      this.log(
+        `${kind}: ${Object.entries(result.counts[kind])
+          .map(([action, count]) => `${count} ${action}`)
+          .join(', ')}`,
+      );
+    for (const skip of result.skipped)
+      this.logToStderr(
+        `Skipped ${skip.kind} ${skip.id} (${skip.code}): ${skip.message}`,
+      );
     return result;
   }
 }

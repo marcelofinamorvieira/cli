@@ -1,4 +1,3 @@
-import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { compareIds } from './compare-ids';
 import type { Kind } from './types';
 
@@ -59,44 +58,99 @@ export function* stronglyConnected(
   }
 }
 
-/** Disk-backed Kahn ordering. No recursion, graph-sized queue, or global scan per vertex. */
-export class PlannerGraph {
-  private readonly insertNode: StatementSync;
-  private readonly insertEdge: StatementSync;
+/** A binary min-heap. */
+export class Heap<T> {
+  private readonly items: T[] = [];
 
-  constructor(readonly database: DatabaseSync) {
-    database.exec(`
-      CREATE TEMP TABLE IF NOT EXISTS planner_graph (
-        phase TEXT NOT NULL, owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL,
-        dependency_kind TEXT NOT NULL, dependency_id TEXT NOT NULL,
-        field_id TEXT NOT NULL, reason TEXT NOT NULL,
-        PRIMARY KEY(phase, owner_kind, owner_id, dependency_kind, dependency_id, field_id, reason)
-      ) WITHOUT ROWID;
-      CREATE INDEX IF NOT EXISTS planner_graph_reverse ON planner_graph
-        (phase, dependency_kind, dependency_id, owner_kind, owner_id);
-      CREATE TEMP TABLE IF NOT EXISTS planner_nodes (
-        phase TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
-        degree INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0,
-        rank INTEGER, PRIMARY KEY(phase,kind,id)
-      ) WITHOUT ROWID;
-      CREATE INDEX IF NOT EXISTS planner_nodes_ready ON planner_nodes(phase,done,degree,kind,id);
-    `);
-    // The same bounded pair of statements serves every vertex/edge. Preparing
-    // one per insertion can retain substantial native SQLite memory until GC.
-    this.insertNode = database.prepare(
-      'INSERT OR IGNORE INTO planner_nodes(phase,kind,id) VALUES(?,?,?)',
-    );
-    this.insertEdge = database.prepare(`INSERT OR IGNORE INTO planner_graph
-      (phase,owner_kind,owner_id,dependency_kind,dependency_id,field_id,reason) VALUES(?,?,?,?,?,?,?)`);
+  constructor(private readonly compare: (left: T, right: T) => number) {}
+
+  peek(): T | undefined {
+    return this.items[0];
+  }
+
+  push(item: T): void {
+    const { items } = this;
+    let index = items.push(item) - 1;
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (this.compare(items[parent]!, items[index]!) <= 0) break;
+      [items[parent], items[index]] = [items[index]!, items[parent]!];
+      index = parent;
+    }
+  }
+
+  pop(): T | undefined {
+    const { items } = this;
+    const first = items[0];
+    const last = items.pop();
+    if (!items.length || last === undefined) return first;
+    items[0] = last;
+    for (let index = 0; ; ) {
+      const left = index * 2 + 1;
+      let smallest = index;
+      for (const child of [left, left + 1])
+        if (
+          child < items.length &&
+          this.compare(items[child]!, items[smallest]!) < 0
+        )
+          smallest = child;
+      if (smallest === index) break;
+      [items[smallest], items[index]] = [items[index]!, items[smallest]!];
+      index = smallest;
+    }
+    return first;
+  }
+}
+
+interface Vertex {
+  kind: Kind;
+  id: string;
+  /** Edges to dependencies not ranked yet. */
+  degree: number;
+  done: boolean;
+  rank: number;
+}
+
+/** An edge is identified by its field and reason, as several can join a pair. */
+type Labels = Set<string>;
+const label = (reason: string, fieldId: string) => `${reason}\0${fieldId}`;
+const key = (kind: string, id: string) => `${kind}\0${id}`;
+const byKindAndId = (left: Vertex, right: Vertex) =>
+  compareIds(left.kind, right.kind) || compareIds(left.id, right.id);
+
+interface Phase {
+  vertices: Map<string, Vertex>;
+  /** Owner key, then dependency key, then the labels of their edges. */
+  edges: Map<string, Map<string, Labels>>;
+}
+
+/** Kahn ordering of each planning phase, in memory. */
+export class PlannerGraph {
+  private readonly phases = new Map<string, Phase>();
+
+  private phase(name: string): Phase {
+    let phase = this.phases.get(name);
+    if (!phase) {
+      phase = { vertices: new Map(), edges: new Map() };
+      this.phases.set(name, phase);
+    }
+    return phase;
   }
 
   clear(phase: string): void {
-    this.database.prepare('DELETE FROM planner_graph WHERE phase=?').run(phase);
-    this.database.prepare('DELETE FROM planner_nodes WHERE phase=?').run(phase);
+    this.phases.delete(phase);
   }
 
   node(phase: string, kind: Kind, id: string): void {
-    this.insertNode.run(phase, kind, id);
+    const vertices = this.phase(phase).vertices;
+    if (!vertices.has(key(kind, id)))
+      vertices.set(key(kind, id), {
+        kind,
+        id,
+        degree: 0,
+        done: false,
+        rank: 0,
+      });
   }
 
   edge(
@@ -108,15 +162,43 @@ export class PlannerGraph {
     reason: string,
     fieldId = '',
   ): void {
-    this.insertEdge.run(
-      phase,
-      ownerKind,
-      ownerId,
-      dependencyKind,
-      dependencyId,
-      fieldId,
-      reason,
-    );
+    const edges = this.phase(phase).edges;
+    const owner = key(ownerKind, ownerId);
+    let dependencies = edges.get(owner);
+    if (!dependencies) {
+      dependencies = new Map();
+      edges.set(owner, dependencies);
+    }
+    const dependency = key(dependencyKind, dependencyId);
+    let labels = dependencies.get(dependency);
+    if (!labels) {
+      labels = new Set();
+      dependencies.set(dependency, labels);
+    }
+    labels.add(label(reason, fieldId));
+  }
+
+  /** Removes the edges between two records that `matches` selects. */
+  removeEdges(
+    phase: string,
+    ownerId: string,
+    dependencyId: string,
+    matches: (reason: string, fieldId: string) => boolean,
+  ): void {
+    const labels = this.phases
+      .get(phase)
+      ?.edges.get(key('record', ownerId))
+      ?.get(key('record', dependencyId));
+    if (!labels) return;
+    for (const entry of [...labels]) {
+      const [reason, fieldId] = entry.split('\0') as [string, string];
+      if (matches(reason, fieldId)) labels.delete(entry);
+    }
+  }
+
+  /** Whether a vertex was ranked by the last `order`; undefined if absent. */
+  done(phase: string, kind: Kind, id: string): boolean | undefined {
+    return this.phases.get(phase)?.vertices.get(key(kind, id))?.done;
   }
 
   /**
@@ -126,104 +208,143 @@ export class PlannerGraph {
    * vertex receives a deterministic level and vertices that only wait on a
    * cycle still follow all of its members.
    */
-  order(phase: string, force = false): number {
-    this.database
-      .prepare(`UPDATE planner_nodes SET done=0,rank=0,degree=(
-      SELECT COUNT(*) FROM planner_graph g JOIN planner_nodes d
-        ON d.phase=g.phase AND d.kind=g.dependency_kind AND d.id=g.dependency_id
-      WHERE g.phase=planner_nodes.phase AND g.owner_kind=planner_nodes.kind AND g.owner_id=planner_nodes.id
-    ) WHERE phase=?`)
-      .run(phase);
-    // Without an explicit index, SQLite may prefer the primary key's kind/id
-    // order and scan a whole phase for each ready vertex on long chains.
-    const ready = this.database.prepare(`SELECT kind,id,rank FROM planner_nodes INDEXED BY planner_nodes_ready
-      WHERE phase=? AND done=0 AND degree=0 ORDER BY kind,id LIMIT 1`);
-    const blocked = this.database.prepare(
-      'SELECT kind,id FROM planner_nodes WHERE phase=? AND done=0 ORDER BY degree,kind,id LIMIT 1',
-    );
-    const dependants = this.database.prepare(`SELECT g.owner_kind AS kind,g.owner_id AS id,COUNT(*) AS edges
-      FROM planner_graph g JOIN planner_nodes n ON n.phase=g.phase AND n.kind=g.owner_kind AND n.id=g.owner_id
-      WHERE g.phase=? AND g.dependency_kind=? AND g.dependency_id=? AND n.done=0
-      GROUP BY g.owner_kind,g.owner_id`);
-    const complete = this.database.prepare(
-      'UPDATE planner_nodes SET done=1,rank=? WHERE phase=? AND kind=? AND id=?',
-    );
-    const decrement = this.database.prepare(
-      'UPDATE planner_nodes SET degree=degree-?,rank=MAX(rank,?) WHERE phase=? AND kind=? AND id=? AND done=0',
-    );
-    for (;;) {
-      let next = ready.get(phase);
-      if (!next && force) {
-        const start = blocked.get(phase);
-        if (start)
-          next = this.forced(phase, String(start.kind), String(start.id));
-      }
-      if (!next) break;
-      // Ranks are levels: a vertex runs only after every predecessor's level.
-      // The indexed queue need not collect or sort a whole ready wave to
-      // propagate maximum predecessor levels.
-      const level = Number(next.rank);
-      complete.run(level, phase, next.kind, next.id);
-      for (const dependant of dependants.iterate(phase, next.kind, next.id)) {
-        decrement.run(
-          dependant.edges,
-          level + 1,
-          phase,
-          dependant.kind,
-          dependant.id,
-        );
+  order(name: string, force = false): number {
+    const { vertices, edges } = this.phase(name);
+    // Dependants of each vertex, with how many edges join them.
+    const dependants = new Map<string, Map<string, number>>();
+    for (const vertex of vertices.values()) {
+      vertex.done = false;
+      vertex.rank = 0;
+      vertex.degree = 0;
+    }
+    for (const [owner, dependencies] of edges) {
+      const vertex = vertices.get(owner);
+      if (!vertex) continue;
+      for (const [dependency, labels] of dependencies) {
+        if (!labels.size || !vertices.has(dependency)) continue;
+        vertex.degree += labels.size;
+        let waiting = dependants.get(dependency);
+        if (!waiting) {
+          waiting = new Map();
+          dependants.set(dependency, waiting);
+        }
+        waiting.set(owner, labels.size);
       }
     }
-    return Number(
-      this.database
-        .prepare(
-          'SELECT COUNT(*) AS count FROM planner_nodes WHERE phase=? AND done=0',
-        )
-        .get(phase)?.count ?? 0,
+    const ready = [...vertices.values()].filter((vertex) => !vertex.degree);
+    // Unfinished vertices by pending dependencies, for `forced`. An entry is
+    // stale once its vertex is done or its degree has changed since.
+    const blocked = new Heap<[number, Vertex]>(
+      ([leftDegree, left], [rightDegree, right]) =>
+        leftDegree - rightDegree || byKindAndId(left, right),
     );
+    if (force)
+      for (const vertex of vertices.values())
+        if (vertex.degree) blocked.push([vertex.degree, vertex]);
+    let remaining = vertices.size;
+    for (;;) {
+      let next = ready.pop();
+      if (!next && force && remaining) {
+        for (
+          let [degree, start] = blocked.peek()!;
+          start.done || degree !== start.degree;
+          [degree, start] = blocked.peek()!
+        )
+          blocked.pop();
+        next = this.forced(name, blocked.peek()![1]);
+      }
+      if (!next) break;
+      // Ranks are levels: a vertex runs only after every predecessor's level,
+      // so the order in which ready vertices are taken does not matter.
+      next.done = true;
+      remaining--;
+      for (const [owner, count] of dependants.get(key(next.kind, next.id)) ??
+        []) {
+        const vertex = vertices.get(owner)!;
+        if (vertex.done) continue;
+        vertex.degree -= count;
+        vertex.rank = Math.max(vertex.rank, next.rank + 1);
+        if (!vertex.degree) ready.push(vertex);
+        else if (force) blocked.push([vertex.degree, vertex]);
+      }
+    }
+    return remaining;
+  }
+
+  private pending(phase: Phase, vertex: string): string[] {
+    return [...(phase.edges.get(vertex) ?? [])]
+      .filter(
+        ([dependency, labels]) =>
+          labels.size && phase.vertices.get(dependency)?.done === false,
+      )
+      .map(([dependency]) => dependency)
+      .sort(compareIds);
   }
 
   /**
    * The vertex to rank when every unfinished vertex waits on another one: the
    * member with the fewest pending dependencies of a cycle whose members wait
    * on nothing outside it. Tarjan's search follows unfinished dependencies
-   * from `kind`/`id`, and the first strongly connected component it completes
-   * is such a cycle, so no vertex is ranked before a dependency outside its
-   * own cycle. The search only holds the vertices it reaches.
+   * from `start`, the unfinished vertex with the fewest pending dependencies,
+   * and the first strongly connected component it completes is such a cycle,
+   * so no vertex is ranked before a dependency outside its own cycle.
    */
-  private forced(phase: string, kind: string, id: string) {
-    const dependencies = this.database.prepare(`SELECT DISTINCT g.dependency_kind AS kind,g.dependency_id AS id
-      FROM planner_graph g JOIN planner_nodes d ON d.phase=g.phase AND d.kind=g.dependency_kind AND d.id=g.dependency_id
-      WHERE g.phase=? AND g.owner_kind=? AND g.owner_id=? AND d.done=0 ORDER BY 1,2`);
-    const vertex = this.database.prepare(
-      'SELECT kind,id,rank,degree FROM planner_nodes WHERE phase=? AND kind=? AND id=?',
+  private forced(name: string, start: Vertex): Vertex {
+    const phase = this.phase(name);
+    const [first] = stronglyConnected([key(start.kind, start.id)], (vertex) =>
+      this.pending(phase, vertex),
     );
-    const [first] = stronglyConnected([`${kind}\0${id}`], (key) =>
-      dependencies
-        .all(phase, ...key.split('\0'))
-        .map((row) => `${row.kind}\0${row.id}`),
-    );
-    const members = first!.map((key) => vertex.get(phase, ...key.split('\0'))!);
-    members.sort(
-      (left, right) =>
-        Number(left.degree) - Number(right.degree) ||
-        compareIds(String(left.kind), String(right.kind)) ||
-        compareIds(String(left.id), String(right.id)),
-    );
-    return members[0]!;
+    return first!
+      .map((member) => phase.vertices.get(member)!)
+      .sort(
+        (left, right) => left.degree - right.degree || byKindAndId(left, right),
+      )[0]!;
   }
 
-  *ranks(phase: string): Generator<{ kind: Kind; id: string; rank: number }> {
-    for (const row of this.database
-      .prepare(
-        'SELECT kind,id,rank FROM planner_nodes WHERE phase=? AND done=1 ORDER BY rank,kind,id',
-      )
-      .iterate(phase)) {
-      yield {
-        kind: row.kind as Kind,
-        id: String(row.id),
-        rank: Number(row.rank),
-      };
+  /** Ranked vertices by rank, kind and ID. */
+  ranks(phase: string): Array<{ kind: Kind; id: string; rank: number }> {
+    return [...(this.phases.get(phase)?.vertices.values() ?? [])]
+      .filter((vertex) => vertex.done)
+      .sort((left, right) => left.rank - right.rank || byKindAndId(left, right))
+      .map(({ kind, id, rank }) => ({ kind, id, rank }));
+  }
+
+  /** Edges between vertices the last `order` left unranked, by owner and dependency. */
+  *unresolvedEdges(
+    phase: string,
+  ): Generator<{ ownerId: string; dependencyId: string; reason: string }> {
+    const { vertices, edges } = this.phase(phase);
+    const rows: Array<{
+      ownerId: string;
+      dependencyId: string;
+      reason: string;
+    }> = [];
+    for (const [owner, dependencies] of edges) {
+      const ownerVertex = vertices.get(owner);
+      if (!ownerVertex || ownerVertex.done || ownerVertex.kind !== 'record')
+        continue;
+      for (const [dependency, labels] of dependencies) {
+        const dependencyVertex = vertices.get(dependency);
+        if (
+          !dependencyVertex ||
+          dependencyVertex.done ||
+          dependencyVertex.kind !== 'record' ||
+          dependency === owner
+        )
+          continue;
+        for (const entry of labels)
+          rows.push({
+            ownerId: ownerVertex.id,
+            dependencyId: dependencyVertex.id,
+            reason: entry.split('\0')[0]!,
+          });
+      }
     }
+    rows.sort(
+      (left, right) =>
+        compareIds(left.ownerId, right.ownerId) ||
+        compareIds(left.dependencyId, right.dependencyId),
+    );
+    yield* rows;
   }
 }

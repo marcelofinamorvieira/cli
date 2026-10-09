@@ -1,80 +1,38 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { pbkdf2 } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
+import { join } from 'node:path';
 import { CmaClient } from '@datocms/cli-utils';
-import { describe, it } from 'mocha';
-import { ContentError } from '../src/engine/errors';
-import { cmaFailure, runTrackedMigration } from '../src/engine/execution';
-import { runMigrationPart } from '../src/migration';
-
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((complete) => {
-    resolve = complete;
-  });
-  return { promise, resolve };
-}
-
-const json = (
-  status: number,
-  body: unknown,
-  headers: Record<string, string> = {},
-) =>
-  new Response(JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json', ...headers },
-  });
-
-const recordData = (id: string) => ({
-  id,
-  type: 'item',
-  attributes: {},
-  relationships: {
-    item_type: { data: { id: 'model', type: 'item_type' } },
-  },
-  meta: { current_version: '1' },
-});
-
-const record = (id: string) => json(200, { data: recordData(id) });
-
-/** A fake CMA transport that records requests and can hold them open. */
-function transport() {
-  const requests: string[] = [];
-  const settled: string[] = [];
-  let gate: Promise<void> | undefined;
-  const fetchFn: typeof fetch = async (input, init) => {
-    const label = `${init?.method ?? 'GET'} ${new URL(String(input)).pathname}`;
-    requests.push(label);
-    if (gate) await gate;
-    settled.push(label);
-    return record(label.split('/').at(-1)!);
-  };
-  return {
-    requests,
-    settled,
-    fetchFn,
-    hold() {
-      const pending = deferred();
-      gate = pending.promise;
-      return () => {
-        gate = undefined;
-        pending.resolve();
-      };
-    },
-  };
-}
-
-const build = (fetchFn: typeof fetch) =>
-  CmaClient.buildClient({
-    apiToken: 'local-mock-only',
-    environment: 'fork',
-    autoRetry: false,
-    fetchFn,
-  });
+import { after, before, describe, it } from 'mocha';
+import {
+  canonicalUpload,
+  collectionHash,
+  recordHash,
+} from '../src/engine/codec';
+import { DiffFile, type DiffManifest } from '../src/engine/diff-file';
+import {
+  ContentError,
+  DESTINATION_CHANGED_MESSAGE,
+} from '../src/engine/errors';
+import {
+  assertExpectations,
+  cmaFailure,
+  runOperations,
+} from '../src/engine/execution';
+import type { Operation } from '../src/engine/operations';
+import { schemaHash } from '../src/engine/schema';
+import type {
+  Client,
+  CollectionState,
+  RecordState,
+  SchemaState,
+  UploadState,
+} from '../src/engine/types';
+import { ZipWriter } from '../src/engine/zip';
+import { cmaFixture } from './cma-fixture';
+import { fixtureId as id } from './fixture-id';
+import { content, diff, run, writeTestDiff } from './pipeline';
 
 const apiError = (status: number, url: string, errors: unknown[]) =>
   new CmaClient.ApiError({
@@ -87,351 +45,182 @@ const apiError = (status: number, url: string, errors: unknown[]) =>
     },
   });
 
-describe('tracked migration execution', () => {
-  it('drains an in-flight write on interrupt, rejects later writes and lets reads continue', async () => {
-    const fake = transport();
-    const controller = new AbortController();
-    const interruption = Object.assign(
-      new ContentError(
-        'INTERRUPTED',
-        'Content operation interrupted by SIGINT.',
-      ),
-      { exitCode: 130 },
-    );
-    const release = fake.hold();
-    let laterWrite: unknown;
-    const execution = runTrackedMigration(
-      async (client) => {
-        await client.items.update('first', { title: 'one' });
-        await client.items.find('still-readable');
-        try {
-          await client.items.update('second', { title: 'two' });
-        } catch (error) {
-          laterWrite = error;
-          throw error;
-        }
-      },
-      build,
-      controller.signal,
-      fake.fetchFn,
-    );
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(fake.requests, ['PUT /items/first']);
-    controller.abort(interruption);
-    let finished = false;
-    void execution.catch(() => {
-      finished = true;
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(finished, false, 'the runner must wait for the write');
-    release();
-    await assert.rejects(execution, (error) => error === interruption);
-    assert.equal(laterWrite, interruption);
-    assert.deepEqual(fake.settled, [
-      'PUT /items/first',
-      'GET /items/still-readable',
-    ]);
-  });
-
-  it('waits for a call the callback did not await before completing', async () => {
-    const fake = transport();
-    const release = fake.hold();
-    const execution = runTrackedMigration(
-      async (client) => {
-        void client.items.update('unawaited', { title: 'late' });
-      },
-      build,
-      undefined,
-      fake.fetchFn,
-    );
-    let finished = false;
-    void execution.then(() => {
-      finished = true;
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(finished, false);
-    release();
-    await execution;
-    assert.deepEqual(fake.settled, ['PUT /items/unawaited']);
-  });
-
-  it('waits for a part the callback did not await, even while file I/O is slow', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'content-execution-'));
-    const script = join(directory, 'migration.ts');
-    await writeFile(script, '');
-    await mkdir(join(directory, 'migration.content', 'parts'), {
-      recursive: true,
-    });
-    await writeFile(
-      join(directory, 'migration.content', 'parts', 'part.ts'),
-      "export default async (client: any) => { await client.items.update('from-part', { title: 'late' }); };",
-    );
-    // Occupy libuv's thread pool so asynchronous file I/O completes late.
-    const busy = Array.from(
-      { length: 8 },
-      () =>
-        new Promise((resolve) =>
-          pbkdf2('busy', 'salt', 300_000, 32, 'sha256', resolve),
-        ),
-    );
-    const fake = transport();
-    try {
-      await runTrackedMigration(
-        async (client) => {
-          void runMigrationPart(client, script, 'part.ts');
+const MODEL = id('execution-model');
+const DATE = '2025-01-01T00:00:00.000Z';
+const SCHEMA: SchemaState = {
+  siteId: 'site',
+  environmentId: 'source',
+  locales: ['en'],
+  semantics: {},
+  workflows: [],
+  hash: '',
+  models: [
+    {
+      id: MODEL,
+      apiKey: 'article',
+      name: 'Article',
+      block: false,
+      singleton: false,
+      sortable: false,
+      tree: false,
+      draftMode: true,
+      saveInvalidDrafts: false,
+      allLocalesRequired: false,
+      workflowId: null,
+      fields: [
+        {
+          id: id('execution-title'),
+          apiKey: 'title',
+          type: 'string',
+          localized: false,
+          validators: {},
+          defaultValue: null,
         },
-        build,
-        undefined,
-        fake.fetchFn,
-      );
-      assert.deepEqual(fake.settled, ['PUT /items/from-part']);
-    } finally {
-      await Promise.all(busy);
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
+      ],
+    },
+  ],
+};
+SCHEMA.hash = schemaHash(SCHEMA);
 
-  it('settles every request before reporting a callback failure', async () => {
-    const fake = transport();
-    const release = fake.hold();
-    const failure = new Error('script failed');
-    const execution = runTrackedMigration(
-      async (client) => {
-        void client.items.update('pending', {});
-        throw failure;
-      },
-      build,
-      undefined,
-      fake.fetchFn,
-    );
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(fake.settled, []);
-    release();
-    await assert.rejects(execution, (error) => error === failure);
-    assert.deepEqual(fake.settled, ['PUT /items/pending']);
-  });
+function record(name: string, title = name): RecordState {
+  const state: RecordState = {
+    id: id(name),
+    modelId: MODEL,
+    current: { title },
+    published: null,
+    currentVersion: `v-${name}`,
+    publishedUpdatedAt: null,
+    createdAt: DATE,
+    firstPublishedAt: null,
+    parentId: null,
+    position: null,
+    stage: null,
+    schedules: { publication: null, unpublishing: null },
+    hash: '',
+  };
+  state.hash = recordHash(state);
+  return state;
+}
 
-  it('waits for a call that is waiting to poll its job', async () => {
-    const requests: string[] = [];
-    const fetchFn: typeof fetch = async (input, init) => {
-      const { pathname } = new URL(String(input));
-      requests.push(`${init?.method ?? 'GET'} ${pathname}`);
-      return pathname === '/items/x'
-        ? json(202, { data: { id: 'job', type: 'job' } })
-        : json(200, {
-            data: {
-              id: 'job',
-              type: 'job_result',
-              attributes: { status: 200, payload: { data: recordData('x') } },
-            },
-          });
-    };
-    await runTrackedMigration(
-      async (client) => {
-        // The 202 settles at once; the SDK then waits before polling.
-        void client.items.destroy('x');
-      },
-      build,
-      undefined,
-      fetchFn,
-    );
-    assert.deepEqual(requests, ['DELETE /items/x', 'GET /job-results/job']);
+function upload(name: string, notes: string): UploadState {
+  return canonicalUpload({
+    id: id(name),
+    basename: name,
+    filename: `${name}.svg`,
+    md5: createHash('md5').update(name).digest('hex'),
+    size: name.length,
+    url: `https://assets.example.test/${name}.svg`,
+    upload_collection: null,
+    author: null,
+    copyright: null,
+    notes,
+    tags: [],
   });
+}
 
-  it('waits for a rate-limited call through its retry, awaited or not', async () => {
-    const requests: string[] = [];
-    const fetchFn: typeof fetch = async (input, init) => {
-      const { pathname } = new URL(String(input));
-      requests.push(`${init?.method ?? 'GET'} ${pathname}`);
-      return requests.length % 2
-        ? json(429, {}, { 'x-ratelimit-reset': '1' })
-        : record(pathname.split('/').at(-1)!);
-    };
-    const retrying = (fetchFn: typeof fetch) =>
-      CmaClient.buildClient({
-        apiToken: 'local-mock-only',
-        environment: 'fork',
-        fetchFn,
-      });
-    await runTrackedMigration(
-      async (client) => {
-        await client.items.update('awaited', {});
-      },
-      retrying,
-      undefined,
-      fetchFn,
-    );
-    assert.deepEqual(requests, ['PUT /items/awaited', 'PUT /items/awaited']);
-    let retried: unknown;
-    await runTrackedMigration(
-      async (client) => {
-        void client.items.update('floating', {}).then((item) => {
-          retried = item.id;
-        });
-      },
-      retrying,
-      undefined,
-      fetchFn,
-    );
-    assert.deepEqual(requests.slice(2), [
-      'PUT /items/floating',
-      'PUT /items/floating',
-    ]);
-    assert.equal(retried, 'floating');
-  });
+function folder(name: string, label: string, position: number) {
+  const state: CollectionState = {
+    id: id(name),
+    label,
+    parentId: null,
+    position,
+    hash: '',
+  };
+  state.hash = collectionHash(state);
+  return state;
+}
 
-  it('keeps rejections of unawaited calls from ending the process before cleanup', async () => {
-    const execution = resolve(__dirname, '../src/engine/execution.ts');
-    const script = `
-      const { setTimeout: delay } = require('node:timers/promises');
-      const { CmaClient } = require('@datocms/cli-utils');
-      const { runTrackedMigration } = require(${JSON.stringify(execution)});
-      const fetchFn = async (input, init) => {
-        const { pathname } = new URL(String(input));
-        const id = pathname.split('/').at(-1);
-        if (id === 'invalid')
-          return new Response(JSON.stringify({ data: [{ id: 'e', type: 'api_error', attributes: { code: 'INVALID_FIELD', details: {} } }] }), { status: 422, headers: { 'content-type': 'application/json' } });
-        return new Response(JSON.stringify({ data: { id, type: 'item', attributes: {}, relationships: { item_type: { data: { id: 'model', type: 'item_type' } } }, meta: {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
-      };
-      const build = (fetchFn) => CmaClient.buildClient({ apiToken: 'local-mock-only', environment: 'fork', autoRetry: false, fetchFn });
-      const attempt = async (run) => {
-        try {
-          await runTrackedMigration(run, build, undefined, fetchFn);
-          return 'completed';
-        } catch (error) {
-          await delay(50);
-          return error.code + ': ' + error.message;
-        }
-      };
-      (async () => {
-        const chained = await attempt(async (client) => {
-          void (async () => {
-            await client.items.find('a');
-            await client.items.update('a', {});
-          })();
-        });
-        const failed = await attempt(async (client) => {
-          void client.items.update('invalid', {});
-          await delay(20);
-        });
-        const rawRequest = await attempt(async (client) => {
-          void client.request({ method: 'PUT', url: '/items/invalid', body: {} });
-          await delay(20);
-          await client.items.find('a');
-        });
-        const rawMethod = await attempt(async (client) => {
-          void client.uploadCollections.rawDestroy('invalid');
-          await delay(20);
-          await client.items.find('a');
-        });
-        const handledLate = await attempt(async (client) => {
-          const update = client.items.update('invalid', {});
-          await delay(20);
-          await update.catch(() => undefined);
-        });
-        process.stdout.write(JSON.stringify({
-          chained,
-          failed,
-          rawRequest,
-          rawMethod,
-          handledLate,
-          listeners: process.listenerCount('unhandledRejection'),
-        }));
-      })();
-    `;
-    const child = spawn(
-      process.execPath,
-      ['--require', 'ts-node/register/transpile-only', '-e', script],
-      { cwd: resolve(__dirname, '..'), stdio: ['ignore', 'pipe', 'pipe'] },
-    );
-    let output = '';
-    let errors = '';
-    child.stdout.on('data', (data: Buffer) => {
-      output += data.toString();
-    });
-    child.stderr.on('data', (data: Buffer) => {
-      errors += data.toString();
-    });
-    const code = await new Promise<number | null>((complete, reject) => {
-      child.once('error', reject);
-      child.once('exit', complete);
-    });
-    assert.equal(code, 0, errors);
-    const result = JSON.parse(output);
-    // Unawaited calls that succeed are waited for, not reported.
-    assert.equal(result.chained, 'completed');
-    assert.equal(
-      result.failed,
-      'UNAWAITED_MIGRATION_CALL: A call the migration did not await failed: The CMA rejected PUT /items/invalid: INVALID_FIELD. Await every client call.',
-    );
-    // Calls that hand the SDK request promise straight to the script.
-    assert.equal(
-      result.rawRequest,
-      'UNAWAITED_MIGRATION_CALL: A call the migration did not await failed: The CMA rejected PUT /items/invalid: INVALID_FIELD. Await every client call.',
-    );
-    assert.equal(
-      result.rawMethod,
-      'UNAWAITED_MIGRATION_CALL: A call the migration did not await failed: The CMA rejected DELETE /upload-collections/invalid: INVALID_FIELD. Await every client call.',
-    );
-    // Awaiting a call after it failed handles its rejection.
-    assert.equal(result.handledLate, 'completed');
-    assert.equal(result.listeners, 0);
-  }).timeout(120_000);
-
-  it('completes a script that leaves a paged listing early while queued page reads are in flight', async () => {
-    const requests: string[] = [];
-    const fetchFn: typeof fetch = async (input) => {
-      const url = new URL(String(input));
-      const offset = Number(url.searchParams.get('page[offset]') ?? 0);
-      requests.push(`GET ${url.pathname} ${offset}`);
-      // The last page is still loading when the script returns.
-      if (offset === 2) await delay(30);
-      return json(200, {
-        data: [recordData(`r${offset}`)],
-        meta: { total_count: 3 },
-      });
-    };
-    let found: string | undefined;
-    await runTrackedMigration(
-      async (client) => {
-        for await (const item of client.items.listPagedIterator(
-          {},
-          { perPage: 1 },
-        )) {
-          if (item.id === 'r1') {
-            found = item.id;
-            break;
-          }
-        }
-      },
-      build,
-      undefined,
-      fetchFn,
-    );
-    assert.equal(found, 'r1');
-    assert.deepEqual(requests, [
-      'GET /items 0',
-      'GET /items 1',
-      'GET /items 2',
-    ]);
-  });
-
-  it('completes awaited scripts without inventing failures', async () => {
-    const fake = transport();
-    await runTrackedMigration(
-      async (client) => {
-        await Promise.all([
-          client.items.update('a', {}),
-          client.items.update('b', {}),
-        ]);
-      },
-      build,
-      undefined,
-      fake.fetchFn,
-    );
-    assert.deepEqual(fake.settled.sort(), ['PUT /items/a', 'PUT /items/b']);
-  });
+/**
+ * The diff updates a record, an upload and a folder, and creates one of
+ * each; `other` and `still` are the same on both sides.
+ */
+const target = content({
+  records: [record('kept', 'Old'), record('other')],
+  uploads: [upload('photo', 'old'), upload('still', 'same')],
+  collections: [folder('archive', 'Archive', 1)],
 });
+const source = content({
+  records: [record('kept', 'New'), record('other'), record('fresh')],
+  uploads: [
+    upload('photo', 'new'),
+    upload('still', 'same'),
+    upload('added', 'new'),
+  ],
+  collections: [folder('archive', 'Renamed', 1), folder('media', 'Media', 2)],
+});
+const targetSchema = { ...SCHEMA, environmentId: 'target' };
+
+let directory: string;
+let diffPath: string;
+let operations: Operation[];
+let manifest: DiffManifest;
+let diffs = 0;
+/**
+ * Writes hand-written lines, and the files they upload, as a diff with the
+ * generated diff's manifest. Lines are written as they are, valid or not.
+ */
+async function linesDiff(
+  lines: unknown[],
+  files: Record<string, string> = {},
+): Promise<string> {
+  const path = join(directory, `lines-${++diffs}.diff-records.zip`);
+  const zip = new ZipWriter(path);
+  zip.addBuffer(
+    'operations/000001.jsonl',
+    lines.map((line) => `${JSON.stringify(line)}\n`).join(''),
+  );
+  for (const [name, contents] of Object.entries(files))
+    zip.addBuffer(name, contents);
+  zip.addBuffer(
+    'manifest.json',
+    JSON.stringify({ ...manifest, operations: lines.length }),
+  );
+  await zip.close();
+  return path;
+}
+
+async function useDiff<T>(
+  path: string,
+  use: (file: DiffFile) => Promise<T>,
+): Promise<T> {
+  const file = await DiffFile.open(path);
+  try {
+    return await use(file);
+  } finally {
+    file.close();
+  }
+}
+
+const check = (client: Client, path = diffPath) =>
+  useDiff(path, (file) => assertExpectations(client, file, { concurrency: 2 }));
+const execute = (
+  client: Client,
+  path: string,
+  options: Parameters<typeof runOperations>[2] = {},
+) => useDiff(path, (file) => runOperations(client, file, options));
+
+/** A client that records every call and answers with `answers`. */
+function recorder(answers: Record<string, (...args: any[]) => unknown> = {}) {
+  const calls: Array<[string, ...unknown[]]> = [];
+  const resource = (name: string) =>
+    new Proxy(
+      {},
+      {
+        get:
+          (_, method) =>
+          async (...args: unknown[]) => {
+            const call = `${name}.${String(method)}`;
+            calls.push([call, ...args]);
+            return answers[call]?.(...args);
+          },
+      },
+    );
+  const client = new Proxy(
+    {},
+    { get: (_, name) => resource(String(name)) },
+  ) as Client;
+  return { client, calls };
+}
 
 describe('CMA failure reporting', () => {
   it('names the request, error codes and field validations of a 422', () => {
@@ -458,7 +247,7 @@ describe('CMA failure reporting', () => {
     assert.equal(error.code, 'CMA_VALIDATION_FAILED');
     assert.equal(
       error.message,
-      'The CMA rejected PUT /items/abc: INVALID_FIELD (slug: VALIDATION_UNIQUE); INVALID_FIELD (author: VALIDATION_ITEM_ITEM_TYPE). A unique value may still be held by another record; reorder or edit the script so that record releases it first. A referenced record or asset may be missing or unpublished; make sure the script creates or publishes it first.',
+      'The CMA rejected PUT /items/abc: INVALID_FIELD (slug: VALIDATION_UNIQUE); INVALID_FIELD (author: VALIDATION_ITEM_ITEM_TYPE). A unique value may still be held by another record; reorder or edit the diff so that record releases it first. A referenced record or asset may be missing or unpublished; make sure the diff creates or publishes it first.',
     );
     assert.deepEqual(error.details, {
       method: 'PUT',
@@ -488,9 +277,9 @@ describe('CMA failure reporting', () => {
       ]),
     ) as ContentError;
     assert.equal(error.code, 'RECORD_CHANGED_DURING_APPLY');
-    assert.match(
+    assert.equal(
       error.message,
-      /^Record abc was modified by someone else while the migration was running\./,
+      'Record abc was modified by someone else while the diff was running.',
     );
   });
 
@@ -532,5 +321,602 @@ describe('CMA failure reporting', () => {
     });
     const plain = new Error('plain');
     assert.equal(cmaFailure(plain), plain);
+  });
+});
+
+describe('content diff execution', () => {
+  before(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'content-execution-test-'));
+    const generated = await diff({
+      source,
+      target,
+      sourceSchema: SCHEMA,
+      targetSchema,
+      options: {
+        modelIds: [MODEL],
+        uploads: 'all',
+        includeDeletions: false,
+        allowPartial: false,
+      },
+    });
+    operations = generated.operations;
+    diffPath = await writeTestDiff(directory, generated.plan, operations);
+    manifest = await useDiff(diffPath, async (file) => file.manifest);
+  });
+  after(() => rm(directory, { recursive: true, force: true }));
+
+  describe('destination expectations', () => {
+    it('passes when everything the diff touches is as expected, and compares nothing else', async () => {
+      // Only the first operation on an existing entity carries what it expects.
+      assert.deepEqual(
+        operations.flatMap((operation) =>
+          operation.expect ? [[operation.op, operation.id]] : [],
+        ),
+        [
+          ['folder.update', id('archive')],
+          ['upload.update', id('photo')],
+          ['record.update', id('kept')],
+        ],
+      );
+      const fixture = cmaFixture(target, targetSchema, source);
+      fixture.records.get(id('other'))!.currentVersion = 'edited';
+      fixture.uploads.get(id('still'))!.attributes.notes = 'edited';
+      assert.equal(await check(fixture.client), operations.length);
+    });
+
+    const cases: Array<
+      [
+        string,
+        (fixture: ReturnType<typeof cmaFixture>) => void,
+        { kind: string; id: string; reason: string },
+      ]
+    > = [
+      [
+        'a record edited',
+        ({ records }) => {
+          records.get(id('kept'))!.currentVersion = 'edited';
+        },
+        { kind: 'record', id: id('kept'), reason: 'changed' },
+      ],
+      [
+        'a record published',
+        ({ records }) => {
+          Object.assign(records.get(id('kept'))!, {
+            published: { title: 'Old' },
+            publishedUpdatedAt: DATE,
+          });
+        },
+        { kind: 'record', id: id('kept'), reason: 'changed' },
+      ],
+      [
+        'a record deleted',
+        ({ records }) => records.delete(id('kept')),
+        { kind: 'record', id: id('kept'), reason: 'removed' },
+      ],
+      [
+        'a record created under an ID the diff creates',
+        ({ records }) =>
+          records.set(id('fresh'), { ...record('other'), id: id('fresh') }),
+        { kind: 'record', id: id('fresh'), reason: 'added' },
+      ],
+      [
+        'an upload edited',
+        ({ uploads }) => {
+          uploads.get(id('photo'))!.attributes.notes = 'edited';
+        },
+        { kind: 'upload', id: id('photo'), reason: 'changed' },
+      ],
+      [
+        'an upload deleted',
+        ({ uploads }) => uploads.delete(id('photo')),
+        { kind: 'upload', id: id('photo'), reason: 'removed' },
+      ],
+      [
+        'an upload created under an ID the diff creates',
+        ({ uploads }) =>
+          uploads.set(id('added'), {
+            ...upload('still', 'x'),
+            id: id('added'),
+          }),
+        { kind: 'upload', id: id('added'), reason: 'added' },
+      ],
+      [
+        'a folder renamed',
+        ({ folders }) => {
+          folders.get(id('archive'))!.label = 'Edited';
+        },
+        { kind: 'collection', id: id('archive'), reason: 'changed' },
+      ],
+      [
+        'a folder deleted',
+        ({ folders }) => folders.delete(id('archive')),
+        { kind: 'collection', id: id('archive'), reason: 'removed' },
+      ],
+      [
+        'a folder created under an ID the diff creates',
+        ({ folders }) =>
+          folders.set(id('media'), folder('media', 'Someone else', 2)),
+        { kind: 'collection', id: id('media'), reason: 'added' },
+      ],
+    ];
+    for (const [change, apply, details] of cases)
+      it(`reports ${change} with the same instruction`, async () => {
+        const fixture = cmaFixture(target, targetSchema, source);
+        apply(fixture);
+        await assert.rejects(check(fixture.client), (error: ContentError) => {
+          assert.equal(error.code, 'DESTINATION_CHANGED');
+          assert.equal(error.message, DESTINATION_CHANGED_MESSAGE);
+          assert.deepEqual(error.details, details);
+          return true;
+        });
+        assert.deepEqual(fixture.events, []);
+      });
+
+    it('reads records and uploads by ID in batches of 100, and folders only when the diff touches them', async () => {
+      const lines = [
+        ...Array.from({ length: 150 }, (_, index) => ({
+          op: 'record.create',
+          id: `r${index}`,
+          label: `Create r${index}`,
+          data: {},
+        })),
+        {
+          op: 'upload.update',
+          id: 'u',
+          label: 'Update u',
+          expect: { hash: 'h' },
+          data: {},
+        },
+      ];
+      const { client, calls } = recorder({
+        'items.rawList': () => ({ data: [] }),
+        'uploads.list': () => [],
+      });
+      await assert.rejects(
+        check(client, await linesDiff(lines)),
+        (error: ContentError) => error.code === 'DESTINATION_CHANGED',
+      );
+      const queries = calls
+        .filter(([method]) => method === 'items.rawList')
+        .map(([, query]) => {
+          const { filter, version, page } = query as {
+            filter: { ids: string };
+            version: string;
+            page: { limit: number };
+          };
+          return [filter.ids.split(',').length, version, page.limit];
+        });
+      assert.deepEqual(
+        queries.sort(),
+        [
+          [100, 'current', 100],
+          [100, 'published', 100],
+          [50, 'current', 50],
+          [50, 'published', 50],
+        ].sort(),
+      );
+      assert.deepEqual(
+        calls.filter(([method]) => method !== 'items.rawList'),
+        [['uploads.list', { filter: { ids: 'u' }, page: { limit: 1 } }]],
+      );
+    });
+
+    it('refuses an invalid line before reading or writing anything', async () => {
+      const valid = {
+        op: 'record.update',
+        id: 'r',
+        label: 'Update r',
+        expect: { currentVersion: '1', publishedUpdatedAt: null },
+        data: { title: 'x' },
+      };
+      for (const [line, problem] of [
+        [
+          { op: 'record.explode', label: 'x' },
+          'unknown operation "record.explode".',
+        ],
+        [
+          { op: 'record.update', id: 'r', label: 'x' },
+          '"data" must be an object.',
+        ],
+        [{ op: 'record.publish', label: 'x' }, '"id" must be a DatoCMS ID.'],
+        [
+          { ...valid, op: 'record.create' },
+          '"expect" does not fit the operation.',
+        ],
+        [
+          { op: 'upload.create', id: 'u', label: 'x', data: {}, md5: 'm' },
+          '"file" or "url" must be a string.',
+        ],
+        [
+          {
+            op: 'upload.create',
+            id: 'u',
+            label: 'x',
+            data: {},
+            md5: 'm',
+            file: 'assets/u/missing.svg',
+          },
+          'the diff has no file assets/u/missing.svg.',
+        ],
+      ] as const) {
+        const { client, calls } = recorder();
+        await assert.rejects(
+          check(client, await linesDiff([valid, line])),
+          (error: ContentError) => {
+            assert.equal(error.code, 'INVALID_DIFF');
+            assert.equal(
+              error.message,
+              `operations/000001.jsonl line 2: ${problem}`,
+            );
+            assert.deepEqual(error.details, {
+              where: 'operations/000001.jsonl line 2',
+            });
+            return true;
+          },
+        );
+        assert.deepEqual(calls, []);
+      }
+    });
+  });
+
+  describe('running operations', () => {
+    it('runs every operation in order through its SDK call', async () => {
+      const md5 = { md5: 'ABCDEF' };
+      const lines = [
+        { op: 'folder.create', id: 'f', label: '1', data: { label: 'F' } },
+        { op: 'folder.update', id: 'f', label: '2', data: { label: 'G' } },
+        { op: 'folders.reorder', label: '3', data: [{ id: 'f' }] },
+        {
+          op: 'upload.create',
+          id: 'u',
+          label: '4',
+          url: 'https://example.test/u.svg',
+          md5: 'abcdef',
+          data: { filename: 'u.svg' },
+        },
+        {
+          op: 'upload.replace',
+          id: 'u',
+          label: '5',
+          url: 'https://example.test/v.svg',
+          md5: 'abcdef',
+          data: { filename: 'v.svg' },
+        },
+        { op: 'upload.update', id: 'u', label: '6', data: { notes: 'n' } },
+        { op: 'record.create', id: 'r', label: '7', data: { title: 't' } },
+        { op: 'record.update', id: 'r', label: '8', data: { title: 'u' } },
+        { op: 'record.publish', id: 'r', label: '9' },
+        {
+          op: 'schedule.publication.create',
+          id: 'r',
+          label: '10',
+          data: { publication_scheduled_at: DATE },
+        },
+        { op: 'schedule.publication.delete', id: 'r', label: '11' },
+        {
+          op: 'schedule.unpublishing.create',
+          id: 'r',
+          label: '12',
+          data: { unpublishing_scheduled_at: DATE },
+        },
+        { op: 'schedule.unpublishing.delete', id: 'r', label: '13' },
+        { op: 'record.unpublish', id: 'r', label: '14' },
+        { op: 'record.delete', id: 'r', label: '15' },
+        { op: 'upload.delete', id: 'u', label: '16' },
+        { op: 'folder.delete', id: 'f', label: '17' },
+      ];
+      const { client, calls } = recorder({
+        'uploads.createFromUrl': () => md5,
+        'uploads.updateFromUrl': () => md5,
+      });
+      assert.equal(await execute(client, await linesDiff(lines)), lines.length);
+      // A record is published or unpublished alone, never with its links.
+      const alone = [undefined, { recursive: false }];
+      assert.deepEqual(calls, [
+        ['uploadCollections.create', { id: 'f', label: 'F' }],
+        ['uploadCollections.update', 'f', { label: 'G' }],
+        ['uploadCollections.reorder', [{ id: 'f' }]],
+        [
+          'uploads.createFromUrl',
+          { id: 'u', url: 'https://example.test/u.svg', filename: 'u.svg' },
+        ],
+        [
+          'uploads.updateFromUrl',
+          'u',
+          { url: 'https://example.test/v.svg', filename: 'v.svg' },
+        ],
+        ['uploads.update', 'u', { notes: 'n' }],
+        ['items.create', { id: 'r', title: 't' }],
+        ['items.update', 'r', { title: 'u' }],
+        ['items.publish', 'r', ...alone],
+        [
+          'scheduledPublication.create',
+          'r',
+          { publication_scheduled_at: DATE },
+        ],
+        ['scheduledPublication.destroy', 'r'],
+        [
+          'scheduledUnpublishing.create',
+          'r',
+          { unpublishing_scheduled_at: DATE },
+        ],
+        ['scheduledUnpublishing.destroy', 'r'],
+        ['items.unpublish', 'r', ...alone],
+        ['items.destroy', 'r'],
+        ['uploads.destroy', 'u'],
+        ['uploadCollections.destroy', 'f'],
+      ]);
+    });
+
+    it('uploads new files from the diff and removes each extracted file', async () => {
+      const files = {
+        'assets/u/u.svg': '<svg>new</svg>',
+        'assets/v/v.svg': '<svg>replaced</svg>',
+      };
+      const md5 = (contents: string) =>
+        createHash('md5').update(contents).digest('hex');
+      const lines = Object.entries(files).map(([file, contents]) => ({
+        op: file.includes('/u/') ? 'upload.create' : 'upload.replace',
+        id: file.split('/')[1],
+        label: `Upload ${file}`,
+        file,
+        md5: md5(contents),
+        data: { filename: file.split('/')[2] },
+      }));
+      const read: Array<[string, string]> = [];
+      const extract = async ({ localPath }: { localPath: string }) => {
+        const contents = await readFile(localPath, 'utf8');
+        read.push([localPath, contents]);
+        return { md5: md5(contents) };
+      };
+      const { client, calls } = recorder({
+        'uploads.createFromLocalFile': extract,
+        'uploads.updateFromLocalFile': (_id: string, body) => extract(body),
+      });
+      await execute(client, await linesDiff(lines, files));
+      assert.deepEqual(
+        read.map(([, contents]) => contents),
+        Object.values(files),
+      );
+      assert.deepEqual(calls, [
+        [
+          'uploads.createFromLocalFile',
+          { id: 'u', localPath: read[0]![0], filename: 'u.svg' },
+        ],
+        [
+          'uploads.updateFromLocalFile',
+          'v',
+          { localPath: read[1]![0], filename: 'v.svg' },
+        ],
+      ]);
+      for (const [path] of read) await assert.rejects(access(path));
+    });
+
+    it('refuses an uploaded file that differs from the one the diff expects', async () => {
+      const message = (asset: string) =>
+        `Asset ${asset} was uploaded with a different file than the diff expects: it changed in the source since the diff generation. Please re-generate a diff to apply.`;
+      // A source asset edited after the diff was generated, fetched by URL.
+      const fixture = cmaFixture(target, targetSchema, source);
+      fixture.remoteFiles.get(upload('added', 'new').url)!.md5 = 'edited';
+      const index = operations.findIndex(
+        (operation) => operation.op === 'upload.create',
+      );
+      const { label } = operations[index]!;
+      const where = `operations/000001.jsonl line ${index + 1}`;
+      await assert.rejects(
+        run(fixture.client, diffPath),
+        (error: ContentError) => {
+          assert.equal(error.code, 'ASSET_CHANGED');
+          assert.equal(
+            error.message,
+            `${where}, ${label}: ${message(id('added'))}`,
+          );
+          assert.deepEqual(error.details, { operation: { where, label } });
+          return true;
+        },
+      );
+      // A file from the diff is removed once it has been uploaded, also then.
+      let extracted = '';
+      const { client } = recorder({
+        'uploads.createFromLocalFile': ({
+          localPath,
+        }: { localPath: string }) => {
+          extracted = localPath;
+          return { md5: 'edited' };
+        },
+      });
+      const line = {
+        op: 'upload.create',
+        id: 'u',
+        label: 'Create u',
+        file: 'assets/u/u.svg',
+        md5: 'expected',
+        data: {},
+      };
+      await assert.rejects(
+        execute(client, await linesDiff([line], { 'assets/u/u.svg': 'x' })),
+        (error: ContentError) => {
+          assert.equal(error.code, 'ASSET_CHANGED');
+          assert.equal(
+            error.message,
+            `operations/000001.jsonl line 1, Create u: ${message('u')}`,
+          );
+          return true;
+        },
+      );
+      await assert.rejects(access(extracted));
+    });
+
+    it('names the line and label of a failed operation and runs nothing after it', async () => {
+      const lines = [
+        { op: 'record.publish', id: 'a', label: 'Publish a' },
+        { op: 'record.update', id: 'b', label: 'Update b', data: {} },
+        { op: 'record.delete', id: 'c', label: 'Delete c' },
+      ];
+      const path = await linesDiff(lines);
+      const rejection = apiError(422, 'https://site-api.datocms.com/items/b', [
+        {
+          id: '1',
+          type: 'api_error',
+          attributes: {
+            code: 'INVALID_FIELD',
+            details: { field: 'title', code: 'VALIDATION_UNIQUE' },
+          },
+        },
+      ]);
+      const failing = (error: unknown) =>
+        recorder({
+          'items.update': () => {
+            throw error;
+          },
+        });
+      const where = 'operations/000001.jsonl line 2';
+      const rejected = failing(rejection);
+      await assert.rejects(
+        execute(rejected.client, path),
+        (error: ContentError) => {
+          assert.equal(error.code, 'CMA_VALIDATION_FAILED');
+          assert.equal(
+            error.message,
+            `${where}, Update b: The CMA rejected PUT /items/b: INVALID_FIELD (title: VALIDATION_UNIQUE). A unique value may still be held by another record; reorder or edit the diff so that record releases it first.`,
+          );
+          assert.deepEqual(error.details, {
+            method: 'PUT',
+            url: 'https://site-api.datocms.com/items/b',
+            status: 422,
+            errors: [
+              {
+                code: 'INVALID_FIELD',
+                details: { field: 'title', code: 'VALIDATION_UNIQUE' },
+              },
+            ],
+            operation: { where, label: 'Update b' },
+          });
+          return true;
+        },
+      );
+      assert.deepEqual(
+        rejected.calls.map(([method]) => method),
+        ['items.publish', 'items.update'],
+      );
+      const timedOut = failing(
+        new CmaClient.TimeoutError({
+          request: {
+            method: 'PUT',
+            url: 'https://site-api.datocms.com/items/b',
+            headers: {},
+          },
+        }),
+      );
+      await assert.rejects(
+        execute(timedOut.client, path),
+        (error: ContentError) => {
+          assert.equal(error.code, 'CMA_REQUEST_FAILED');
+          assert.equal(
+            error.message,
+            `${where}, Update b: The CMA request PUT /items/b timed out; it may still have been applied.`,
+          );
+          return true;
+        },
+      );
+      // Anything that is not a CMA failure is reported as it is.
+      const plain = new Error('plain');
+      await assert.rejects(
+        execute(failing(plain).client, path),
+        (error: unknown) => error === plain,
+      );
+    });
+
+    it("keeps the ID it creates and the file it uploads whatever a line's data says", async () => {
+      const md5 = { md5: 'abcdef' };
+      const { client, calls } = recorder({
+        'uploads.createFromUrl': () => md5,
+      });
+      await execute(
+        client,
+        await linesDiff([
+          {
+            op: 'record.create',
+            id: 'r',
+            label: '1',
+            data: { id: 'other', title: 't' },
+          },
+          {
+            op: 'folder.create',
+            id: 'f',
+            label: '2',
+            data: { id: 'other', label: 'F' },
+          },
+          {
+            op: 'upload.create',
+            id: 'u',
+            label: '3',
+            url: 'https://example.test/u.svg',
+            md5: 'abcdef',
+            data: {
+              id: 'other',
+              localPath: '/etc/hosts',
+              url: 'https://elsewhere.test/u.svg',
+              filename: 'u.svg',
+            },
+          },
+        ]),
+      );
+      assert.deepEqual(calls, [
+        ['items.create', { id: 'r', title: 't' }],
+        ['uploadCollections.create', { id: 'f', label: 'F' }],
+        [
+          'uploads.createFromUrl',
+          { id: 'u', url: 'https://example.test/u.svg', filename: 'u.svg' },
+        ],
+      ]);
+    });
+
+    it('fails a run interrupted during its last operation', async () => {
+      const controller = new AbortController();
+      const { client } = recorder({
+        'items.publish': () => controller.abort(),
+      });
+      await assert.rejects(
+        execute(
+          client,
+          await linesDiff([{ op: 'record.publish', id: 'r', label: 'last' }]),
+          { signal: controller.signal },
+        ),
+        { code: 'INTERRUPTED' },
+      );
+    });
+
+    it('finishes the operation in flight on interrupt and runs no other', async () => {
+      const controller = new AbortController();
+      const interruption = Object.assign(
+        new ContentError(
+          'INTERRUPTED',
+          'Content operation interrupted by SIGINT.',
+        ),
+        { exitCode: 130 },
+      );
+      const settled: string[] = [];
+      const { client, calls } = recorder({
+        'items.publish': async (id: string) => {
+          controller.abort(interruption);
+          await new Promise((resolve) => setImmediate(resolve));
+          settled.push(id);
+        },
+      });
+      const lines = ['a', 'b'].map((record) => ({
+        op: 'record.publish',
+        id: record,
+        label: `Publish ${record}`,
+      }));
+      await assert.rejects(
+        execute(client, await linesDiff(lines), { signal: controller.signal }),
+        (error: unknown) => error === interruption,
+      );
+      assert.deepEqual(calls, [
+        ['items.publish', 'a', undefined, { recursive: false }],
+      ]);
+      assert.deepEqual(settled, ['a']);
+    });
   });
 });

@@ -7,9 +7,8 @@ import {
   type LogLevelFlagEnum,
   type LogLevelModeEnum,
   type ProfileConfig,
-  logLevelMap,
 } from '@datocms/cli-utils';
-import { jsonFailure } from './command-helpers';
+import { jsonFailure, requestLogLevel } from './command-helpers';
 import { resolveLinkedSiteToken, resolveProfileApiToken } from './profile-auth';
 
 /** One project: the root client manages environments. */
@@ -149,17 +148,11 @@ export abstract class PairedProfileCommand extends DatoConfigCommand {
           ],
         },
       );
-    const logLevel = flags['log-level'] ?? profile?.logLevel;
     const logMode = flags['log-mode'] ?? profile?.logMode;
     const options: CmaClient.ClientConfigOptions = {
       apiToken,
       baseUrl: flags['base-url'] ?? profile?.baseUrl,
-      // Unlike CmaClientCommand, `--output` does not silence request logs:
-      // here it names the generated script, not an output format.
-      logLevel:
-        flags.json || !logLevel
-          ? CmaClient.LogLevel.NONE
-          : logLevelMap[logLevel],
+      logLevel: requestLogLevel(flags, profile),
       logFn: (message: string) => {
         if (logMode === 'file')
           appendFileSync('./api-calls.log', `${message}\n`, 'utf8');
@@ -194,9 +187,5 @@ export abstract class PairedProfileCommand extends DatoConfigCommand {
       this,
       [error],
     );
-  }
-
-  protected progress(message: string): void {
-    if (!this.jsonEnabled()) this.logToStderr(message);
   }
 }

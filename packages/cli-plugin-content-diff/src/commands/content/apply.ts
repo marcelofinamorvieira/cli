@@ -1,5 +1,5 @@
 import { CmaClient, CmaClientCommand, oclif } from '@datocms/cli-utils';
-import { applyContentMigration } from '../../engine/apply';
+import { applyContentDiff } from '../../engine/apply';
 import {
   ContentError,
   type ContentFailureContext,
@@ -17,27 +17,27 @@ type ClientOptions = Awaited<
 
 export default class ContentApplyCommand extends CmaClientCommand {
   static description =
-    'Run a TypeScript content migration in a new isolated destination fork';
+    'Run a content diff in a new isolated fork of the destination';
   static examples = [
-    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts',
-    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --in-place',
-    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --preflight-only',
-    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --fork-name=content-review',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/1791559800_sync.diff-records.zip',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/1791559800_sync.diff-records.zip --in-place',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/1791559800_sync.diff-records.zip --preflight-only',
+    '<%= config.bin %> <%= command.id %> ./migrations/content/1791559800_sync.diff-records.zip --fork-name=content-review',
   ];
   static args = {
-    SCRIPT: oclif.Args.string({
-      description: 'TypeScript content migration entrypoint',
+    FILE: oclif.Args.string({
+      description: 'Content diff (.zip) written by content:diff',
       required: true,
     }),
   };
   static flags = {
     destination: oclif.Flags.string({
       description:
-        'Apply against this destination environment ID instead of the migration binding',
+        'Apply against this destination environment ID instead of the one the diff was generated for',
     }),
     'preflight-only': oclif.Flags.boolean({
       description:
-        'Check artifacts, read access and the original destination baseline without executing the script or creating a fork',
+        'Check the diff and what it touches in the destination without running it or creating a fork',
       exclusive: ['keep-failed-fork'],
       default: false,
     }),
@@ -64,15 +64,9 @@ export default class ContentApplyCommand extends CmaClientCommand {
       default: true,
       allowNo: true,
     }),
-    verification: oclif.Flags.custom<'versions' | 'full'>({
-      description:
-        'Skip rereading records whose version did not change ("versions"), or reread every record in each check ("full")',
-      options: ['versions', 'full'],
-      default: 'versions',
-    })(),
     concurrency: oclif.Flags.integer({
       description:
-        'Maximum concurrent baseline read requests (1–16); script calls execute as written',
+        'Maximum concurrent check requests (1–16); operations run one at a time',
       default: 8,
       min: 1,
       max: 16,
@@ -86,10 +80,10 @@ export default class ContentApplyCommand extends CmaClientCommand {
   // authentication or network access.
   protected async init(): Promise<void> {
     const { args } = await this.parse(ContentApplyCommand);
-    if (!args.SCRIPT.endsWith('.ts'))
+    if (!args.FILE.endsWith('.zip'))
       throw new ContentError(
-        'INVALID_MIGRATION_PATH',
-        'Pass the generated .ts migration entrypoint to content:apply.',
+        'INVALID_DIFF_PATH',
+        'Pass the .zip diff written by content:diff to content:apply.',
       );
     await super.init();
   }
@@ -105,7 +99,7 @@ export default class ContentApplyCommand extends CmaClientCommand {
     return withInterruptHandling(
       (signal) => this.runOperation(signal),
       () =>
-        this.progress(
+        this.logToStderr(
           'Interrupted. Waiting for active requests before cleanup.',
         ),
     );
@@ -114,15 +108,11 @@ export default class ContentApplyCommand extends CmaClientCommand {
   private async runOperation(signal: AbortSignal): Promise<ApplyOutcome> {
     const { flags, args } = await this.parse(ContentApplyCommand);
     const options = await this.buildBaseClientInitializationOptions();
-    const result = await applyContentMigration({
+    const result = await applyContentDiff({
       rootClient: this.client,
-      buildEnvironmentClient: (environment, fetchFn) =>
-        CmaClient.buildClient({
-          ...options,
-          environment,
-          ...(fetchFn ? { fetchFn } : {}),
-        }),
-      scriptPath: args.SCRIPT,
+      buildEnvironmentClient: (environment) =>
+        CmaClient.buildClient({ ...options, environment }),
+      diffPath: args.FILE,
       options: {
         signal,
         inPlace: flags['in-place'] ?? false,
@@ -135,28 +125,23 @@ export default class ContentApplyCommand extends CmaClientCommand {
         ...(flags['preflight-only'] ? { preflightOnly: true } : {}),
         concurrency: flags.concurrency,
         fastFork: flags['fast-fork'],
-        verification: flags.verification,
-        log: (message) => this.progress(message),
+        log: (message) => this.logToStderr(message),
       },
     });
-    if (!this.jsonEnabled()) {
-      if ('preflightOnly' in result) {
-        this.log(
-          `Preflight checks passed against environment "${result.environmentId}". The script was not executed; edited effects were not previewed.`,
-        );
-        if (result.partial)
-          this.log(
-            'Partial migration: generation omitted unsupported content.',
-          );
-        return result;
-      }
-      const partial = result.partial
-        ? ' (generation omitted unsupported content)'
-        : '';
+    if ('preflightOnly' in result) {
       this.log(
-        `Executed content migration in environment "${result.environmentId}"${partial}.`,
+        `Preflight checks passed against environment "${result.environmentId}" for ${result.operations} operations. Nothing was run.`,
       );
+      if (result.partial)
+        this.log('Partial diff: generation omitted unsupported content.');
+      return result;
     }
+    const partial = result.partial
+      ? ' (generation omitted unsupported content)'
+      : '';
+    this.log(
+      `Ran ${result.operations} operations in environment "${result.environmentId}"${partial}.`,
+    );
     return result;
   }
 
@@ -181,9 +166,5 @@ export default class ContentApplyCommand extends CmaClientCommand {
       exit: exitStatus(base),
       suggestions: contentErrorReport(base).suggestions,
     });
-  }
-
-  private progress(message: string): void {
-    if (!this.jsonEnabled()) this.logToStderr(message);
   }
 }

@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { collectionHash, hashJson, recordHash } from '../src/engine/codec';
 import { ContentError } from '../src/engine/errors';
+import type { Operation } from '../src/engine/operations';
 import {
+  COLLECTION_WRITE_PHASE,
   assertSchemaCompatible,
-  createPlan,
   creationEmptyValue,
   orderedCollectionWrites,
 } from '../src/engine/planner';
-import { PlannerGraph } from '../src/engine/planner-graph';
-import { SnapshotStore } from '../src/engine/store';
+import { Heap, PlannerGraph } from '../src/engine/planner-graph';
 import type {
   CollectionState,
   FieldSchema,
@@ -21,6 +21,7 @@ import type {
   UploadState,
 } from '../src/engine/types';
 import { fixtureId } from './fixture-id';
+import { type Content, content, diff } from './pipeline';
 
 const id = fixtureId;
 const MODEL = id('model');
@@ -131,10 +132,39 @@ function options(overrides: Partial<PlanOptions> = {}): PlanOptions {
     ...overrides,
   };
 }
+type Planned = Awaited<ReturnType<typeof diff>>;
+/** Plans one side against the other: records alone, or complete content. */
+function fixture(
+  source: RecordState[] | Partial<Content>,
+  target: RecordState[] | Partial<Content>,
+  state = schema(),
+  opts = options(),
+): Promise<Planned> {
+  const side = (value: RecordState[] | Partial<Content>) =>
+    content(Array.isArray(value) ? { records: value } : value);
+  return diff({
+    source: side(source),
+    target: side(target),
+    sourceSchema: state,
+    options: opts,
+  });
+}
+function collectionFixture(
+  source: CollectionState[],
+  target: CollectionState[],
+  overrides: Partial<PlanOptions> = {},
+): Promise<Planned> {
+  return fixture(
+    { collections: source },
+    { collections: target },
+    schema(),
+    options({ uploads: 'all', ...overrides }),
+  );
+}
 /** Two records of one creation cycle, in creation order. */
-function creationCycle(store: SnapshotStore): [RecordPlan, RecordPlan] {
+function creationCycle({ plan }: Planned): [RecordPlan, RecordPlan] {
   const [first, second] = [A, B]
-    .map((recordId) => store.getPlan('record', recordId) as RecordPlan)
+    .map((recordId) => plan.records.get(recordId)!)
     .sort(
       (left, right) =>
         left.execution!.createOrder! - right.execution!.createOrder!,
@@ -142,113 +172,134 @@ function creationCycle(store: SnapshotStore): [RecordPlan, RecordPlan] {
   assert.ok(first.execution!.createOrder! < second.execution!.createOrder!);
   return [first, second];
 }
-async function fixture(
-  source: RecordState[],
-  target: RecordState[],
-  state = schema(),
-  opts = options(),
-  check?: (
-    store: SnapshotStore,
-    metadata: Awaited<ReturnType<typeof createPlan>>,
-  ) => void,
-): Promise<void> {
-  const store = new SnapshotStore();
-  try {
-    for (const entry of source) store.putRecord('source', entry);
-    for (const entry of target) store.putRecord('target', entry);
-    const metadata = createPlan(
-      store,
-      state,
-      { ...state, environmentId: 'target' },
-      opts,
-    );
-    check?.(store, metadata);
-  } finally {
-    store.dispose();
-  }
+/** The fields a record write sends, without its model and metadata. */
+function written(operation: Operation): JsonObject {
+  const { item_type: _, meta: __, ...fields } = operation.data as JsonObject;
+  return fields;
 }
-async function collectionFixture(
-  source: CollectionState[],
-  target: CollectionState[],
-  overrides: Partial<PlanOptions> = {},
-  check?: (
-    store: SnapshotStore,
-    metadata: Awaited<ReturnType<typeof createPlan>>,
-  ) => void,
-): Promise<void> {
-  const store = new SnapshotStore();
-  try {
-    for (const state of source) store.putCollection('source', state);
-    for (const state of target) store.putCollection('target', state);
-    const metadata = createPlan(
-      store,
-      schema(),
-      schema(),
-      options({ uploads: 'all', ...overrides }),
-    );
-    check?.(store, metadata);
-  } finally {
-    store.dispose();
+/** The fields a new record is created with. */
+function creationFields(operations: Operation[], recordId: string) {
+  return written(
+    operations.find(
+      (operation) =>
+        operation.op === 'record.create' && operation.id === recordId,
+    )!,
+  );
+}
+/** A new record's fields when it is first published. */
+function firstPublished(operations: Operation[], recordId: string) {
+  const fields: JsonObject = {};
+  for (const operation of operations) {
+    if (operation.id !== recordId) continue;
+    if (operation.op === 'record.publish') return fields;
+    if (operation.op === 'record.create' || operation.op === 'record.update')
+      Object.assign(fields, written(operation));
   }
+  assert.fail(`Record ${recordId} is never published.`);
 }
 const unsafe = (error: unknown) =>
   error instanceof ContentError && error.code === 'UNSAFE_REQUESTED_CHANGE';
 
-describe('indexed planner', () => {
-  it('assigns dependency levels to independent roots and chains without a graph-sized ready queue', () => {
-    const store = new SnapshotStore();
-    try {
-      const graph = new PlannerGraph(store.database);
-      for (const recordId of [A, B, C, id('independent'), id('deep')])
-        graph.node('create', 'record', recordId);
-      graph.edge('create', 'record', B, 'record', A, 'reference');
-      graph.edge('create', 'record', C, 'record', B, 'reference');
-      graph.edge('create', 'record', id('deep'), 'record', C, 'reference');
-      graph.edge(
-        'create',
-        'record',
-        id('deep'),
-        'record',
-        id('independent'),
-        'reference',
-      );
-      const prepare = store.database.prepare.bind(store.database);
-      let indexedReadyQueue = false;
-      store.database.prepare = (sql) => {
-        if (sql.includes('AND done=0 AND degree=0'))
-          indexedReadyQueue = prepare(`EXPLAIN QUERY PLAN ${sql}`)
-            .all('create')
-            .some((row) => String(row.detail).includes('planner_nodes_ready'));
-        return prepare(sql);
-      };
-      assert.equal(graph.order('create'), 0);
-      assert.equal(indexedReadyQueue, true);
-      const levels = new Map(
-        [...graph.ranks('create')].map((entry) => [entry.id, entry.rank]),
-      );
-      assert.equal(levels.get(A), 0);
-      assert.equal(levels.get(id('independent')), 0);
-      assert.equal(levels.get(B), 1);
-      assert.equal(levels.get(C), 2);
-      assert.equal(levels.get(id('deep')), 3);
-      graph.edge('create', 'record', A, 'record', C, 'cycle');
-      assert.equal(graph.order('create'), 4);
-      assert.deepEqual(
-        [...graph.ranks('create')].map((entry) => entry.id),
-        [id('independent')],
-      );
-      // Forcing releases a member of the cycle, so every vertex still
-      // receives a level and the vertex waiting on the cycle follows it.
-      assert.equal(graph.order('create', true), 0);
-      const forced = new Map(
-        [...graph.ranks('create')].map((entry) => [entry.id, entry.rank]),
-      );
-      assert.equal(forced.size, 5);
-      for (const dependency of [C, id('independent')])
-        assert.ok(forced.get(dependency)! < forced.get(id('deep'))!);
-    } finally {
-      store.dispose();
-    }
+describe('planner', () => {
+  it('pops a heap in order, whatever the push order', () => {
+    const values = Array.from({ length: 200 }, (_, n) => (n * 73) % 200);
+    const heap = new Heap<number>((a, b) => a - b);
+    for (const value of values) heap.push(value);
+    assert.equal(heap.peek(), 0);
+    const popped: number[] = [];
+    for (let value = heap.pop(); value !== undefined; value = heap.pop())
+      popped.push(value);
+    assert.deepEqual(
+      popped,
+      [...values].sort((a, b) => a - b),
+    );
+  });
+
+  it('assigns dependency levels to independent roots and chains', () => {
+    const graph = new PlannerGraph();
+    for (const recordId of [A, B, C, id('independent'), id('deep')])
+      graph.node('create', 'record', recordId);
+    graph.edge('create', 'record', B, 'record', A, 'reference');
+    graph.edge('create', 'record', C, 'record', B, 'reference');
+    graph.edge('create', 'record', id('deep'), 'record', C, 'reference');
+    graph.edge(
+      'create',
+      'record',
+      id('deep'),
+      'record',
+      id('independent'),
+      'reference',
+    );
+    assert.equal(graph.order('create'), 0);
+    const levels = new Map(
+      graph.ranks('create').map((entry) => [entry.id, entry.rank]),
+    );
+    assert.equal(levels.get(A), 0);
+    assert.equal(levels.get(id('independent')), 0);
+    assert.equal(levels.get(B), 1);
+    assert.equal(levels.get(C), 2);
+    assert.equal(levels.get(id('deep')), 3);
+    graph.edge('create', 'record', A, 'record', C, 'cycle');
+    assert.equal(graph.order('create'), 4);
+    assert.deepEqual(
+      graph.ranks('create').map((entry) => entry.id),
+      [id('independent')],
+    );
+    // Forcing releases a member of the cycle, so every vertex still
+    // receives a level and the vertex waiting on the cycle follows it.
+    assert.equal(graph.order('create', true), 0);
+    const forced = new Map(
+      graph.ranks('create').map((entry) => [entry.id, entry.rank]),
+    );
+    assert.equal(forced.size, 5);
+    for (const dependency of [C, id('independent')])
+      assert.ok(forced.get(dependency)! < forced.get(id('deep'))!);
+  });
+
+  it('reports the edges a cycle leaves unranked until they are removed', () => {
+    const [first, second, waiting] = [A, B, C].sort();
+    const graph = new PlannerGraph();
+    for (const recordId of [first, second, waiting])
+      graph.node('publish', 'record', recordId);
+    graph.edge('publish', 'record', first, 'record', second, 'publication');
+    graph.edge('publish', 'record', first, 'record', second, 'parent');
+    graph.edge('publish', 'record', second, 'record', first, 'publication');
+    graph.edge('publish', 'record', waiting, 'record', first, 'publication');
+    assert.equal(graph.order('publish'), 3);
+    assert.equal(graph.done('publish', 'record', first), false);
+    assert.equal(graph.done('publish', 'record', id('absent')), undefined);
+    assert.deepEqual(
+      [...graph.unresolvedEdges('publish')],
+      [
+        { ownerId: first, dependencyId: second, reason: 'publication' },
+        { ownerId: first, dependencyId: second, reason: 'parent' },
+        { ownerId: second, dependencyId: first, reason: 'publication' },
+        { ownerId: waiting, dependencyId: first, reason: 'publication' },
+      ],
+    );
+    graph.removeEdges(
+      'publish',
+      first,
+      second,
+      (reason) => reason === 'parent',
+    );
+    assert.equal(graph.order('publish'), 3);
+    graph.removeEdges(
+      'publish',
+      first,
+      second,
+      (reason) => reason === 'publication',
+    );
+    assert.equal(graph.order('publish'), 0);
+    assert.deepEqual([...graph.unresolvedEdges('publish')], []);
+    assert.deepEqual(
+      graph.ranks('publish').map((entry) => [entry.id, entry.rank]),
+      [
+        [first, 0],
+        [second, 1],
+        [waiting, 1],
+      ],
+    );
   });
 
   it('seeds creation fields with native empty values', () => {
@@ -258,25 +309,30 @@ describe('indexed planner', () => {
     assert.equal(creationEmptyValue('structured_text'), null);
   });
 
-  it('stores complete changed states and only guards for noops', async () => {
-    await fixture(
+  it('keeps both states of changed records and neither for noops', async () => {
+    const { plan, operations } = await fixture(
       [record(), record(B, { title: 'new' })],
       [record(), record(B, { title: 'old' })],
-      schema(),
-      options(),
-      (store, metadata) => {
-        const noop = store.getPlan('record', A)!;
-        const update = store.getPlan('record', B)! as RecordPlan;
-        assert.equal(noop.action, 'noop');
-        assert.equal('baseline' in noop, false);
-        assert.equal('desired' in noop, false);
-        assert.equal(update.action, 'update');
-        assert.deepEqual(update.baseline?.current, { title: 'old' });
-        assert.deepEqual(update.desired?.current, { title: 'new' });
-        assert.equal(metadata.counts.record.noop, 1);
-        assert.equal(metadata.counts.record.update, 1);
-      },
     );
+    const noop = plan.records.get(A)!;
+    const update = plan.records.get(B)!;
+    assert.equal(noop.action, 'noop');
+    assert.equal('baseline' in noop, false);
+    assert.equal('desired' in noop, false);
+    assert.equal(update.action, 'update');
+    assert.equal(update.baseline?.title, 'old');
+    assert.equal(update.desired?.title, 'new');
+    assert.equal(plan.metadata.counts.record.noop, 1);
+    assert.equal(plan.metadata.counts.record.update, 1);
+    assert.deepEqual(operations, [
+      {
+        op: 'record.update',
+        id: B,
+        label: `Update Page "new" (${B})`,
+        expect: { currentVersion: '1', publishedUpdatedAt: null },
+        data: { title: 'new', meta: { current_version: '1' } },
+      },
+    ]);
   });
 
   it('rejects lossy native metadata payloads and skips only their requested dependency closure', async () => {
@@ -290,79 +346,71 @@ describe('indexed planner', () => {
     ]);
     for (const key of ['__proto__', '__itemTypeId']) {
       for (const slice of ['current', 'published']) {
-        const store = new SnapshotStore();
-        try {
-          const asset = upload();
-          store.putUpload('source', asset);
-          store.putUpload('target', asset);
-          const safe: JsonObject = { asset: null, link: null };
-          const lossy: JsonObject = {
-            asset: {
-              upload_id: asset.id,
-              custom_data: { [key]: 'business value' },
-            },
-            link: null,
-          };
-          store.putRecord(
-            'source',
-            record(
-              A,
-              slice === 'current' ? lossy : safe,
-              slice === 'published'
-                ? {
-                    published: lossy,
-                  }
-                : {},
-            ),
-          );
-          store.putRecord('source', record(B, { asset: null, link: A }));
-          store.putRecord('source', record(C, safe));
-          assert.throws(
-            () => createPlan(store, state, state, options()),
-            (error: unknown) =>
-              error instanceof ContentError &&
-              error.code === 'UNSAFE_REQUESTED_CHANGE' &&
-              error.details?.reason === 'UNSUPPORTED_PAYLOAD_KEY',
-          );
-          assert.deepEqual([...store.planEntries()], []);
-          createPlan(store, state, state, options({ allowPartial: true }));
-          assert.equal(store.getPlan('record', A)?.action, 'skip');
-          assert.equal(store.getPlan('record', B)?.action, 'skip');
-          assert.equal(store.getPlan('record', C)?.action, 'create');
-          store.putRecord('target', store.getRecord('source', A)!);
-          createPlan(store, state, state, options());
-          assert.equal(store.getPlan('record', A)?.action, 'noop');
-          assert.equal(store.getPlan('record', B)?.action, 'create');
-        } finally {
-          store.dispose();
-        }
+        const asset = upload();
+        const safe: JsonObject = { asset: null, link: null };
+        const lossy: JsonObject = {
+          asset: {
+            upload_id: asset.id,
+            custom_data: { [key]: 'business value' },
+          },
+          link: null,
+        };
+        const refused = record(
+          A,
+          slice === 'current' ? lossy : safe,
+          slice === 'published' ? { published: lossy } : {},
+        );
+        const source = content({
+          records: [
+            refused,
+            record(B, { asset: null, link: A }),
+            record(C, safe),
+          ],
+          uploads: [asset],
+        });
+        const target = content({ uploads: [asset] });
+        await assert.rejects(
+          fixture(source, target, state),
+          (error: unknown) =>
+            unsafe(error) &&
+            (error as ContentError).details?.reason ===
+              'UNSUPPORTED_PAYLOAD_KEY',
+        );
+        const partial = await fixture(
+          source,
+          target,
+          state,
+          options({ allowPartial: true }),
+        );
+        assert.equal(partial.plan.records.get(A)?.action, 'skip');
+        assert.equal(partial.plan.records.get(B)?.action, 'skip');
+        assert.equal(partial.plan.records.get(C)?.action, 'create');
+        const { plan } = await fixture(
+          source,
+          { ...target, records: [refused] },
+          state,
+        );
+        assert.equal(plan.records.get(A)?.action, 'noop');
+        assert.equal(plan.records.get(B)?.action, 'create');
       }
     }
   });
 
   it('retains destination-only and unselected model records', async () => {
     const other = model({ id: id('other-model'), apiKey: 'other' });
-    const source = schema();
-    const target = schema([model(), other]);
-    const store = new SnapshotStore();
-    try {
-      store.putRecord(
-        'target',
-        record(B, { title: 'keep' }, { modelId: other.id }),
-      );
-      const metadata = createPlan(
-        store,
-        source,
-        target,
-        options({ includeDeletions: true }),
-      );
-      const entry = store.getPlan('record', B)!;
-      assert.equal(entry.action, 'noop');
-      assert.deepEqual(entry.diagnostics, []);
-      assert.equal(metadata.counts.record.delete, 0);
-    } finally {
-      store.dispose();
-    }
+    const { plan } = await diff({
+      source: content(),
+      target: content({
+        records: [record(B, { title: 'keep' }, { modelId: other.id })],
+      }),
+      sourceSchema: schema(),
+      targetSchema: schema([model(), other]),
+      options: options({ includeDeletions: true }),
+    });
+    const entry = plan.records.get(B)!;
+    assert.equal(entry.action, 'noop');
+    assert.deepEqual(entry.diagnostics, []);
+    assert.equal(plan.metadata.counts.record.delete, 0);
   });
 
   it('compares only the structure content transfer relies on', () => {
@@ -608,10 +656,9 @@ describe('indexed planner', () => {
     ]);
     // The CMA validates identities; numeric and malformed IDs plan unchanged.
     for (const sourceId of ['123', 'A'.repeat(22), '0000000000000000000123']) {
-      await fixture([record(sourceId)], [], schema(), options(), (store) =>
-        assert.equal(store.getPlan('record', sourceId)?.action, 'create'),
-      );
-      await fixture(
+      const created = await fixture([record(sourceId)], []);
+      assert.equal(created.plan.records.get(sourceId)?.action, 'create');
+      const nested = await fixture(
         [
           record(A, {
             block: {
@@ -623,20 +670,17 @@ describe('indexed planner', () => {
         ],
         [],
         blockSchema,
-        options(),
-        (store) => assert.equal(store.getPlan('record', A)?.action, 'create'),
       );
-      const store = new SnapshotStore();
-      try {
-        store.putUpload('source', upload(sourceId));
-        createPlan(store, schema(), schema(), options({ uploads: 'all' }));
-        assert.equal(store.getPlan('upload', sourceId)?.action, 'create');
-      } finally {
-        store.dispose();
-      }
-      await collectionFixture([collection(sourceId)], [], {}, (store) =>
-        assert.equal(store.getPlan('collection', sourceId)?.action, 'create'),
+      assert.equal(nested.plan.records.get(A)?.action, 'create');
+      const asset = await fixture(
+        { uploads: [upload(sourceId)] },
+        [],
+        schema(),
+        options({ uploads: 'all' }),
       );
+      assert.equal(asset.plan.uploads.get(sourceId)?.action, 'create');
+      const folder = await collectionFixture([collection(sourceId)], []);
+      assert.equal(folder.plan.collections.get(sourceId)?.action, 'create');
     }
   });
 
@@ -644,17 +688,20 @@ describe('indexed planner', () => {
     const state = schema([
       model({ fields: [field({ id: LINK, apiKey: 'link', type: 'link' })] }),
     ]);
-    await fixture(
+    const planned = await fixture(
       [record(A, { link: B }), record(B, { link: A })],
       [],
       state,
-      options(),
-      (store) => {
-        const [first, second] = creationCycle(store);
-        assert.deepEqual(first.execution?.creationFields, { link: null });
-        assert.deepEqual(second.execution?.creationFields, { link: first.id });
-      },
     );
+    const [first, second] = creationCycle(planned);
+    assert.deepEqual(first.execution?.deferredFields, ['link']);
+    assert.deepEqual(second.execution?.deferredFields, []);
+    assert.deepEqual(creationFields(planned.operations, first.id), {
+      link: null,
+    });
+    assert.deepEqual(creationFields(planned.operations, second.id), {
+      link: first.id,
+    });
   });
 
   it('keeps complete required acyclic creation fields and orders their prerequisites', async () => {
@@ -672,7 +719,7 @@ describe('indexed planner', () => {
       }),
     ]);
     const target = record(C, { title: 'existing', link: C });
-    await fixture(
+    const { plan, operations } = await fixture(
       [
         record(A, { title: 'owner', link: B }),
         record(B, { title: 'dependency', link: C }),
@@ -680,22 +727,21 @@ describe('indexed planner', () => {
       ],
       [target],
       state,
-      options(),
-      (store) => {
-        const owner = store.getPlan('record', A) as RecordPlan;
-        const dependency = store.getPlan('record', B) as RecordPlan;
-        assert.deepEqual(owner.execution?.creationFields, {
-          title: 'owner',
-          link: B,
-        });
-        assert.deepEqual(dependency.execution?.creationFields, {
-          title: 'dependency',
-          link: C,
-        });
-        assert.ok(
-          dependency.execution!.createOrder! < owner.execution!.createOrder!,
-        );
-      },
+    );
+    const owner = plan.records.get(A)!;
+    const dependency = plan.records.get(B)!;
+    assert.deepEqual(owner.execution?.deferredFields, []);
+    assert.deepEqual(dependency.execution?.deferredFields, []);
+    assert.deepEqual(creationFields(operations, A), {
+      title: 'owner',
+      link: B,
+    });
+    assert.deepEqual(creationFields(operations, B), {
+      title: 'dependency',
+      link: C,
+    });
+    assert.ok(
+      dependency.execution!.createOrder! < owner.execution!.createOrder!,
     );
   });
 
@@ -715,7 +761,7 @@ describe('indexed planner', () => {
         }),
       ],
     });
-    await fixture(
+    const { plan, operations } = await fixture(
       [
         record(A, { link: B }),
         record(B, { link: A }),
@@ -724,15 +770,12 @@ describe('indexed planner', () => {
       [],
       schema([optional, required]),
       options({ modelIds: [MODEL, required.id] }),
-      (store) => {
-        const dependant = store.getPlan('record', C) as RecordPlan;
-        const seed = store.getPlan('record', A) as RecordPlan;
-        assert.deepEqual(dependant.execution?.creationFields, { link: A });
-        assert.ok(
-          seed.execution!.createOrder! < dependant.execution!.createOrder!,
-        );
-      },
     );
+    const dependant = plan.records.get(C)!;
+    const seed = plan.records.get(A)!;
+    assert.deepEqual(dependant.execution?.deferredFields, []);
+    assert.deepEqual(creationFields(operations, C), { link: A });
+    assert.ok(seed.execution!.createOrder! < dependant.execution!.createOrder!);
   });
 
   it('defers auto-published creation references to existing drafts until their publication phase', async () => {
@@ -762,22 +805,21 @@ describe('indexed planner', () => {
     ];
     const target = [record(B, { title: 'existing draft' })];
     const opts = options({ modelIds: [MODEL, automatic.id] });
-    await fixture(source, target, state, opts, (store) => {
-      const owner = store.getPlan('record', A) as RecordPlan;
-      const dependency = store.getPlan('record', B) as RecordPlan;
-      assert.deepEqual(owner.execution?.creationFields, { link: null });
-      assert.ok(
-        dependency.execution!.publishOrder! < owner.execution!.publishOrder!,
-      );
-    });
+    const { plan, operations } = await fixture(source, target, state, opts);
+    const owner = plan.records.get(A)!;
+    const dependency = plan.records.get(B)!;
+    assert.deepEqual(owner.execution?.deferredFields, ['link']);
+    assert.deepEqual(creationFields(operations, A), { link: null });
+    assert.ok(
+      dependency.execution!.publishOrder! < owner.execution!.publishOrder!,
+    );
     // A required link is seeded the same way; the CMA judges the write.
     automatic.fields[0].validators.required = {};
-    await fixture(source, target, state, opts, (store) =>
-      assert.deepEqual(
-        (store.getPlan('record', A) as RecordPlan).execution?.creationFields,
-        { link: null },
-      ),
-    );
+    const required = await fixture(source, target, state, opts);
+    assert.deepEqual(required.plan.records.get(A)!.execution?.deferredFields, [
+      'link',
+    ]);
+    assert.deepEqual(creationFields(required.operations, A), { link: null });
   });
 
   it('seeds required creation cycles with empty links without consulting validators', async () => {
@@ -797,10 +839,13 @@ describe('indexed planner', () => {
       }),
     ]);
     const source = [record(A, { link: B }), record(B, { link: A })];
-    await fixture(source, [], state, options(), (store) => {
-      const [first, second] = creationCycle(store);
-      assert.deepEqual(first.execution?.creationFields, { link: null });
-      assert.deepEqual(second.execution?.creationFields, { link: first.id });
+    const planned = await fixture(source, [], state);
+    const [first, second] = creationCycle(planned);
+    assert.deepEqual(creationFields(planned.operations, first.id), {
+      link: null,
+    });
+    assert.deepEqual(creationFields(planned.operations, second.id), {
+      link: first.id,
     });
   });
 
@@ -820,13 +865,13 @@ describe('indexed planner', () => {
       record(A, { title: { en: 'a', it: 'a' }, link: { en: B, it: B } }),
       record(B, { title: { en: 'b', it: 'b' }, link: { en: A, it: A } }),
     ];
-    await fixture(source, [], state, options(), (store) => {
-      const [first] = creationCycle(store);
-      const title = first.id === A ? 'a' : 'b';
-      assert.deepEqual(first.execution?.creationFields, {
-        title: { en: title, it: title },
-        link: { en: null, it: null },
-      });
+    const planned = await fixture(source, [], state);
+    const [first] = creationCycle(planned);
+    const title = first.id === A ? 'a' : 'b';
+    assert.deepEqual(first.execution?.deferredFields, ['link']);
+    assert.deepEqual(creationFields(planned.operations, first.id), {
+      title: { en: title, it: title },
+      link: { en: null, it: null },
     });
   });
 
@@ -895,14 +940,14 @@ describe('indexed planner', () => {
         },
       }),
     ];
-    await fixture(source, [], state, options(), (store) => {
-      const [first, second] = creationCycle(store);
-      assert.deepEqual(first.execution?.creationFields?.link, { en: null });
-      assert.deepEqual(first.execution?.creationFields?.blocks, { en: [] });
-      assert.deepEqual(
-        second.execution?.creationFields,
-        second.desired!.current,
-      );
+    const planned = await fixture(source, [], state);
+    const [first, second] = creationCycle(planned);
+    const seed = creationFields(planned.operations, first.id);
+    assert.deepEqual(seed.link, { en: null });
+    assert.deepEqual(seed.blocks, { en: [] });
+    assert.deepEqual(second.execution?.deferredFields, []);
+    assert.deepEqual(creationFields(planned.operations, second.id).link, {
+      en: first.id,
     });
     const constrained = {
       ...state,
@@ -920,13 +965,10 @@ describe('indexed planner', () => {
       ),
     };
     // A minimum size does not change the seed; the CMA judges the write.
-    await fixture(source, [], constrained, options(), (store) =>
-      assert.deepEqual(
-        creationCycle(store)[0].execution?.creationFields?.blocks,
-        {
-          en: [],
-        },
-      ),
+    const sized = await fixture(source, [], constrained);
+    assert.deepEqual(
+      creationFields(sized.operations, creationCycle(sized)[0].id).blocks,
+      { en: [] },
     );
   });
 
@@ -952,8 +994,9 @@ describe('indexed planner', () => {
         },
       },
     );
-    await fixture([scheduled], [], state);
-    await fixture(
+    const planned = await fixture([scheduled], [], state);
+    assert.equal(planned.plan.metadata.counts.record.create, 1);
+    const elsewhere = await fixture(
       [
         record(A, scheduled.current, {
           schedules: {
@@ -967,14 +1010,13 @@ describe('indexed planner', () => {
       ],
       [],
       state,
-      options(),
-      (_store, metadata) => assert.equal(metadata.counts.record.create, 1),
     );
+    assert.equal(elsewhere.plan.metadata.counts.record.create, 1);
     const nonnative = {
       ...schema([model({ fields: [field({ validators: { required: {} } })] })]),
       semantics: { improved_validation_at_publishing: true },
     };
-    await fixture(
+    const improved = await fixture(
       [
         record(
           A,
@@ -989,9 +1031,8 @@ describe('indexed planner', () => {
       ],
       [],
       nonnative,
-      options(),
-      (_store, metadata) => assert.equal(metadata.counts.record.create, 1),
     );
+    assert.equal(improved.plan.metadata.counts.record.create, 1);
   });
 
   it('plans writes around scheduled unchanged records that the SDK cannot write back', async () => {
@@ -1001,59 +1042,48 @@ describe('indexed planner', () => {
       }),
     ]);
     for (const write of ['none', 'record', 'upload', 'collection']) {
-      const store = new SnapshotStore();
-      try {
-        const asset = upload();
-        store.putUpload('source', asset);
-        store.putUpload('target', asset);
-        const scheduled = record(
-          A,
-          {
-            asset: {
-              upload_id: asset.id,
-              custom_data: { __itemTypeId: 'business value' },
-            },
+      const asset = upload();
+      const scheduled = record(
+        A,
+        {
+          asset: {
+            upload_id: asset.id,
+            custom_data: { __itemTypeId: 'business value' },
           },
-          {
-            schedules: {
-              publication: { at: '2099-01-01T12:00:00.000Z', selective: null },
-              unpublishing: null,
-            },
+        },
+        {
+          schedules: {
+            publication: { at: '2099-01-01T12:00:00.000Z', selective: null },
+            unpublishing: null,
           },
-        );
-        store.putRecord('source', scheduled);
-        store.putRecord('target', scheduled);
-        if (write === 'record')
-          store.putRecord('source', record(B, { asset: null }));
-        if (write === 'upload') {
-          const changed = { ...asset, filename: 'renamed.png', hash: '' };
-          changed.hash = hashJson(changed);
-          store.putUpload('source', changed);
-        }
-        if (write === 'collection') {
-          const collection = {
-            id: id('new-collection'),
-            label: 'New',
-            parentId: null,
-            position: 1,
-            hash: '',
-          };
-          collection.hash = hashJson(collection);
-          store.putCollection('source', collection);
-        }
-        const run = () =>
-          createPlan(
-            store,
-            state,
-            state,
-            options({ allowPartial: true, uploads: 'all' }),
-          );
-        // The unchanged record is never rewritten, so it does not block writes.
-        const metadata = await run();
-        assert.equal(metadata.counts.record.noop, 1);
-      } finally {
-        store.dispose();
+        },
+      );
+      const source = content({ records: [scheduled], uploads: [asset] });
+      if (write === 'record') source.records.push(record(B, { asset: null }));
+      if (write === 'upload') {
+        const changed = { ...asset, filename: 'renamed.png', hash: '' };
+        changed.hash = hashJson(changed);
+        source.uploads = [changed];
       }
+      if (write === 'collection') {
+        const created = {
+          id: id('new-collection'),
+          label: 'New',
+          parentId: null,
+          position: 1,
+          hash: '',
+        };
+        created.hash = hashJson(created);
+        source.collections.push(created);
+      }
+      // The unchanged record is never rewritten, so it does not block writes.
+      const { plan } = await fixture(
+        source,
+        { records: [scheduled], uploads: [asset] },
+        state,
+        options({ allowPartial: true, uploads: 'all' }),
+      );
+      assert.equal(plan.metadata.counts.record.noop, 1);
     }
   });
 
@@ -1083,10 +1113,9 @@ describe('indexed planner', () => {
       record(id('d'), { title: 'c', email: null }),
       record(id('e'), { title: 'held', email: null }),
     ];
-    await fixture(source, [], state, options(), (_store, metadata) =>
-      assert.equal(metadata.counts.record.create, 5),
-    );
-    await fixture(
+    const created = await fixture(source, [], state);
+    assert.equal(created.plan.metadata.counts.record.create, 5);
+    const { plan } = await fixture(
       source,
       [
         record(A),
@@ -1097,14 +1126,11 @@ describe('indexed planner', () => {
         record(id('holder'), { title: 'held', email: null }),
       ],
       state,
-      options(),
-      (store, metadata) => {
-        assert.equal(metadata.counts.record.update, 5);
-        assert.equal(metadata.counts.record.noop, 1);
-        for (const entry of store.planEntries('record', 'update'))
-          assert.deepEqual(entry.diagnostics, []);
-      },
     );
+    assert.equal(plan.metadata.counts.record.update, 5);
+    assert.equal(plan.metadata.counts.record.noop, 1);
+    for (const entry of plan.records.values())
+      if (entry.action === 'update') assert.deepEqual(entry.diagnostics, []);
   });
 
   it('never reads field validators or default values while planning', async () => {
@@ -1146,22 +1172,14 @@ describe('indexed planner', () => {
         position,
       });
     };
-    const store = new SnapshotStore();
-    try {
-      for (const entry of [linked(A, B, 0), linked(B, A, 1)])
-        store.putRecord('source', entry);
-      store.putRecord('target', record(C, { title: 'old' }, { position: 0 }));
-      const metadata = createPlan(
-        store,
-        state,
-        { ...state, environmentId: 'target' },
-        options({ includeDeletions: true }),
-      );
-      assert.equal(metadata.counts.record.create, 2);
-      assert.equal(metadata.counts.record.delete, 1);
-    } finally {
-      store.dispose();
-    }
+    const { plan } = await fixture(
+      [linked(A, B, 0), linked(B, A, 1)],
+      [record(C, { title: 'old' }, { position: 0 })],
+      state,
+      options({ includeDeletions: true }),
+    );
+    assert.equal(plan.metadata.counts.record.create, 2);
+    assert.equal(plan.metadata.counts.record.delete, 1);
   });
 
   it('publishes link cycles among new records in two steps', async () => {
@@ -1176,33 +1194,40 @@ describe('indexed planner', () => {
           published: { link },
         },
       );
-    await fixture(
+    const { plan, operations } = await fixture(
       [linked(A, B), linked(B, A)],
       [],
       state,
-      options(),
-      (store, metadata) => {
-        assert.equal(metadata.counts.record.create, 2);
-        const [first, second] = [A, B]
-          .map((recordId) => store.getPlan('record', recordId) as RecordPlan)
-          .sort((left, right) =>
-            left.execution?.provisionalPublished
-              ? -1
-              : right.execution?.provisionalPublished
-                ? 1
-                : 0,
-          );
-        // One record publishes without its cycle link, the other can then
-        // publish, and apply republishes the first one with the link.
-        assert.deepEqual([first.diagnostics, second.diagnostics], [[], []]);
-        assert.deepEqual(first.execution?.provisionalPublished, {
-          link: null,
-        });
-        assert.equal(first.execution?.publishOrder, 0);
-        assert.equal(second.execution?.provisionalPublished, undefined);
-        assert.equal(second.execution?.publishOrder, 1);
-      },
     );
+    assert.equal(plan.metadata.counts.record.create, 2);
+    const [first, second] = [A, B]
+      .map((recordId) => plan.records.get(recordId)!)
+      .sort((left, right) =>
+        left.execution?.provisionalTargets
+          ? -1
+          : right.execution?.provisionalTargets
+            ? 1
+            : 0,
+      );
+    // One record publishes without its cycle link, the other can then
+    // publish, and apply republishes the first one with the link.
+    assert.deepEqual([first.diagnostics, second.diagnostics], [[], []]);
+    assert.deepEqual(first.execution?.provisionalTargets, [second.id]);
+    assert.deepEqual(firstPublished(operations, first.id), { link: null });
+    assert.equal(first.execution?.publishOrder, 0);
+    assert.equal(second.execution?.provisionalTargets, undefined);
+    assert.equal(second.execution?.publishOrder, 1);
+    assert.deepEqual(
+      operations
+        .filter((operation) => operation.op === 'record.publish')
+        .map((operation) => operation.id),
+      [first.id, second.id, first.id],
+    );
+    const restore = operations.find((operation) =>
+      operation.label.startsWith('Restore the links left out'),
+    );
+    assert.equal(restore?.id, first.id);
+    assert.deepEqual(restore?.data, { link: second.id });
   });
 
   it('drops one link per cycle and keeps links outside it', async () => {
@@ -1222,29 +1247,27 @@ describe('indexed planner', () => {
         },
       );
     const existing = linked(X, []);
-    await fixture(
-      [linked(A, [B, X]), linked(B, [C, X]), linked(C, [A, X]), existing],
+    const next = new Map([
+      [A, B],
+      [B, C],
+      [C, A],
+    ]);
+    const { plan, operations } = await fixture(
+      [...[...next].map(([owner, link]) => linked(owner, [link, X])), existing],
       [existing],
       state,
-      options(),
-      (store) => {
-        const entries = [A, B, C].map(
-          (recordId) => store.getPlan('record', recordId) as RecordPlan,
-        );
-        const provisional = entries.filter(
-          (entry) => entry.execution?.provisionalPublished,
-        );
-        assert.equal(provisional.length, 1);
-        const [entry] = provisional;
-        const links = entry.desired!.published!.links as string[];
-        assert.deepEqual(entry.execution!.provisionalPublished, {
-          links: links.filter((target) => target === X),
-        });
-        assert.deepEqual(
-          entries.map((candidate) => candidate.diagnostics),
-          [[], [], []],
-        );
-      },
+    );
+    const entries = [A, B, C].map((recordId) => plan.records.get(recordId)!);
+    const provisional = entries.filter(
+      (entry) => entry.execution?.provisionalTargets,
+    );
+    assert.equal(provisional.length, 1);
+    const [entry] = provisional;
+    assert.deepEqual(entry.execution!.provisionalTargets, [next.get(entry.id)]);
+    assert.deepEqual(firstPublished(operations, entry.id), { links: [X] });
+    assert.deepEqual(
+      entries.map((candidate) => candidate.diagnostics),
+      [[], [], []],
     );
   });
 
@@ -1270,19 +1293,17 @@ describe('indexed planner', () => {
         },
       ),
     );
-    await fixture(source, [], state, options(), (store, metadata) => {
-      assert.equal(metadata.counts.record.create, 2);
-      assert.deepEqual(
-        [A, B]
-          .map(
-            (recordId) =>
-              (store.getPlan('record', recordId) as RecordPlan).execution
-                ?.provisionalPublished,
-          )
-          .filter(Boolean),
-        [{ link: null }],
-      );
-    });
+    const { plan, operations } = await fixture(source, [], state);
+    assert.equal(plan.metadata.counts.record.create, 2);
+    assert.deepEqual(
+      [A, B]
+        .filter(
+          (recordId) =>
+            plan.records.get(recordId)!.execution?.provisionalTargets,
+        )
+        .map((recordId) => firstPublished(operations, recordId)),
+      [{ link: null }],
+    );
   });
 
   it('still diagnoses publication cycles through links inside blocks', async () => {
@@ -1317,18 +1338,19 @@ describe('indexed planner', () => {
     };
     const source = [linked(A, B), linked(B, A)];
     await assert.rejects(
-      fixture(source, [], state, options()),
+      fixture(source, [], state),
       (error: unknown) =>
         unsafe(error) &&
         (error as ContentError).details?.reason === 'PUBLICATION_CYCLE',
     );
-    await fixture(
+    const { plan, operations } = await fixture(
       source,
       [],
       state,
       options({ allowPartial: true }),
-      (_store, metadata) => assert.equal(metadata.counts.record.skip, 2),
     );
+    assert.equal(plan.metadata.counts.record.skip, 2);
+    assert.deepEqual(operations, []);
   });
 
   it('breaks a cycle of a link and a Structured Text link at the link in either ID order', async () => {
@@ -1370,20 +1392,20 @@ describe('indexed planner', () => {
       const source = [A, B].map((recordId) =>
         record(recordId, fields(recordId), { published: fields(recordId) }),
       );
-      await fixture(source, [], state, options(), (store, metadata) => {
-        assert.equal(metadata.counts.record.create, 2);
-        assert.equal(metadata.counts.record.skip, 0);
-        const owner = store.getPlan('record', linking) as RecordPlan;
-        const other = store.getPlan('record', linked) as RecordPlan;
-        assert.deepEqual(owner.execution?.provisionalPublished, {
-          link: null,
-          body: null,
-        });
-        assert.equal(other.execution?.provisionalPublished, undefined);
-        assert.ok(
-          owner.execution!.publishOrder! < other.execution!.publishOrder!,
-        );
+      const { plan, operations } = await fixture(source, [], state);
+      assert.equal(plan.metadata.counts.record.create, 2);
+      assert.equal(plan.metadata.counts.record.skip, 0);
+      const owner = plan.records.get(linking)!;
+      const other = plan.records.get(linked)!;
+      assert.deepEqual(owner.execution?.provisionalTargets, [linked]);
+      assert.deepEqual(firstPublished(operations, linking), {
+        link: null,
+        body: null,
       });
+      assert.equal(other.execution?.provisionalTargets, undefined);
+      assert.ok(
+        owner.execution!.publishOrder! < other.execution!.publishOrder!,
+      );
     }
   });
 
@@ -1408,44 +1430,43 @@ describe('indexed planner', () => {
           published: { link },
         },
       );
-    await fixture(
+    // The record created second links to the first one, which its create
+    // has already published.
+    const automated = await fixture(
       [linked(A, B, automatic.id), linked(B, A, automatic.id)],
       [],
       state,
       opts,
-      (store) => {
-        // The record created second links to the first one, which its
-        // create has already published.
-        const [first, second] = creationCycle(store);
-        for (const entry of [first, second]) {
-          assert.equal(entry.action, 'create');
-          assert.deepEqual(entry.diagnostics, []);
-          assert.equal(entry.execution?.publishOrder, 0);
-        }
-        assert.deepEqual(first.execution?.creationFields, { link: null });
-        assert.deepEqual(second.execution?.creationFields, { link: first.id });
-      },
     );
+    const [first, second] = creationCycle(automated);
+    for (const entry of [first, second]) {
+      assert.equal(entry.action, 'create');
+      assert.deepEqual(entry.diagnostics, []);
+      assert.equal(entry.execution?.publishOrder, 0);
+    }
+    assert.deepEqual(creationFields(automated.operations, first.id), {
+      link: null,
+    });
+    assert.deepEqual(creationFields(automated.operations, second.id), {
+      link: first.id,
+    });
     // A new draft is published only in the publication phase, so the record
     // linking back to it still writes that link afterwards.
-    await fixture(
+    const { plan, operations } = await fixture(
       [linked(A, B, MODEL), linked(B, A, automatic.id)],
       [],
       state,
       opts,
-      (store) => {
-        const draft = store.getPlan('record', A) as RecordPlan;
-        const owner = store.getPlan('record', B) as RecordPlan;
-        for (const entry of [draft, owner]) {
-          assert.equal(entry.action, 'create');
-          assert.deepEqual(entry.diagnostics, []);
-        }
-        assert.deepEqual(owner.execution?.creationFields, { link: null });
-        assert.ok(
-          draft.execution!.publishOrder! < owner.execution!.publishOrder!,
-        );
-      },
     );
+    const draft = plan.records.get(A)!;
+    const owner = plan.records.get(B)!;
+    for (const entry of [draft, owner]) {
+      assert.equal(entry.action, 'create');
+      assert.deepEqual(entry.diagnostics, []);
+    }
+    assert.deepEqual(owner.execution?.deferredFields, ['link']);
+    assert.deepEqual(creationFields(operations, B), { link: null });
+    assert.ok(draft.execution!.publishOrder! < owner.execution!.publishOrder!);
   });
 
   it('plans native self-reference publication, unpublication, and deletion', async () => {
@@ -1482,33 +1503,25 @@ describe('indexed planner', () => {
         published: fields,
       });
       for (const target of [[], [draft]]) {
-        await fixture([published], target, state, options(), (store) => {
-          const plan = store.getPlan('record', A) as RecordPlan;
-          assert.equal(plan.execution?.publishOrder, 0);
-          if (target.length === 0)
-            assert.deepEqual(plan.execution?.creationFields, {
-              body: creationEmptyValue(type),
-            });
-        });
+        const { plan, operations } = await fixture([published], target, state);
+        const entry = plan.records.get(A)!;
+        assert.equal(entry.execution?.publishOrder, 0);
+        if (target.length === 0) {
+          assert.deepEqual(entry.execution?.deferredFields, ['body']);
+          assert.deepEqual(creationFields(operations, A), {
+            body: creationEmptyValue(type),
+          });
+        }
       }
-      await fixture([draft], [published], state, options(), (store) => {
-        assert.equal(
-          (store.getPlan('record', A) as RecordPlan).execution?.publishOrder,
-          0,
-        );
-      });
-      await fixture(
+      const unpublished = await fixture([draft], [published], state);
+      assert.equal(unpublished.plan.records.get(A)!.execution?.publishOrder, 0);
+      const deleted = await fixture(
         [],
         [published],
         state,
         options({ includeDeletions: true }),
-        (store) => {
-          assert.equal(
-            (store.getPlan('record', A) as RecordPlan).execution?.deleteOrder,
-            0,
-          );
-        },
       );
+      assert.equal(deleted.plan.records.get(A)!.execution?.deleteOrder, 0);
     }
   });
 
@@ -1516,41 +1529,34 @@ describe('indexed planner', () => {
     const state = schema([
       model({ fields: [field({ apiKey: 'link', type: 'link' })] }),
     ]);
-    await fixture(
+    const cycle = await fixture(
       [],
       [record(A, { link: B }), record(B, { link: A })],
       state,
       options({ includeDeletions: true }),
-      (store, metadata) => {
-        assert.equal(metadata.counts.record.delete, 2);
-        const orders = [A, B].map(
-          (recordId) =>
-            (store.getPlan('record', recordId) as RecordPlan).execution
-              ?.deleteOrder,
-        );
-        assert.equal(new Set(orders).size, 2);
-      },
     );
+    assert.equal(cycle.plan.metadata.counts.record.delete, 2);
+    const orders = [A, B].map(
+      (recordId) => cycle.plan.records.get(recordId)!.execution?.deleteOrder,
+    );
+    assert.equal(new Set(orders).size, 2);
     const tree = schema([model({ tree: true })]);
-    await fixture(
+    const created = await fixture(
       [record(A, { title: 'self' }, { parentId: A, position: 0 })],
       [],
       tree,
-      options(),
-      (store) =>
-        assert.equal(
-          typeof (store.getPlan('record', A) as RecordPlan).execution
-            ?.createOrder,
-          'number',
-        ),
     );
-    await fixture(
+    assert.equal(
+      typeof created.plan.records.get(A)!.execution?.createOrder,
+      'number',
+    );
+    const deleted = await fixture(
       [],
       [record(A, { title: 'self' }, { parentId: A, position: 0 })],
       tree,
       options({ includeDeletions: true }),
-      (_store, metadata) => assert.equal(metadata.counts.record.delete, 1),
     );
+    assert.equal(deleted.plan.metadata.counts.record.delete, 1);
   });
 
   it('deletes a record that only waits on a deletion cycle after that cycle', async () => {
@@ -1560,7 +1566,7 @@ describe('indexed planner', () => {
     const state = schema([
       model({ fields: [field({ apiKey: 'links', type: 'links' })] }),
     ]);
-    await fixture(
+    const { plan } = await fixture(
       [],
       [
         record(first!, { links: [second!, target!] }),
@@ -1569,14 +1575,11 @@ describe('indexed planner', () => {
       ],
       state,
       options({ includeDeletions: true }),
-      (store) => {
-        const order = (recordId: string) =>
-          (store.getPlan('record', recordId) as RecordPlan).execution!
-            .deleteOrder!;
-        assert.notEqual(order(first!), order(second!));
-        assert.ok(order(target!) > order(first!));
-      },
     );
+    const order = (recordId: string) =>
+      plan.records.get(recordId)!.execution!.deleteOrder!;
+    assert.notEqual(order(first!), order(second!));
+    assert.ok(order(target!) > order(first!));
   });
 
   it('plans explicit nulls over configured defaults without consulting defaults', async () => {
@@ -1620,14 +1623,14 @@ describe('indexed planner', () => {
           },
         },
       ],
-    ] as const)
-      await fixture(
+    ] as const) {
+      const { plan } = await fixture(
         [record(A, fields as JsonObject)],
         [],
         state,
-        options(),
-        (_store, metadata) => assert.equal(metadata.counts.record.create, 1),
       );
+      assert.equal(plan.metadata.counts.record.create, 1);
+    }
   });
 
   it('plans block relocation, reuse and singleton identity changes', async () => {
@@ -1647,7 +1650,7 @@ describe('indexed planner', () => {
     };
     // A block moving to another record, a block repeated within one record,
     // and a published-only block written back to the draft all plan as writes.
-    await fixture(
+    const moved = await fixture(
       [
         record(A, { block: null, blocks: [] }),
         record(B, { block, blocks: [block, block] }),
@@ -1657,19 +1660,16 @@ describe('indexed planner', () => {
         record(B, { block: null, blocks: [] }),
       ],
       state,
-      options(),
-      (_store, metadata) => assert.equal(metadata.counts.record.update, 2),
     );
-    await fixture(
+    assert.equal(moved.plan.metadata.counts.record.update, 2);
+    const { plan } = await fixture(
       [record(A)],
       [record(B)],
       schema([model({ singleton: true })]),
       options({ includeDeletions: true }),
-      (store) => {
-        assert.equal(store.getPlan('record', A)?.action, 'create');
-        assert.equal(store.getPlan('record', B)?.action, 'delete');
-      },
     );
+    assert.equal(plan.records.get(A)?.action, 'create');
+    assert.equal(plan.records.get(B)?.action, 'delete');
   });
 
   it('deletes an upload still referenced by a retained record and leaves the reference to the CMA', async () => {
@@ -1677,26 +1677,20 @@ describe('indexed planner', () => {
       id: id('other-model'),
       fields: [field({ apiKey: 'file', type: 'file' })],
     });
-    const state = schema([model(), other]);
     const asset = upload();
-    const store = new SnapshotStore();
-    try {
-      store.putRecord(
-        'target',
-        record(B, { file: { upload_id: asset.id } }, { modelId: other.id }),
-      );
-      store.putUpload('target', asset);
-      const metadata = createPlan(
-        store,
-        state,
-        state,
-        options({ uploads: 'all', includeDeletions: true }),
-      );
-      assert.equal(store.getPlan('upload', asset.id)?.action, 'delete');
-      assert.equal(metadata.counts.record.noop, 1);
-    } finally {
-      store.dispose();
-    }
+    const { plan } = await fixture(
+      [],
+      {
+        records: [
+          record(B, { file: { upload_id: asset.id } }, { modelId: other.id }),
+        ],
+        uploads: [asset],
+      },
+      schema([model(), other]),
+      options({ uploads: 'all', includeDeletions: true }),
+    );
+    assert.equal(plan.uploads.get(asset.id)?.action, 'delete');
+    assert.equal(plan.metadata.counts.record.noop, 1);
   });
 
   it('orders tree creates and linked deletes iteratively', async () => {
@@ -1706,34 +1700,27 @@ describe('indexed planner', () => {
         fields: [field(), field({ id: LINK, apiKey: 'link', type: 'link' })],
       }),
     ]);
-    await fixture(
+    const created = await fixture(
       [
         record(A, { title: 'parent' }, { position: 0 }),
         record(B, { title: 'child' }, { parentId: A, position: 0 }),
       ],
       [],
       state,
-      options(),
-      (store) => {
-        const parent = store.getPlan('record', A) as RecordPlan;
-        const child = store.getPlan('record', B) as RecordPlan;
-        assert.ok(
-          parent.execution!.createOrder! < child.execution!.createOrder!,
-        );
-      },
     );
-    await fixture(
+    const parent = created.plan.records.get(A)!;
+    const child = created.plan.records.get(B)!;
+    assert.ok(parent.execution!.createOrder! < child.execution!.createOrder!);
+    const deleted = await fixture(
       [],
       [record(A, { title: 'owner', link: B }), record(B)],
       state,
       options({ includeDeletions: true }),
-      (store) => {
-        const owner = store.getPlan('record', A) as RecordPlan;
-        const dependency = store.getPlan('record', B) as RecordPlan;
-        assert.ok(
-          owner.execution!.deleteOrder! < dependency.execution!.deleteOrder!,
-        );
-      },
+    );
+    const owner = deleted.plan.records.get(A)!;
+    const dependency = deleted.plan.records.get(B)!;
+    assert.ok(
+      owner.execution!.deleteOrder! < dependency.execution!.deleteOrder!,
     );
   });
 
@@ -1741,11 +1728,10 @@ describe('indexed planner', () => {
     const state = schema([model({ tree: true })]);
     const node = (recordId: string, parentId: string | null) =>
       record(recordId, { title: 'node' }, { parentId, position: 0 });
-    const order = (store: SnapshotStore, recordId: string) =>
-      (store.getPlan('record', recordId) as RecordPlan).execution!
-        .publishOrder!;
-    const clean = (store: SnapshotStore) => {
-      for (const entry of store.planEntries('record'))
+    const order = ({ plan }: Planned, recordId: string) =>
+      plan.records.get(recordId)!.execution!.publishOrder!;
+    const clean = ({ plan }: Planned) => {
+      for (const entry of plan.records.values())
         assert.deepEqual(entry.diagnostics, []);
     };
     // X > P > Y becomes P > Y > X with Y unchanged. Moving X first would put
@@ -1756,36 +1742,30 @@ describe('indexed planner', () => {
       [second, first],
     ]) {
       const unchanged = node(C, ancestor);
-      await fixture(
+      const planned = await fixture(
         [node(ancestor, null), unchanged, node(moved, C)],
         [node(moved, null), node(ancestor, moved), unchanged],
         state,
-        options(),
-        (store, metadata) => {
-          assert.equal(metadata.counts.record.update, 2);
-          assert.equal(metadata.counts.record.noop, 1);
-          assert.ok(order(store, ancestor) < order(store, moved));
-          clean(store);
-        },
       );
+      assert.equal(planned.plan.metadata.counts.record.update, 2);
+      assert.equal(planned.plan.metadata.counts.record.noop, 1);
+      assert.ok(order(planned, ancestor) < order(planned, moved));
+      clean(planned);
     }
     // X > P > U > Q > V becomes Q > V > P > U > X with U and V unchanged.
     // Each move waits for the nearest moved ancestor, which waits for its own.
     const [x, p, u, q, v] = ['x', 'p', 'u', 'q', 'v'].map(id);
-    await fixture(
+    const chain = await fixture(
       [node(q, null), node(v, q), node(p, v), node(u, p), node(x, u)],
       [node(x, null), node(p, x), node(u, p), node(q, u), node(v, q)],
       state,
-      options(),
-      (store, metadata) => {
-        assert.equal(metadata.counts.record.update, 3);
-        assert.ok(order(store, q) < order(store, p));
-        assert.ok(order(store, p) < order(store, x));
-        clean(store);
-      },
     );
+    assert.equal(chain.plan.metadata.counts.record.update, 3);
+    assert.ok(order(chain, q) < order(chain, p));
+    assert.ok(order(chain, p) < order(chain, x));
+    clean(chain);
     // An ordinary leaf move has no moved ancestor to wait for.
-    await fixture(
+    const leaf = await fixture(
       [
         record(A, { title: 'a' }, { position: 0 }),
         record(B, { title: 'b' }, { position: 1 }),
@@ -1797,57 +1777,43 @@ describe('indexed planner', () => {
         record(C, { title: 'leaf' }, { parentId: A, position: 0 }),
       ],
       state,
-      options(),
-      (store, metadata) => {
-        assert.equal(metadata.counts.record.update, 1);
-        assert.equal(order(store, C), 0);
-        clean(store);
-      },
     );
+    assert.equal(leaf.plan.metadata.counts.record.update, 1);
+    assert.equal(order(leaf, C), 0);
+    clean(leaf);
   });
 
-  it('plans a 6000-record dependency chain from disk without a recursive graph traversal', async () => {
+  it('plans a 6000-record dependency chain without a recursive graph traversal', async () => {
     const state = schema([model({ tree: true })]);
-    const store = new SnapshotStore();
-    try {
-      // Build the fixture in bounded transactions too: no array of all record
-      // payloads should hide a project-sized memory requirement in this test.
-      for (let start = 0; start < 6000; start += 100)
-        store.transaction(() => {
-          for (let index = start; index < start + 100; index++)
-            store.putRecord(
-              'source',
-              record(
-                id(`node-${index}`),
-                { title: `node-${index}` },
-                {
-                  parentId: index ? id(`node-${index - 1}`) : null,
-                  position: 0,
-                  published: { title: `node-${index}` },
-                },
-              ),
-            );
-        });
-      const metadata = createPlan(
-        store,
-        state,
-        { ...state, environmentId: 'target' },
-        options(),
-      );
-      assert.equal(metadata.counts.record.create, 6000);
-      let checked = 0;
-      for (const entry of store.planEntries('record')) {
-        assert.equal(entry.kind, 'record');
-        if (entry.kind !== 'record') continue;
-        const depth = Number(String(entry.desired!.current.title).slice(5));
-        assert.equal(entry.execution?.createOrder, depth);
-        assert.equal(entry.execution?.publishOrder, depth);
-        checked++;
-      }
-      assert.equal(checked, 6000);
-    } finally {
-      store.dispose();
+    const records = Array.from({ length: 6000 }, (_, index) =>
+      record(
+        id(`node-${index}`),
+        { title: `node-${index}` },
+        {
+          parentId: index ? id(`node-${index - 1}`) : null,
+          position: 0,
+          published: { title: `node-${index}` },
+        },
+      ),
+    );
+    const { plan, operations } = await fixture(records, [], state);
+    assert.equal(plan.metadata.counts.record.create, 6000);
+    let checked = 0;
+    for (const entry of plan.records.values()) {
+      const depth = Number(entry.desired!.title!.slice(5));
+      assert.equal(entry.execution?.createOrder, depth);
+      assert.equal(entry.execution?.publishOrder, depth);
+      checked++;
     }
+    assert.equal(checked, 6000);
+    // Each record is created, and then published, after its parent.
+    for (const op of ['record.create', 'record.publish'])
+      assert.deepEqual(
+        operations
+          .filter((operation) => operation.op === op)
+          .map((operation) => operation.id),
+        records.map((entry) => entry.id),
+      );
   });
 
   it('preserves already published dependency cycles when both targets are available', async () => {
@@ -1888,9 +1854,8 @@ describe('indexed planner', () => {
         },
       ),
     ];
-    await fixture(source, target, state, options(), (_store, metadata) =>
-      assert.equal(metadata.counts.record.update, 2),
-    );
+    const { plan } = await fixture(source, target, state);
+    assert.equal(plan.metadata.counts.record.update, 2);
   });
 
   it('unpublishes a record still referenced by a retained publication', async () => {
@@ -1904,17 +1869,14 @@ describe('indexed planner', () => {
       record(A, { title: 'old' }, { published: { title: 'old' } }),
       record(B, { link: A }, { modelId: other.id, published: { link: A } }),
     ];
-    await fixture(
+    const { plan } = await fixture(
       [record(A, { title: 'new' })],
       target,
       state,
-      options(),
-      (store) => {
-        const entry = store.getPlan('record', A) as RecordPlan;
-        assert.equal(entry.action, 'update');
-        assert.deepEqual(entry.diagnostics, []);
-      },
     );
+    const entry = plan.records.get(A)!;
+    assert.equal(entry.action, 'update');
+    assert.deepEqual(entry.diagnostics, []);
   });
 
   it('releases previous published references before unpublishing their dependencies', async () => {
@@ -1940,22 +1902,18 @@ describe('indexed planner', () => {
       ),
     ];
     for (const published of [{ title: 'owner', link: null }, null]) {
-      await fixture(
+      const { plan } = await fixture(
         [
           record(A, { title: 'owner', link: null }, { published }),
           record(B, { title: 'dependency', link: null }),
         ],
         target,
         state,
-        options(),
-        (store) => {
-          const owner = store.getPlan('record', A) as RecordPlan;
-          const dependency = store.getPlan('record', B) as RecordPlan;
-          assert.ok(
-            owner.execution!.publishOrder! <
-              dependency.execution!.publishOrder!,
-          );
-        },
+      );
+      const owner = plan.records.get(A)!;
+      const dependency = plan.records.get(B)!;
+      assert.ok(
+        owner.execution!.publishOrder! < dependency.execution!.publishOrder!,
       );
     }
   });
@@ -1979,21 +1937,19 @@ describe('indexed planner', () => {
         { published: { title: 'dependency', link: null } },
       ),
     ];
-    await fixture(
+    const { plan } = await fixture(
       source,
       target,
       state,
       options({ includeDeletions: true }),
-      (store) => {
-        assert.equal(store.getPlan('record', A)?.action, 'delete');
-        assert.equal(store.getPlan('record', B)?.action, 'update');
-      },
     );
+    assert.equal(plan.records.get(A)?.action, 'delete');
+    assert.equal(plan.records.get(B)?.action, 'update');
   });
 
   it('plans no update when only ordering differs', async () => {
     const state = schema([model({ sortable: true })]);
-    await fixture(
+    const { plan, operations } = await fixture(
       [
         record(A, { title: 'same' }, { position: 0 }),
         record(B, { title: 'same' }, { position: 1 }),
@@ -2003,32 +1959,33 @@ describe('indexed planner', () => {
         record(B, { title: 'same' }, { position: 0 }),
       ],
       state,
-      options(),
-      (store, metadata) => {
-        assert.equal(metadata.counts.record.update, 0);
-        assert.equal(store.getPlan('record', A)?.action, 'noop');
-      },
+    );
+    assert.equal(plan.metadata.counts.record.update, 0);
+    assert.equal(plan.records.get(A)?.action, 'noop');
+    // The group is ordered by one reorder instead.
+    assert.deepEqual(
+      operations.map((operation) => [operation.op, operation.data]),
+      [['records.reorder', { model: MODEL, parent: null, order: [A, B] }]],
     );
   });
 
   it('plans no update when a requested position coincides with a retained one', async () => {
     const state = schema([model({ sortable: true })]);
-    await fixture(
+    const { plan } = await fixture(
       [record(A, { title: 'same' }, { position: 0 })],
       [
         record(A, { title: 'same' }, { position: 1 }),
         record(B, { title: 'keep' }, { position: 0 }),
       ],
       state,
-      options(),
-      (store) => assert.equal(store.getPlan('record', A)?.action, 'noop'),
     );
+    assert.equal(plan.records.get(A)?.action, 'noop');
   });
 
   it('skips a refused record without closing over its ordered model', async () => {
     const state = schema([model({ sortable: true })]);
     const lossy = { title: { __itemTypeId: 'business value' } };
-    await fixture(
+    const { plan } = await fixture(
       [
         record(A, lossy, { position: 0 }),
         record(B, { title: 'sibling' }, { position: 1 }),
@@ -2036,12 +1993,10 @@ describe('indexed planner', () => {
       [],
       state,
       options({ allowPartial: true }),
-      (store, metadata) => {
-        assert.equal(store.getPlan('record', A)?.action, 'skip');
-        assert.equal(store.getPlan('record', B)?.action, 'create');
-        assert.equal(metadata.counts.record.skip, 1);
-      },
     );
+    assert.equal(plan.records.get(A)?.action, 'skip');
+    assert.equal(plan.records.get(B)?.action, 'create');
+    assert.equal(plan.metadata.counts.record.skip, 1);
   });
 
   it('spreads a skip only to writes referencing a skipped create and deletes its retained state needs', async () => {
@@ -2053,7 +2008,7 @@ describe('indexed planner', () => {
     const lossy = { title: { __itemTypeId: 'business value' }, link: null };
     const X = id('x');
     const Y = id('y');
-    await fixture(
+    const { plan } = await fixture(
       [
         // A is a refused create: B and C reference it and are skipped too,
         // whether they are creates or updates.
@@ -2074,23 +2029,18 @@ describe('indexed planner', () => {
       ],
       state,
       options({ allowPartial: true, includeDeletions: true }),
-      (store) => {
-        const action = (recordId: string) =>
-          store.getPlan('record', recordId)?.action;
-        assert.equal(action(A), 'skip');
-        assert.equal(action(B), 'skip');
-        assert.equal(action(C), 'skip');
-        assert.equal(action(X), 'skip');
-        assert.equal(action(Y), 'update');
-        assert.equal(action(id('d')), 'skip');
-        assert.equal(action(id('e')), 'delete');
-        assert.deepEqual(
-          store
-            .getPlan('record', id('d'))
-            ?.diagnostics.map((item) => item.code),
-          ['PRESERVED_SKIP_DEPENDENCY'],
-        );
-      },
+    );
+    const action = (recordId: string) => plan.records.get(recordId)?.action;
+    assert.equal(action(A), 'skip');
+    assert.equal(action(B), 'skip');
+    assert.equal(action(C), 'skip');
+    assert.equal(action(X), 'skip');
+    assert.equal(action(Y), 'update');
+    assert.equal(action(id('d')), 'skip');
+    assert.equal(action(id('e')), 'delete');
+    assert.deepEqual(
+      plan.records.get(id('d'))?.diagnostics.map((item) => item.code),
+      ['PRESERVED_SKIP_DEPENDENCY'],
     );
   });
 
@@ -2106,41 +2056,28 @@ describe('indexed planner', () => {
     kept.hash = hashJson(kept);
     const unrelated = upload(id('unrelated'));
     const X = id('x');
-    const store = new SnapshotStore();
-    try {
-      store.putRecord(
-        'source',
-        record(X, { title: { __itemTypeId: 'business value' }, file: null }),
+    const { plan } = await fixture(
+      [record(X, { title: { __itemTypeId: 'business value' }, file: null })],
+      {
+        records: [record(X, { title: 'old', file: { upload_id: kept.id } })],
+        uploads: [kept, unrelated],
+        collections: [folder],
+      },
+      state,
+      options({ allowPartial: true, includeDeletions: true, uploads: 'all' }),
+    );
+    assert.equal(plan.records.get(X)?.action, 'skip');
+    for (const entry of [
+      plan.uploads.get(kept.id),
+      plan.collections.get(folder.id),
+    ]) {
+      assert.equal(entry?.action, 'skip');
+      assert.deepEqual(
+        entry?.diagnostics.map((item) => item.code),
+        ['PRESERVED_SKIP_DEPENDENCY'],
       );
-      store.putRecord(
-        'target',
-        record(X, { title: 'old', file: { upload_id: kept.id } }),
-      );
-      store.putUpload('target', kept);
-      store.putUpload('target', unrelated);
-      store.putCollection('target', folder);
-      createPlan(
-        store,
-        state,
-        { ...state, environmentId: 'target' },
-        options({ allowPartial: true, includeDeletions: true, uploads: 'all' }),
-      );
-      assert.equal(store.getPlan('record', X)?.action, 'skip');
-      for (const [kind, entryId] of [
-        ['upload', kept.id],
-        ['collection', folder.id],
-      ] as const) {
-        const entry = store.getPlan(kind, entryId);
-        assert.equal(entry?.action, 'skip');
-        assert.deepEqual(
-          entry?.diagnostics.map((item) => item.code),
-          ['PRESERVED_SKIP_DEPENDENCY'],
-        );
-      }
-      assert.equal(store.getPlan('upload', unrelated.id)?.action, 'delete');
-    } finally {
-      store.dispose();
     }
+    assert.equal(plan.uploads.get(unrelated.id)?.action, 'delete');
   });
 
   it('unpublishes published records that link to each other in a forced order', async () => {
@@ -2155,21 +2092,18 @@ describe('indexed planner', () => {
         { title: recordId, link },
         published ? { published: { title: recordId, link } } : {},
       );
-    await fixture(
+    const { plan } = await fixture(
       [linked(A, B, false), linked(B, A, false)],
       [linked(A, B, true), linked(B, A, true)],
       state,
-      options(),
-      (store) => {
-        const orders = [A, B].map((recordId) => {
-          const entry = store.getPlan('record', recordId) as RecordPlan;
-          assert.equal(entry.action, 'update');
-          assert.deepEqual(entry.diagnostics, []);
-          return entry.execution!.publishOrder;
-        });
-        assert.notEqual(orders[0], orders[1]);
-      },
     );
+    const orders = [A, B].map((recordId) => {
+      const entry = plan.records.get(recordId)!;
+      assert.equal(entry.action, 'update');
+      assert.deepEqual(entry.diagnostics, []);
+      return entry.execution!.publishOrder;
+    });
+    assert.notEqual(orders[0], orders[1]);
   });
 
   it('unpublishes a record referenced from an unpublishing cycle after its referrer', async () => {
@@ -2185,7 +2119,7 @@ describe('indexed planner', () => {
         { title: recordId, links },
         published ? { published: { title: recordId, links } } : {},
       );
-    await fixture(
+    const { plan } = await fixture(
       [
         linked(first!, [second!, target!], false),
         linked(second!, [first!], false),
@@ -2197,17 +2131,14 @@ describe('indexed planner', () => {
         linked(target!, [], true),
       ],
       state,
-      options(),
-      (store) => {
-        const order = (recordId: string) => {
-          const entry = store.getPlan('record', recordId) as RecordPlan;
-          assert.deepEqual(entry.diagnostics, []);
-          return entry.execution!.publishOrder!;
-        };
-        assert.notEqual(order(first!), order(second!));
-        assert.ok(order(target!) > order(first!));
-      },
     );
+    const order = (recordId: string) => {
+      const entry = plan.records.get(recordId)!;
+      assert.deepEqual(entry.diagnostics, []);
+      return entry.execution!.publishOrder!;
+    };
+    assert.notEqual(order(first!), order(second!));
+    assert.ok(order(target!) > order(first!));
   });
 
   it('unpublishes a tree child before its unpublished parent', async () => {
@@ -2226,20 +2157,15 @@ describe('indexed planner', () => {
           ...(published ? { published: { title: recordId } } : {}),
         },
       );
-    await fixture(
+    const { plan } = await fixture(
       [node(A, null, false), node(B, A, false)],
       [node(A, null, true), node(B, A, true)],
       state,
-      options(),
-      (store) => {
-        const parent = store.getPlan('record', A) as RecordPlan;
-        const child = store.getPlan('record', B) as RecordPlan;
-        assert.deepEqual([...parent.diagnostics, ...child.diagnostics], []);
-        assert.ok(
-          child.execution!.publishOrder! < parent.execution!.publishOrder!,
-        );
-      },
     );
+    const parent = plan.records.get(A)!;
+    const child = plan.records.get(B)!;
+    assert.deepEqual([...parent.diagnostics, ...child.diagnostics], []);
+    assert.ok(child.execution!.publishOrder! < parent.execution!.publishOrder!);
   });
 
   it('publishes a new tree child linked from a block of its already published parent', async () => {
@@ -2269,7 +2195,7 @@ describe('indexed planner', () => {
       { blocks: [] },
       { parentId: A, position: 0, published: { blocks: [] } },
     );
-    await fixture(
+    const { plan } = await fixture(
       [
         record(
           A,
@@ -2286,19 +2212,16 @@ describe('indexed planner', () => {
         ),
       ],
       state,
-      options(),
-      (store) => {
-        const parent = store.getPlan('record', A) as RecordPlan;
-        const created = store.getPlan('record', B) as RecordPlan;
-        assert.equal(parent.action, 'update');
-        assert.equal(created.action, 'create');
-        assert.deepEqual([...parent.diagnostics, ...created.diagnostics], []);
-        assert.equal(parent.execution?.provisionalPublished, undefined);
-        assert.equal(created.execution?.provisionalPublished, undefined);
-        assert.ok(
-          created.execution!.publishOrder! < parent.execution!.publishOrder!,
-        );
-      },
+    );
+    const parent = plan.records.get(A)!;
+    const created = plan.records.get(B)!;
+    assert.equal(parent.action, 'update');
+    assert.equal(created.action, 'create');
+    assert.deepEqual([...parent.diagnostics, ...created.diagnostics], []);
+    assert.equal(parent.execution?.provisionalTargets, undefined);
+    assert.equal(created.execution?.provisionalTargets, undefined);
+    assert.ok(
+      created.execution!.publishOrder! < parent.execution!.publishOrder!,
     );
   });
 
@@ -2344,37 +2267,32 @@ describe('indexed planner', () => {
           ...(published && { published: { blocks: [] } }),
         },
       );
-    for (const target of [[], [parent(false), child(false)]])
-      await fixture(
+    for (const target of [[], [parent(false), child(false)]]) {
+      const { plan } = await fixture(
         [parent(true), child(true)],
         target,
         state,
-        options(),
-        (store) => {
-          const parentPlan = store.getPlan('record', A) as RecordPlan;
-          const childPlan = store.getPlan('record', B) as RecordPlan;
-          assert.deepEqual(
-            [...parentPlan.diagnostics, ...childPlan.diagnostics],
-            [],
-          );
-          assert.ok(
-            childPlan.execution!.publishOrder! <
-              parentPlan.execution!.publishOrder!,
-          );
-        },
       );
+      const parentPlan = plan.records.get(A)!;
+      const childPlan = plan.records.get(B)!;
+      assert.deepEqual(
+        [...parentPlan.diagnostics, ...childPlan.diagnostics],
+        [],
+      );
+      assert.ok(
+        childPlan.execution!.publishOrder! <
+          parentPlan.execution!.publishOrder!,
+      );
+    }
   });
 
   it('orders a folder parent swap deterministically for the CMA to judge', async () => {
-    await collectionFixture(
+    const { plan } = await collectionFixture(
       [collection(A, B), collection(B, A)],
       [collection(A, null), collection(B, null, 2)],
-      {},
-      (store, metadata) => {
-        assert.equal(metadata.counts.collection.update, 2);
-        assert.equal([...orderedCollectionWrites(store)].length, 2);
-      },
     );
+    assert.equal(plan.metadata.counts.collection.update, 2);
+    assert.equal(orderedCollectionWrites(plan).length, 2);
   });
 
   it('plans position-only collection reorders, sparse positions, and parent moves', async () => {
@@ -2414,54 +2332,46 @@ describe('indexed planner', () => {
         ],
       },
     ];
-    for (const { source, target } of cases)
-      await collectionFixture(source, target, {}, (store, metadata) => {
-        assert(metadata.counts.collection.update > 0);
-        for (const state of source) {
-          const previous = target.find((entry) => entry.id === state.id)!;
-          const entry = store.getPlan('collection', state.id)!;
-          assert.equal(
-            entry.action,
-            previous.hash === state.hash ? 'noop' : 'update',
-          );
-          if (entry.action === 'update')
-            assert.deepEqual(
-              entry.kind === 'collection' && entry.desired,
-              state,
-            );
-        }
-      });
+    for (const { source, target } of cases) {
+      const { plan } = await collectionFixture(source, target);
+      assert(plan.metadata.counts.collection.update > 0);
+      for (const state of source) {
+        const previous = target.find((entry) => entry.id === state.id)!;
+        const entry = plan.collections.get(state.id)!;
+        assert.equal(
+          entry.action,
+          previous.hash === state.hash ? 'noop' : 'update',
+        );
+        if (entry.action === 'update') assert.deepEqual(entry.desired, state);
+      }
+    }
   });
 
   it('plans duplicate folder positions', async () => {
     const peers = [collection(A), collection(B)];
     await collectionFixture(peers, peers);
-    await collectionFixture(peers, [], {}, (_store, metadata) =>
-      assert.equal(metadata.counts.collection.create, 2),
-    );
+    const created = await collectionFixture(peers, []);
+    assert.equal(created.plan.metadata.counts.collection.create, 2);
     await collectionFixture([...peers, collection(C, null, 3)], peers);
     await collectionFixture([peers[0]], peers, { includeDeletions: true });
-    await collectionFixture(
+    const renamed = await collectionFixture(
       [...peers, collection(C, null, 3, 'Renamed')],
       [...peers, collection(C, null, 3)],
-      {},
-      (store) => assert.equal(store.getPlan('collection', C)?.action, 'update'),
     );
+    assert.equal(renamed.plan.collections.get(C)?.action, 'update');
   });
 
   it('plans folder label collisions and label swaps for the CMA to judge', async () => {
-    await collectionFixture(
+    const collision = await collectionFixture(
       [collection(A, null, 1, 'Images')],
       [collection(B, null, 2, 'Images')],
-      {},
-      (store) => assert.equal(store.getPlan('collection', A)?.action, 'create'),
     );
-    await collectionFixture(
+    assert.equal(collision.plan.collections.get(A)?.action, 'create');
+    const swap = await collectionFixture(
       [collection(A, null, 1, 'Beta'), collection(B, null, 2, 'Alpha')],
       [collection(A, null, 1, 'Alpha'), collection(B, null, 2, 'Beta')],
-      {},
-      (_store, metadata) => assert.equal(metadata.counts.collection.update, 2),
     );
+    assert.equal(swap.plan.metadata.counts.collection.update, 2);
   });
 
   it('allows ordinary collection renames and moves, case-sensitive labels, and untouched grandfathered labels', async () => {
@@ -2494,22 +2404,16 @@ describe('indexed planner', () => {
   });
 
   it('orders collection updates by their desired parent rather than their old parent', async () => {
-    await collectionFixture(
+    const { plan } = await collectionFixture(
       [collection(A, B), collection(B)],
       [collection(A), collection(B, A)],
-      {},
-      (store) => {
-        const rank = (collectionId: string) =>
-          Number(
-            store.database
-              .prepare(
-                "SELECT rank FROM planner_nodes WHERE phase='collection-write' AND id=?",
-              )
-              .get(collectionId)?.rank,
-          );
-        assert(rank(B) < rank(A));
-      },
     );
+    const rank = new Map(
+      plan.graph
+        .ranks(COLLECTION_WRITE_PHASE)
+        .map((entry) => [entry.id, entry.rank]),
+    );
+    assert(rank.get(B)! < rank.get(A)!);
   });
 
   it('detaches an ancestor before moving beneath its unchanged descendant', async () => {
@@ -2524,12 +2428,11 @@ describe('indexed planner', () => {
       collection(inner, middle),
       collection(outer, inner),
     ];
-    await collectionFixture(source, target, {}, (store) => {
-      assert.deepEqual(
-        [...orderedCollectionWrites(store)].map((entry) => entry.id),
-        [middle, outer],
-      );
-    });
+    const { plan } = await collectionFixture(source, target);
+    assert.deepEqual(
+      orderedCollectionWrites(plan).map((entry) => entry.id),
+      [middle, outer],
+    );
   });
 
   it('plans an update that creates a nested block over a configured default', async () => {
@@ -2555,12 +2458,7 @@ describe('indexed planner', () => {
         },
       }),
     ];
-    await fixture(
-      source,
-      [record(A, { block: null })],
-      state,
-      options(),
-      (_store, metadata) => assert.equal(metadata.counts.record.update, 1),
-    );
+    const { plan } = await fixture(source, [record(A, { block: null })], state);
+    assert.equal(plan.metadata.counts.record.update, 1);
   });
 });

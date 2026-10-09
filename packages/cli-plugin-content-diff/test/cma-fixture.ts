@@ -1,9 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { basename, dirname, extname, join } from 'node:path';
-import { compileFunction } from 'node:vm';
-import * as ts from 'typescript';
+import { basename, extname } from 'node:path';
 import {
   canonicalFields,
   canonicalUpload,
@@ -12,16 +8,15 @@ import {
   recordPayloadFields,
   recordReferences,
 } from '../src/engine/codec';
-import { companionDirectory } from '../src/engine/companion';
-import type { SnapshotStore } from '../src/engine/store';
 import type {
+  Client,
   CollectionState,
   JsonObject,
   RecordState,
   SchemaState,
   UploadState,
 } from '../src/engine/types';
-import { type ContentMigrationClient, reorderRecords } from '../src/migration';
+import type { Content } from './pipeline';
 
 /** Applies `map` to every block position of one locale's native field value. */
 function mapNativeBlocks(
@@ -119,33 +114,24 @@ function resolveBlocks(
  * dependencies. Asset URLs serve the source uploads of `sources`.
  */
 export function cmaFixture(
-  store: SnapshotStore,
+  target: Content,
   schema: SchemaState,
-  sources: SnapshotStore = store,
+  sources: Content = target,
 ) {
   const definition = structuredClone(schema);
   const records = new Map(
-    [...store.records('target')].map((record) => [
-      record.id,
-      structuredClone(record),
-    ]),
+    target.records.map((record) => [record.id, structuredClone(record)]),
   );
   const uploads = new Map(
-    [...store.uploads('target')].map((upload) => [
-      upload.id,
-      structuredClone(upload),
-    ]),
+    target.uploads.map((upload) => [upload.id, structuredClone(upload)]),
   );
   const folders = new Map(
-    [...store.collections('target')].map((folder) => [
-      folder.id,
-      structuredClone(folder),
-    ]),
+    target.collections.map((folder) => [folder.id, structuredClone(folder)]),
   );
   // What each source asset URL serves; tests change entries to stand for a
   // source asset edited after generation.
   const remoteFiles = new Map(
-    [...sources.uploads('source')].map((upload) => [
+    sources.uploads.map((upload) => [
       upload.url,
       { md5: upload.md5, size: upload.size },
     ]),
@@ -378,6 +364,7 @@ export function cmaFixture(
         if (!type.draftMode) {
           assert(valid(record), 'invalid record creation');
           record.published = structuredClone(fields);
+          record.publishedUpdatedAt = record.currentVersion;
         }
         assert.equal(body.position, undefined, 'creation appends');
         place(record);
@@ -419,6 +406,7 @@ export function cmaFixture(
         if (!type.draftMode) {
           assert(valid(record), 'invalid record update');
           record.published = structuredClone(record.current);
+          record.publishedUpdatedAt = String(revision + 1);
         }
         record.currentVersion = String(++revision);
         if ('position' in body) place(record, old, Number(body.position));
@@ -436,6 +424,7 @@ export function cmaFixture(
         assert(valid(record), 'publish persisted invalid record');
         links(record, true);
         record.published = structuredClone(record.current);
+        record.publishedUpdatedAt = String(++revision);
         record.firstPublishedAt ??= new Date().toISOString();
         events.push(`publish:${id}`);
         return save(record);
@@ -448,8 +437,35 @@ export function cmaFixture(
         assert.equal(options.recursive, false);
         const record = get(id);
         record.published = null;
+        record.publishedUpdatedAt = null;
         events.push(`unpublish:${id}`);
         return save(record);
+      },
+      /** The version listing apply's checks read. */
+      async rawList(query: {
+        filter: { ids: string };
+        version: 'current' | 'published';
+      }) {
+        const ids = query.filter.ids.split(',');
+        return {
+          data: ids
+            .map((id) => records.get(id))
+            .filter(
+              (record): record is RecordState =>
+                !!record && (query.version === 'current' || !!record.published),
+            )
+            .map((record) => ({
+              id: record.id,
+              type: 'item',
+              meta: {
+                current_version: record.currentVersion,
+                updated_at:
+                  query.version === 'published'
+                    ? record.publishedUpdatedAt
+                    : null,
+              },
+            })),
+        };
       },
       async *listPagedIterator(
         query: { filter: { type: string }; version: string },
@@ -538,6 +554,9 @@ export function cmaFixture(
       },
     },
     uploadCollections: {
+      async list() {
+        return [...folders.values()].map(folderResponse);
+      },
       async find(id: string) {
         return folderResponse(folderGet(id));
       },
@@ -662,6 +681,13 @@ export function cmaFixture(
       },
     },
     uploads: {
+      async list(query: { filter: { ids: string } }) {
+        return query.filter.ids
+          .split(',')
+          .flatMap((id) =>
+            uploads.has(id) ? [uploadResponse(uploads.get(id)!)] : [],
+          );
+      },
       async find(id: string) {
         const upload = uploads.get(id);
         assert(upload);
@@ -722,7 +748,7 @@ export function cmaFixture(
     },
   };
   return {
-    client: client as unknown as ContentMigrationClient,
+    client: client as unknown as Client,
     events,
     /** Every record update, and whether it was locked to a version. */
     updates,
@@ -733,74 +759,16 @@ export function cmaFixture(
     folders,
     remoteFiles,
     definition,
-    snapshot(destination: SnapshotStore) {
-      for (const record of records.values()) {
-        record.hash = recordHash(record);
-        destination.putRecord('source', record);
-        for (const ref of recordReferences(record, schema))
-          destination.putReference('source', ref);
-      }
-      for (const upload of uploads.values())
-        destination.putUpload('source', upload);
-      for (const folder of folders.values())
-        destination.putCollection('source', folder);
+    /** What the fixture holds now, as a side of another diff. */
+    snapshot(): Content {
+      for (const record of records.values()) record.hash = recordHash(record);
+      return {
+        records: [...records.values()].map((record) => structuredClone(record)),
+        uploads: [...uploads.values()].map((upload) => structuredClone(upload)),
+        collections: [...folders.values()].map((folder) =>
+          structuredClone(folder),
+        ),
+      };
     },
   };
-}
-
-export async function executeGeneratedScript(
-  file: string,
-  client: ContentMigrationClient,
-): Promise<void> {
-  const source = await readFile(file, 'utf8');
-  const transformed = ts.transpileModule(source, {
-    fileName: file,
-    reportDiagnostics: true,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-    },
-  });
-  assert.deepEqual(
-    transformed.diagnostics?.filter(
-      (d) => d.category === ts.DiagnosticCategory.Error,
-    ),
-    [],
-  );
-  const localRequire = createRequire(file);
-  const module = {
-    exports: {} as {
-      default: (client: ContentMigrationClient) => Promise<void>;
-    },
-  };
-  const runtime = {
-    defineContentMigration: (
-      callback: (client: ContentMigrationClient) => Promise<void>,
-    ) => callback,
-    runMigrationPart: (
-      client: ContentMigrationClient,
-      script: string,
-      part: string,
-    ) =>
-      executeGeneratedScript(
-        join(companionDirectory(script), 'parts', part),
-        client,
-      ),
-    reorderRecords,
-  };
-  compileFunction(
-    transformed.outputText,
-    ['require', 'module', 'exports', '__dirname', '__filename'],
-    { filename: file },
-  )(
-    (specifier: string) =>
-      specifier === '@datocms/cli-plugin-content-diff/migration'
-        ? runtime
-        : localRequire(specifier),
-    module,
-    module.exports,
-    dirname(file),
-    file,
-  );
-  await module.exports.default(client);
 }

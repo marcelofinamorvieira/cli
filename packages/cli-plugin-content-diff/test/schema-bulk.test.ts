@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'mocha';
-import { fetchSchema } from '../src/engine/schema';
+import {
+  fetchSchema,
+  readRawSchema,
+  schemaFromRaw,
+} from '../src/engine/schema';
 import type { Client } from '../src/engine/types';
 
 function bulk(count = 3) {
@@ -152,5 +156,27 @@ describe('fresh bulk schema hydration', () => {
     } as unknown as Client;
     await assert.rejects(fetchSchema(client, 'sandbox'), /failed bulk/);
     assert.equal(drained, true);
+  });
+
+  it('reads the same schema from a raw read, stored as a dump stores it, as from a fresh read', async () => {
+    const client = {
+      site: { rawFind: async () => bulk() },
+      workflows: {
+        list: async () => [
+          {
+            id: 'workflow',
+            api_key: 'editorial',
+            stages: [{ id: 'review', name: 'Review', initial: true }],
+          },
+        ],
+      },
+    } as unknown as Client;
+    const raw = await readRawSchema(client);
+    const expected = await fetchSchema(client, 'sandbox');
+    assert.deepEqual(schemaFromRaw(raw, 'sandbox'), expected);
+    assert.deepEqual(
+      schemaFromRaw(JSON.parse(JSON.stringify(raw)), 'sandbox'),
+      expected,
+    );
   });
 });

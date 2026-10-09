@@ -1,32 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
-import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { assertNotAborted } from './cancellation';
-import { captureSnapshot } from './capture';
-import { companionDirectory } from './companion';
+import { DiffFile } from './diff-file';
 import { ContentError, contentErrorReport, destinationChanged } from './errors';
-import { runTrackedMigration } from './execution';
-import {
-  type BaselineManifest,
-  compareBaseline,
-  loadBaseline,
-} from './migration-artifact';
-import { assertMigrationFile, loadContentMigration } from './migration-loader';
+import { assertExpectations, runOperations } from './execution';
 import { projectMigrationSchema } from './migration-schema';
 import { fetchSchema } from './schema';
-import { SnapshotStore } from './store';
-import type { ApplyOptions, ApplyOutcome, Client, SchemaState } from './types';
+import type { ApplyOptions, ApplyOutcome, Client } from './types';
 
-type Definition = (client: Client) => Promise<void>;
 interface Arguments {
   rootClient: Client;
-  buildEnvironmentClient: (
-    environmentId: string,
-    fetchFn?: typeof fetch,
-  ) => Client;
-  scriptPath: string;
+  buildEnvironmentClient: (environmentId: string) => Client;
+  diffPath: string;
   options: ApplyOptions;
 }
 
@@ -127,126 +113,51 @@ function fastForkBlocked(
   );
 }
 
-function projection(baseline: BaselineManifest) {
-  return (schema: SchemaState) =>
-    projectMigrationSchema(schema, baseline.destinationTracking);
-}
-
-/** Codes that mean the destination differs from what was captured. */
-const BASELINE_DRIFT = new Set([
-  'CAPTURE_DRIFT',
-  'INVALID_MIGRATION_TRACKING_MODEL',
-  // Generation captured every destination record through the same codec, so
-  // a value it refuses at apply time was written after generation.
-  'UNSUPPORTED_INTEGER_PRECISION',
-  'INVALID_BLOCK',
-]);
-
-/** Whether the projected schema now differs from the baseline's. */
-async function schemaChanged(
+/**
+ * Checks an environment against the diff: the destination project, the
+ * schema (without the migration tracking model), and everything the diff
+ * touches, before any write. Returns the number of operations.
+ */
+async function assertDestination(
   client: Client,
   environmentId: string,
-  baseline: BaselineManifest,
-): Promise<boolean> {
-  try {
-    const schema = await fetchSchema(
-      client,
-      environmentId,
-      projection(baseline),
-    );
-    return schema.hash !== baseline.schema.hash;
-  } catch (error) {
-    return (
-      error instanceof ContentError &&
-      error.code === 'INVALID_MIGRATION_TRACKING_MODEL'
-    );
-  }
-}
-
-async function assertBaseline(
-  client: Client,
-  environmentId: string,
-  baseline: BaselineManifest,
-  store: SnapshotStore,
+  diff: DiffFile,
   options: ApplyOptions,
-  verify: 'none' | 'versions' | 'full',
-): Promise<void> {
+): Promise<number> {
+  const { manifest } = diff;
+  let schemaHash: string;
   try {
-    const schema = await fetchSchema(
-      client,
-      environmentId,
-      projection(baseline),
+    const schema = await fetchSchema(client, environmentId, (schema) =>
+      projectMigrationSchema(schema, manifest.destinationTracking),
     );
-    if (schema.siteId !== baseline.destination.siteId)
+    if (schema.siteId !== manifest.destination.siteId)
       throw new ContentError(
         'DESTINATION_MISMATCH',
-        'Destination project does not match the migration.',
+        'Destination project does not match the diff.',
       );
-    if (schema.hash !== baseline.schema.hash)
-      throw destinationChanged({ reason: 'schema' });
-    store.clearSide('target');
-    options.log?.(
-      `Checking original migration baseline in "${environmentId}".`,
-    );
-    // DatoCMS has no persistent sandbox freeze; maintenance mode only protects
-    // primary. These checks reject observed drift before the script starts.
-    try {
-      await captureSnapshot({
-        client,
-        environmentId,
-        schema,
-        store,
-        side: 'target',
-        options: {
-          concurrency: options.concurrency,
-          signal: options.signal,
-          progress: options.log,
-          schemaProjection: projection(baseline),
-        },
-        verify,
-      });
-    } catch (error) {
-      // A schema change while records are listed can surface as a failed
-      // request (a removed model, a changed field) or as content the
-      // baseline schema cannot read (a new block model) rather than as drift.
-      if (
-        !options.signal?.aborted &&
-        !(error instanceof ContentError && error.code === 'INTERRUPTED') &&
-        (await schemaChanged(client, environmentId, baseline))
-      )
-        throw destinationChanged({ reason: 'schema' });
-      throw error;
-    }
+    schemaHash = schema.hash;
   } catch (error) {
-    if (!(error instanceof ContentError) || !BASELINE_DRIFT.has(error.code))
-      throw error;
-    throw error.code === 'INVALID_MIGRATION_TRACKING_MODEL'
-      ? destinationChanged({ reason: 'schema' })
-      : destinationChanged({ reason: 'drift', description: error.message });
+    if (
+      error instanceof ContentError &&
+      error.code === 'INVALID_MIGRATION_TRACKING_MODEL'
+    )
+      throw destinationChanged({ reason: 'schema' });
+    throw error;
   }
-  compareBaseline(store, 'target');
+  if (schemaHash !== manifest.schemaHash)
+    throw destinationChanged({ reason: 'schema' });
+  options.log?.(`Checking what the diff touches in "${environmentId}".`);
+  return assertExpectations(client, diff, options);
 }
 
-/**
- * Load the script and apply it with the baseline in its sibling `.content`
- * companion. --preflight-only checks the file without evaluating it.
- */
-export async function applyContentMigration(
-  args: Arguments,
-): Promise<ApplyOutcome> {
-  let definition: Definition | undefined;
-  if (args.options.preflightOnly)
-    assertMigrationFile(args.scriptPath, args.options.signal);
-  else
-    definition = await loadContentMigration(
-      args.scriptPath,
-      args.options.signal,
-    );
-  // Node runs a module under its real path, so a generated script's
-  // `__dirname`, which its parts are found from, has every symlink resolved;
-  // its companion is found beside the same path.
-  const scriptPath = await realpath(resolve(args.scriptPath));
-  return applyMigration({ ...args, scriptPath, definition });
+/** Opens a diff and applies it, or with --preflight-only only checks it. */
+export async function applyContentDiff(args: Arguments): Promise<ApplyOutcome> {
+  const diff = await DiffFile.open(args.diffPath);
+  try {
+    return await applyDiff({ ...args, diff });
+  } finally {
+    diff.close();
+  }
 }
 
 /**
@@ -280,38 +191,31 @@ function cleanupIncomplete(
 }
 
 /**
- * Check the destination baseline and run a loaded migration, in a new fork
- * unless in place. Without a definition this is the read-only preflight:
- * no script, no fork.
+ * Checks the destination and runs the diff, in a new fork unless in place.
+ * With --preflight-only this is a read-only check: no fork, no writes.
  */
-export async function applyMigration(
-  args: Arguments & { definition?: Definition },
+async function applyDiff(
+  args: Arguments & { diff: DiffFile },
 ): Promise<ApplyOutcome> {
-  const { definition, options } = args;
-  const store = new SnapshotStore();
+  const { diff, options } = args;
+  const { manifest } = diff;
   let forkId: string | undefined;
   let forkRequested = false;
   let forkAppeared = false;
-  let scriptStarted = false;
+  let runStarted = false;
   let destinationId: string | undefined;
   try {
     assertNotAborted(options.signal);
-    options.log?.('Validating migration baseline.');
-    const baseline = await loadBaseline(
-      companionDirectory(args.scriptPath),
-      store,
-      options.signal,
-    );
     destinationId =
-      options.destinationEnvironmentId ?? baseline.destination.environmentId;
+      options.destinationEnvironmentId ?? manifest.destination.environmentId;
     const [rootSite, environment] = await Promise.all([
       args.rootClient.site.find(),
       args.rootClient.environments.find(destinationId),
     ]);
-    if (rootSite.id !== baseline.destination.siteId)
+    if (rootSite.id !== manifest.destination.siteId)
       throw new ContentError(
         'DESTINATION_MISMATCH',
-        'Destination project does not match the migration.',
+        'Destination project does not match the diff.',
       );
     // Only an in-place run writes to the destination; whether it can be
     // forked is for the fork request to answer.
@@ -330,38 +234,36 @@ export async function applyMigration(
       );
     if (!options.inPlace) {
       forkId = options.forkName ?? `content-apply-${randomUUID()}`;
-      // Fails fast before the baseline capture; the fork request itself
-      // leaves the ID's validation to the CMA.
+      // Fails fast before the checks; the fork request itself leaves the
+      // ID's validation to the CMA.
       await assertForkIdUnused(args.rootClient, forkId);
     }
-    // Before a fork the destination check only fails fast: a change made
-    // while it captures is part of the fork, whose own check sees it, so
-    // confirming this capture cannot change the outcome.
-    await assertBaseline(
+    // Before a fork the check only fails fast: a change made meanwhile is
+    // part of the fork, whose own check sees it.
+    const operations = await assertDestination(
       args.buildEnvironmentClient(destinationId),
       destinationId,
-      baseline,
-      store,
+      diff,
       options,
-      forkId && definition ? 'none' : options.verification ?? 'versions',
     );
-    const partial = Object.values(baseline.counts).some(
+    const partial = Object.values(manifest.counts).some(
       (counts) => counts.skip > 0,
     );
     assertNotAborted(options.signal);
-    if (!definition)
+    if (options.preflightOnly)
       return {
         environmentId: destinationId,
         preflightOnly: true,
-        scriptExecuted: false,
+        executed: false,
+        operations,
         partial,
-        generatedCounts: baseline.counts,
+        generatedCounts: manifest.counts,
       };
     let environmentId = destinationId;
     if (forkId) {
-      // The capture can take minutes, so the ID is checked again right
-      // before the request: whatever answers to it afterwards was created by
-      // this request and is removed on failure.
+      // The check can take minutes, so the ID is checked again right before
+      // the request: whatever answers to it afterwards was created by this
+      // request and is removed on failure.
       await assertForkIdUnused(args.rootClient, forkId);
       assertNotAborted(options.signal);
       options.log?.(`Creating destination fork "${forkId}".`);
@@ -390,26 +292,22 @@ export async function applyMigration(
       forkRequested = true;
       await waitForFork(args.rootClient, forkId, options.signal, options.log);
       environmentId = forkId;
-      await assertBaseline(
+      await assertDestination(
         args.buildEnvironmentClient(environmentId),
         environmentId,
-        baseline,
-        store,
+        diff,
         options,
-        options.verification ?? 'versions',
       );
     }
     assertNotAborted(options.signal);
-    options.log?.(
-      `Executing TypeScript against the CMA in "${environmentId}".`,
+    options.log?.(`Running ${operations} operations in "${environmentId}".`);
+    runStarted = true;
+    await runOperations(
+      args.buildEnvironmentClient(environmentId),
+      diff,
+      options,
     );
-    scriptStarted = true;
-    await runTrackedMigration(
-      definition,
-      (fetchFn) => args.buildEnvironmentClient(environmentId, fetchFn),
-      options.signal,
-    );
-    return { environmentId, scriptExecuted: true, partial };
+    return { environmentId, executed: true, operations, partial };
   } catch (error) {
     let failure = error;
     let kept = forkAppeared;
@@ -436,10 +334,10 @@ export async function applyMigration(
       if (forkAppeared)
         return `The fork "${forkId}" was kept: an environment with that ID exists after the fork request failed and may have been created by a retried request of this run.`;
       if (kept)
-        return scriptStarted
+        return runStarted
           ? `The fork "${forkId}" was kept; "${destinationId}" was not changed.`
           : `The fork "${forkId}" was kept.`;
-      if (!scriptStarted) return undefined;
+      if (!runStarted) return undefined;
       return forkId
         ? `The fork "${forkId}" was deleted; "${destinationId}" was not changed.`
         : `Writes made before the failure remain in "${destinationId}".`;
@@ -452,7 +350,5 @@ export async function applyMigration(
         ...(said && { outcome: said }),
       });
     throw failure;
-  } finally {
-    store.dispose();
   }
 }

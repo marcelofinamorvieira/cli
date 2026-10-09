@@ -1,25 +1,27 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CmaClient } from '@datocms/cli-utils';
-import { afterEach, describe, it } from 'mocha';
-import { applyMigration } from '../src/engine/apply';
-import * as capture from '../src/engine/capture';
-import { recordGuard, recordHash } from '../src/engine/codec';
+import { after, afterEach, before, describe, it } from 'mocha';
+import { applyContentDiff } from '../src/engine/apply';
+import { recordHash } from '../src/engine/codec';
 import {
   ContentError,
   type ContentFailureContext,
   DESTINATION_CHANGED_MESSAGE,
 } from '../src/engine/errors';
-import * as artifact from '../src/engine/migration-artifact';
-import * as planner from '../src/engine/planner';
 import * as schemaApi from '../src/engine/schema';
 import type {
   ApplyOptions,
   Client,
-  PlanMetadata,
+  PlanCounts,
   RecordState,
   SchemaState,
 } from '../src/engine/types';
+import { cmaFixture } from './cma-fixture';
 import { fixtureId } from './fixture-id';
+import { content, diff, writeTestDiff } from './pipeline';
 
 const restore: Array<() => void> = [];
 function replace(target: object, key: string, value: unknown) {
@@ -27,48 +29,47 @@ function replace(target: object, key: string, value: unknown) {
   Reflect.set(target, key, value);
   restore.push(() => Reflect.set(target, key, before));
 }
-const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+const clone = <T>(value: T): T => structuredClone(value);
 const MODEL = fixtureId('apply-model');
-const FIELD = fixtureId('apply-field');
 const RECORD = fixtureId('apply-record');
 const DATE = '2025-01-01T00:00:00.000Z';
-const empty = { create: 0, update: 0, delete: 0, noop: 0, skip: 0 };
-function fixture() {
-  const schema: SchemaState = {
-    siteId: 'project',
-    environmentId: 'main',
-    locales: ['en'],
-    semantics: {},
-    workflows: [],
-    hash: '',
-    models: [
-      {
-        id: MODEL,
-        apiKey: 'article',
-        name: 'Article',
-        block: false,
-        singleton: false,
-        sortable: false,
-        tree: false,
-        draftMode: true,
-        saveInvalidDrafts: false,
-        allLocalesRequired: false,
-        workflowId: null,
-        fields: [
-          {
-            id: FIELD,
-            apiKey: 'title',
-            type: 'string',
-            localized: false,
-            validators: { required: {} },
-            defaultValue: null,
-          },
-        ],
-      },
-    ],
-  };
-  schema.hash = schemaApi.schemaHash(schema);
-  const original: RecordState = {
+const SCHEMA: SchemaState = {
+  siteId: 'project',
+  environmentId: 'main',
+  locales: ['en'],
+  semantics: {},
+  workflows: [],
+  hash: '',
+  models: [
+    {
+      id: MODEL,
+      apiKey: 'article',
+      name: 'Article',
+      block: false,
+      singleton: false,
+      sortable: false,
+      tree: false,
+      draftMode: true,
+      saveInvalidDrafts: false,
+      allLocalesRequired: false,
+      workflowId: null,
+      fields: [
+        {
+          id: fixtureId('apply-field'),
+          apiKey: 'title',
+          type: 'string',
+          localized: false,
+          validators: { required: {} },
+          defaultValue: null,
+        },
+      ],
+    },
+  ],
+};
+SCHEMA.hash = schemaApi.schemaHash(SCHEMA);
+
+function record(overrides: Partial<RecordState>): RecordState {
+  const state: RecordState = {
     id: RECORD,
     modelId: MODEL,
     current: { title: 'Original' },
@@ -82,49 +83,49 @@ function fixture() {
     stage: null,
     schedules: { publication: null, unpublishing: null },
     hash: '',
+    ...overrides,
   };
-  original.hash = recordHash(original);
-  const baseline = {
-    source: { siteId: 'source', environmentId: 'source' },
-    destination: { siteId: 'project', environmentId: 'main' },
-    schema,
-    options: {
-      modelIds: [MODEL],
-      uploads: 'all',
-      includeDeletions: false,
-      allowPartial: false,
-    },
-    counts: {
-      record: { ...empty, update: 1 },
-      upload: { ...empty },
-      collection: { ...empty },
-    },
-    destinationTracking: { apiKey: 'schema_migration', model: null },
-  } as PlanMetadata & { destinationTracking: { apiKey: string; model: null } };
-  const environments = new Map([
-    [
-      'main',
-      {
-        id: 'main',
-        meta: {
-          primary: true,
-          status: 'ready',
-          read_only_mode: false,
-          forked_from: null as string | null,
-          created_at: DATE,
-        },
-      },
-    ],
+  state.hash = recordHash(state);
+  return state;
+}
+/** The destination holds a draft; the diff updates and publishes it. */
+const original = record({});
+const edited = record({
+  current: { title: 'Edited' },
+  published: { title: 'Edited' },
+  currentVersion: '9',
+  publishedUpdatedAt: DATE,
+  firstPublishedAt: DATE,
+});
+const LABEL = `Publish Article "Edited" (${RECORD})`;
+
+const environment = (id: string, primary: boolean) => ({
+  id,
+  meta: {
+    primary,
+    status: 'ready',
+    read_only_mode: false,
+    fork_completion_percentage: 100,
+  },
+});
+
+/** The diff every test applies, written once. */
+let directory: string;
+let diffPath: string;
+let counts: PlanCounts;
+
+function fixture() {
+  /** What the destination schema reads as; tests change it. */
+  const schema = clone(SCHEMA);
+  const site = { id: 'project' };
+  const environments = new Map([['main', environment('main', true)]]);
+  const contents = new Map([
+    ['main', cmaFixture(content({ records: [original] }), SCHEMA)],
   ]);
-  const records = new Map([['main', clone(original)]]);
-  const clients = new Map<string, Client>();
   const events: string[] = [];
   const forkQueries: Array<Record<string, unknown>> = [];
-  const hooks: { afterCapture?: (environment: string) => void } = {};
-  let uncertain = false;
-  let wrongProject = false;
-  let captures = 0;
-  const verifications: Array<[string, string]> = [];
+  const logs: string[] = [];
+  let failure: unknown;
   const notFound = () =>
     new CmaClient.ApiError({
       request: { method: 'GET', url: '/environments', headers: {} },
@@ -135,105 +136,41 @@ function fixture() {
         body: { data: [] },
       },
     });
-  const client = (environment: string): Client => {
-    if (clients.has(environment)) return clients.get(environment)!;
-    const value = {
-      config: { environment },
-      users: { findMe: async () => ({ id: 'account', type: 'account' }) },
-      site: { find: async () => ({ id: wrongProject ? 'wrong' : 'project' }) },
-      environments: {
-        list: async () => [...environments.values()].map(clone),
-        find: async (id: string) => {
-          const found = environments.get(id);
-          if (!found) throw notFound();
-          return clone(found);
-        },
-        fork: async (
-          source: string,
-          { id }: { id: string },
-          query: Record<string, unknown>,
-        ) => {
-          events.push(`fork:${id}`);
-          forkQueries.push(query);
-          const env = {
-            id,
-            meta: {
-              primary: false,
-              status: 'ready',
-              read_only_mode: false,
-              forked_from: source,
-              created_at: '2026-01-01T00:00:00.000Z',
-            },
-          };
-          environments.set(id, env);
-          records.set(id, clone(records.get(source)!));
-          if (uncertain) throw new Error('Uncertain fork request');
-          return clone(env);
-        },
-        destroy: async (id: string) => {
-          events.push(`destroy:${id}`);
-          environments.delete(id);
-        },
+  // The root client: the project and its environments.
+  const root = {
+    site: { find: async () => clone(site) },
+    environments: {
+      list: async () => [...environments.values()].map(clone),
+      find: async (id: string) => {
+        const found = environments.get(id);
+        if (!found) throw notFound();
+        return clone(found);
       },
-      items: {
-        find: async (id: string) => {
-          assert.equal(id, RECORD);
-          events.push(`read:${environment}`);
-          return { id, title: records.get(environment)!.current.title };
-        },
-        update: async (id: string, payload: { title: string }) => {
-          assert.equal(id, RECORD);
-          events.push(`write:${environment}:${payload.title}`);
-          const state = records.get(environment)!;
-          state.current.title = payload.title;
-          state.currentVersion = '2';
-          state.hash = recordHash(state);
-          return { id, title: payload.title };
-        },
+      fork: async (
+        source: string,
+        { id }: { id: string },
+        query: Record<string, unknown>,
+      ) => {
+        events.push(`fork:${id}`);
+        forkQueries.push(query);
+        environments.set(id, environment(id, false));
+        contents.set(id, cmaFixture(contents.get(source)!.snapshot(), SCHEMA));
+        return clone(environments.get(id)!);
       },
-    } as unknown as Client;
-    clients.set(environment, value);
-    return value;
-  };
-  replace(
-    artifact,
-    'loadBaseline',
-    async (
-      directory: string,
-      store: Parameters<typeof artifact.loadBaseline>[1],
-    ) => {
-      assert.equal(directory, '/fixture/migration.content');
-      store.database.exec(
-        'CREATE TEMP TABLE migration_baseline(kind TEXT,id TEXT,guard_json TEXT)',
-      );
-      store.database
-        .prepare('INSERT INTO migration_baseline VALUES(?,?,?)')
-        .run('record', RECORD, JSON.stringify(recordGuard(original)));
-      return baseline;
+      destroy: async (id: string) => {
+        events.push(`destroy:${id}`);
+        environments.delete(id);
+      },
     },
-  );
+  };
   replace(
     schemaApi,
     'fetchSchema',
-    async (_client: Client, environment: string) => {
-      const value = clone(schema);
-      value.environmentId = environment;
-      value.siteId = wrongProject ? 'wrong' : 'project';
-      return value;
-    },
-  );
-  replace(
-    capture,
-    'captureSnapshot',
-    async (args: Parameters<typeof capture.captureSnapshot>[0]) => {
-      captures++;
-      verifications.push([args.environmentId, args.verify]);
-      args.store.putRecord(args.side, clone(records.get(args.environmentId)!));
-      hooks.afterCapture?.(args.environmentId);
-    },
-  );
-  replace(planner, 'createPlan', () =>
-    assert.fail('Apply must never plan edited TypeScript'),
+    async (
+      _client: Client,
+      environmentId: string,
+      project: (schema: SchemaState) => SchemaState,
+    ) => project({ ...clone(schema), environmentId }),
   );
   const options: ApplyOptions = {
     inPlace: false,
@@ -242,42 +179,43 @@ function fixture() {
     concurrency: 2,
     fastFork: true,
     forkName: 'review',
+    log: (message) => logs.push(message),
   };
-  const builds: Array<[string, boolean]> = [];
-  const args = (
-    work: (client: Client) => Promise<void>,
-    overrides: Partial<ApplyOptions> = {},
-  ) => ({
-    rootClient: client('main'),
-    buildEnvironmentClient: (environment: string, fetchFn?: typeof fetch) => {
-      builds.push([environment, typeof fetchFn === 'function']);
-      return client(environment);
-    },
-    scriptPath: '/fixture/migration.ts',
-    // Preflight never loads the script.
-    definition: overrides.preflightOnly ? undefined : work,
-    options: { ...options, ...overrides },
-  });
+  const apply = (overrides: Partial<ApplyOptions> = {}) =>
+    applyContentDiff({
+      rootClient: root as unknown as Client,
+      buildEnvironmentClient: (id: string) => {
+        const { client } = contents.get(id)!;
+        if (failure)
+          client.items.publish = async () => {
+            throw failure;
+          };
+        return client;
+      },
+      diffPath,
+      options: { ...options, ...overrides },
+    });
   return {
     schema,
-    original,
-    baseline,
-    records,
+    site,
     environments,
+    contents,
     events,
     forkQueries,
-    hooks,
-    client,
-    args,
-    builds,
-    setUncertain: () => {
-      uncertain = true;
+    logs,
+    root,
+    apply,
+    /** Every publication, in every environment, rejects with `error`. */
+    failPublication(error: unknown) {
+      failure = error;
     },
-    setWrongProject: () => {
-      wrongProject = true;
-    },
-    captures: () => captures,
-    verifications,
+    /** The record as an environment holds it. */
+    record: (environmentId: string) =>
+      contents.get(environmentId)!.records.get(RECORD)!,
+    /** The writes the run made in an environment. */
+    writes: (environmentId: string) =>
+      contents.get(environmentId)?.events ?? [],
+    checks: () => logs.filter((message) => message.startsWith('Checking')),
   };
 }
 
@@ -285,7 +223,7 @@ const validationError = (code: string) =>
   new CmaClient.ApiError({
     request: {
       method: 'PUT',
-      url: `https://site-api.datocms.com/items/${RECORD}`,
+      url: `https://site-api.datocms.com/items/${RECORD}/publish`,
       headers: {},
     },
     response: {
@@ -308,159 +246,198 @@ const validationError = (code: string) =>
     },
   });
 
-describe('content migration execution', () => {
+const changed = (details: unknown) => (error: unknown) => {
+  assert(error instanceof ContentError);
+  assert.equal(error.code, 'DESTINATION_CHANGED');
+  assert.equal(error.message, DESTINATION_CHANGED_MESSAGE);
+  assert.deepEqual(error.details, details);
+  return true;
+};
+
+describe('content diff apply', () => {
+  before(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'content-apply-test-'));
+    const { plan, operations } = await diff({
+      source: content({ records: [edited] }),
+      target: content({ records: [original] }),
+      sourceSchema: { ...SCHEMA, siteId: 'source', environmentId: 'source' },
+      targetSchema: SCHEMA,
+      options: {
+        modelIds: [MODEL],
+        uploads: 'all',
+        includeDeletions: false,
+        allowPartial: false,
+      },
+    });
+    assert.deepEqual(
+      operations.map((operation) => operation.op),
+      ['record.update', 'record.publish'],
+    );
+    assert.equal(operations[1]!.label, LABEL);
+    counts = plan.metadata.counts;
+    diffPath = await writeTestDiff(directory, plan, operations);
+  });
+  after(() => rm(directory, { recursive: true, force: true }));
   afterEach(() => {
     for (const reset of restore.splice(0).reverse()) reset();
   });
-  it('runs edited control flow against the actual client and reports completion without predicting effects', async () => {
+
+  it('checks the destination and its fork, then runs the diff in the fork', async () => {
     const test = fixture();
-    const result = await applyMigration(
-      test.args(async (client) => {
-        assert.equal(client, test.client('review'));
-        const record = await client.items.find(RECORD);
-        await client.items.update(RECORD, {
-          title: `${record.title} edited directly`,
-        });
-      }),
-    );
+    const result = await test.apply();
     assert.deepEqual(result, {
       environmentId: 'review',
-      scriptExecuted: true,
+      executed: true,
+      operations: 2,
       partial: false,
     });
-    assert.deepEqual(test.events, [
-      'fork:review',
-      'read:review',
-      'write:review:Original edited directly',
+    assert.deepEqual(test.events, ['fork:review']);
+    assert.deepEqual(test.writes('review'), [
+      `update:${RECORD}`,
+      `publish:${RECORD}`,
     ]);
-    assert.equal(test.records.get('main')!.current.title, 'Original');
-    assert.equal(test.captures(), 2);
-    // A change during the destination capture is carried into the fork, so
-    // only the fork's capture is confirmed.
-    assert.deepEqual(test.verifications, [
-      ['main', 'none'],
-      ['review', 'versions'],
+    // The first update is locked to the version the diff expects.
+    assert.deepEqual(test.contents.get('review')!.updates, [
+      { id: RECORD, locked: true },
     ]);
-    // Only the execution client observes requests through a tracked fetchFn.
-    assert.deepEqual(test.builds, [
-      ['main', false],
-      ['review', false],
-      ['review', true],
+    assert.deepEqual(test.record('review').published, { title: 'Edited' });
+    assert.deepEqual(test.writes('main'), []);
+    assert.equal(test.record('main').current.title, 'Original');
+    // A change during the destination check is carried into the fork, whose
+    // own check sees it.
+    assert.deepEqual(test.logs, [
+      'Checking what the diff touches in "main".',
+      'Creating destination fork "review".',
+      'Checking what the diff touches in "review".',
+      'Running 2 operations in "review".',
     ]);
   });
-  it('checks the baseline without invoking callbacks or creating a fork in preflight-only mode', async () => {
+
+  it('checks the destination without running anything or creating a fork in preflight-only mode', async () => {
     const test = fixture();
-    const result = await applyMigration(
-      test.args(async () => assert.fail('preflight executed the script'), {
-        preflightOnly: true,
-      }),
-    );
+    const result = await test.apply({ preflightOnly: true });
     assert.deepEqual(result, {
       environmentId: 'main',
       preflightOnly: true,
-      scriptExecuted: false,
+      executed: false,
+      operations: 2,
       partial: false,
-      generatedCounts: test.baseline.counts,
+      generatedCounts: counts,
     });
     assert.deepEqual(test.events, []);
-    assert.deepEqual(test.verifications, [['main', 'versions']]);
+    assert.deepEqual(test.writes('main'), []);
+    assert.deepEqual(test.checks(), [
+      'Checking what the diff touches in "main".',
+    ]);
   });
-  it('reports every baseline difference with the same instruction and the first difference', async () => {
-    const changed = (details: unknown) => (error: unknown) => {
-      assert(error instanceof ContentError);
-      assert.equal(error.code, 'DESTINATION_CHANGED');
-      assert.equal(error.message, DESTINATION_CHANGED_MESSAGE);
-      assert.deepEqual(error.details, details);
-      return true;
-    };
+
+  it('refuses a fork name already in use in preflight-only mode too', async () => {
     const test = fixture();
-    test.records.get('main')!.currentVersion = '2';
+    test.environments.set('review', environment('review', false));
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply({ preflightOnly: true }),
+      (error: ContentError) => error.code === 'FORK_ID_COLLISION',
+    );
+    assert.deepEqual(test.events, []);
+  });
+
+  it('reports every destination difference with the same instruction and the first difference', async () => {
+    const test = fixture();
+    test.record('main').currentVersion = '2';
+    await assert.rejects(
+      test.apply(),
       changed({ kind: 'record', id: RECORD, reason: 'changed' }),
     );
-    test.records.set('main', clone(test.original));
+    assert.deepEqual(test.events, []);
+    test.record('main').currentVersion = '1';
     // The destination changes after its own check, so only the fork differs.
-    test.hooks.afterCapture = (environment) => {
-      if (environment === 'main')
-        test.records.get('main')!.currentVersion = '3';
-    };
+    const fork = test.root.environments.fork;
+    replace(
+      test.root.environments,
+      'fork',
+      async (...args: Parameters<typeof fork>) => {
+        test.record('main').currentVersion = '3';
+        return fork(...args);
+      },
+    );
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply(),
       changed({ kind: 'record', id: RECORD, reason: 'changed' }),
     );
     // The fork that failed its own check is removed.
     assert.deepEqual(test.events, ['fork:review', 'destroy:review']);
-    test.hooks.afterCapture = undefined;
-    replace(schemaApi, 'fetchSchema', async () => ({
-      ...clone(test.schema),
-      hash: 'different',
-    }));
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      changed({ reason: 'schema' }),
-    );
-    replace(schemaApi, 'fetchSchema', async () => clone(test.schema));
-    replace(capture, 'captureSnapshot', async () => {
+    assert.deepEqual(test.writes('review'), []);
+    test.events.length = 0;
+    test.schema.locales = ['en', 'it'];
+    await assert.rejects(test.apply(), changed({ reason: 'schema' }));
+    test.schema.locales = ['en'];
+    // The migration tracking model the diff was generated against is gone.
+    replace(schemaApi, 'fetchSchema', async () => {
       throw new ContentError(
-        'CAPTURE_DRIFT',
-        'Record x changed during capture.',
+        'INVALID_MIGRATION_TRACKING_MODEL',
+        'The exact migration tracking model is missing, renamed, or replaced.',
       );
     });
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      changed({
-        reason: 'drift',
-        description: 'Record x changed during capture.',
-      }),
-    );
-    // Generation encoded every destination value, so a value the codec
-    // refuses now was written afterwards.
-    const refusal =
-      'Integer field model.count cannot be represented as an exact safe integer.';
-    replace(capture, 'captureSnapshot', async () => {
-      throw new ContentError('UNSUPPORTED_INTEGER_PRECISION', refusal);
-    });
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      changed({ reason: 'drift', description: refusal }),
-    );
-    replace(capture, 'captureSnapshot', async () => {
-      throw new ContentError('INVALID_RESPONSE', 'Expected a JSON object.');
-    });
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: ContentError) => error.code === 'INVALID_RESPONSE',
-    );
+    await assert.rejects(test.apply(), changed({ reason: 'schema' }));
+    assert.deepEqual(test.events, []);
   });
+
+  it('reports a failed check request as itself', async () => {
+    const test = fixture();
+    const missing = new CmaClient.ApiError({
+      request: { method: 'GET', url: '/items', headers: {} },
+      response: {
+        status: 422,
+        statusText: 'Unprocessable Entity',
+        headers: {},
+        body: { data: [] },
+      },
+    });
+    test.contents.get('main')!.client.items.rawList = async () => {
+      throw missing;
+    };
+    await assert.rejects(test.apply(), (error: unknown) => error === missing);
+    assert.deepEqual(test.events, []);
+  });
+
   it('refuses wrong projects and unapproved primary writes before execution', async () => {
     const test = fixture();
     await assert.rejects(
-      applyMigration(
-        test.args(async () => assert.fail(), {
-          inPlace: true,
-          forkName: undefined,
-        }),
-      ),
-      /requires --allow-primary/,
+      test.apply({ inPlace: true, forkName: undefined }),
+      (error: ContentError) => {
+        assert.equal(error.code, 'PRIMARY_REQUIRES_APPROVAL');
+        assert.equal(
+          error.message,
+          'Applying in place to primary requires --allow-primary.',
+        );
+        return true;
+      },
     );
-    test.setWrongProject();
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: ContentError) => error.code === 'DESTINATION_MISMATCH',
-    );
+    const mismatch = (error: ContentError) => {
+      assert.equal(error.code, 'DESTINATION_MISMATCH');
+      assert.equal(
+        error.message,
+        'Destination project does not match the diff.',
+      );
+      return true;
+    };
+    test.site.id = 'wrong';
+    await assert.rejects(test.apply(), mismatch);
+    // The environment client may still answer for another project.
+    test.site.id = 'project';
+    test.schema.siteId = 'wrong';
+    await assert.rejects(test.apply(), mismatch);
     assert.deepEqual(test.events, []);
+    assert.deepEqual(test.writes('main'), []);
   });
+
   it('deletes a failed fork, including one whose fork request failed after creating it', async () => {
     const test = fixture();
+    test.failPublication(new Error('Publication failed'));
     await assert.rejects(
-      applyMigration(
-        test.args(async () => {
-          throw new Error('Script failed');
-        }),
-      ),
+      test.apply(),
       (error: Error & ContentFailureContext) => {
-        assert.equal(error.message, 'Script failed');
+        assert.equal(error.message, 'Publication failed');
         assert.equal(
           error.outcome,
           'The fork "review" was deleted; "main" was not changed.',
@@ -471,85 +448,80 @@ describe('content migration execution', () => {
     );
     assert.deepEqual(test.events, ['fork:review', 'destroy:review']);
     assert.equal(test.environments.has('main'), true);
-    test.setUncertain();
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      /Uncertain fork request/,
+    assert.equal(test.record('main').current.title, 'Original');
+    const fork = test.root.environments.fork;
+    replace(
+      test.root.environments,
+      'fork',
+      async (...args: Parameters<typeof fork>) => {
+        await fork(...args);
+        throw new Error('Uncertain fork request');
+      },
     );
+    await assert.rejects(test.apply(), /Uncertain fork request/);
     assert.equal(test.environments.has('review'), false);
     assert.deepEqual(test.events.slice(2), ['fork:review', 'destroy:review']);
   });
+
   it('keeps the original failure when the failed fork cannot be removed', async () => {
     const test = fixture();
-    const before = process.listenerCount('unhandledRejection');
-    let during = 0;
-    replace(test.client('main').environments, 'destroy', async () => {
-      during = process.listenerCount('unhandledRejection');
+    replace(test.root.environments, 'destroy', async () => {
       throw new Error('destroy failed');
     });
-    await assert.rejects(
-      applyMigration(
-        test.args(async () => {
-          throw validationError('VALIDATION_UNIQUE');
-        }),
-      ),
-      (error: ContentError) => {
-        assert.equal(error.code, 'APPLY_FAILED_CLEANUP_INCOMPLETE');
-        assert.equal(error.keptForkEnvironmentId, 'review');
-        // The message itself says the fork could not be removed.
-        assert.equal(error.outcome, undefined);
-        assert.match(
-          error.message,
-          /^The CMA rejected PUT .* The failed fork "review" could not be removed: Error: destroy failed$/,
-        );
-        const cause = error.details?.cause as {
-          code: string;
-          details: Record<string, unknown>;
-        };
-        assert.equal(error.details?.forkId, 'review');
-        assert.equal(cause.code, 'CMA_VALIDATION_FAILED');
-        assert.equal(cause.details.status, 422);
-        return true;
-      },
-    );
-    // Every request the script started has settled before the fork is
-    // removed, so cleanup needs no listener and none is left behind.
-    assert.equal(during, before);
-    assert.equal(process.listenerCount('unhandledRejection'), before);
+    test.failPublication(validationError('VALIDATION_UNIQUE'));
+    await assert.rejects(test.apply(), (error: ContentError) => {
+      assert.equal(error.code, 'APPLY_FAILED_CLEANUP_INCOMPLETE');
+      assert.equal(error.keptForkEnvironmentId, 'review');
+      // The message itself says the fork could not be removed.
+      assert.equal(error.outcome, undefined);
+      assert.match(
+        error.message,
+        /^operations\/000001\.jsonl line 2, Publish Article .* The CMA rejected PUT .* The failed fork "review" could not be removed: Error: destroy failed$/,
+      );
+      const cause = error.details?.cause as {
+        code: string;
+        details: Record<string, unknown>;
+      };
+      assert.equal(error.details?.forkId, 'review');
+      assert.equal(cause.code, 'CMA_VALIDATION_FAILED');
+      assert.equal(cause.details.status, 422);
+      return true;
+    });
     test.environments.delete('review');
-    test.hooks.afterCapture = (environment) => {
-      if (environment === 'main')
-        test.records.get('main')!.currentVersion = '3';
-    };
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: ContentError) => {
-        assert.equal(error.code, 'APPLY_FAILED_CLEANUP_INCOMPLETE');
-        assert.deepEqual(error.details?.cause, {
-          code: 'DESTINATION_CHANGED',
-          details: { kind: 'record', id: RECORD, reason: 'changed' },
-        });
-        return true;
+    const fork = test.root.environments.fork;
+    replace(
+      test.root.environments,
+      'fork',
+      async (...args: Parameters<typeof fork>) => {
+        test.record('main').currentVersion = '3';
+        return fork(...args);
       },
     );
+    await assert.rejects(test.apply(), (error: ContentError) => {
+      assert.equal(error.code, 'APPLY_FAILED_CLEANUP_INCOMPLETE');
+      assert.deepEqual(error.details?.cause, {
+        code: 'DESTINATION_CHANGED',
+        details: { kind: 'record', id: RECORD, reason: 'changed' },
+      });
+      return true;
+    });
   });
+
   it('removes a fork that ends in a failed status, or says it was kept', async () => {
     for (const keepFailedFork of [false, true]) {
       const test = fixture();
-      const environments = test.client('main').environments;
-      const find = environments.find.bind(environments);
-      replace(environments, 'find', async (id: string) => {
+      const find = test.root.environments.find;
+      replace(test.root.environments, 'find', async (id: string) => {
         const found = await find(id);
         return id === 'review'
           ? { ...found, meta: { ...found.meta, status: 'failed' } }
           : found;
       });
       await assert.rejects(
-        applyMigration(
-          test.args(async () => assert.fail(), { keepFailedFork }),
-        ),
+        test.apply({ keepFailedFork }),
         (error: ContentError) => {
           assert.equal(error.code, 'FORK_FAILED');
+          assert.equal(error.message, 'Fork "review" ended in status failed.');
           assert.equal(
             error.keptForkEnvironmentId,
             keepFailedFork ? 'review' : undefined,
@@ -565,24 +537,26 @@ describe('content migration execution', () => {
         test.events,
         keepFailedFork ? ['fork:review'] : ['fork:review', 'destroy:review'],
       );
+      assert.deepEqual(test.writes('review'), []);
     }
   });
+
   it('never removes an environment whose fork request DatoCMS rejected', async () => {
     const test = fixture();
-    // Someone else takes the ID during the destination capture.
-    test.hooks.afterCapture = (environment) => {
-      if (environment === 'main')
-        test.environments.set('review', {
-          id: 'review',
-          meta: { ...test.environments.get('main')!.meta, primary: false },
-        });
-    };
+    const list = test.root.environments.list;
+    let lists = 0;
+    // Someone else takes the ID while the destination is checked.
+    replace(test.root.environments, 'list', async () => {
+      if (++lists === 2)
+        test.environments.set('review', environment('review', false));
+      return list();
+    });
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply(),
       (error: ContentError) => error.code === 'FORK_ID_COLLISION',
     );
     assert.deepEqual(test.events, []);
-    test.hooks.afterCapture = undefined;
+    replace(test.root.environments, 'list', list);
     test.environments.delete('review');
     const rejection = new CmaClient.ApiError({
       request: { method: 'POST', url: '/environments/main/fork', headers: {} },
@@ -593,11 +567,11 @@ describe('content migration execution', () => {
         body: { data: [] },
       },
     });
-    replace(test.client('main').environments, 'fork', async () => {
+    replace(test.root.environments, 'fork', async () => {
       throw rejection;
     });
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply(),
       (error: Error & { keptForkEnvironmentId?: string }) => {
         assert.equal(error === rejection, true);
         assert.equal(error.keptForkEnvironmentId, undefined);
@@ -607,15 +581,12 @@ describe('content migration execution', () => {
     // An environment under the ID after a rejected request may come from
     // someone else right after the second check, or from a retried request
     // of this run whose first attempt timed out: kept and reported.
-    replace(test.client('main').environments, 'fork', async () => {
-      test.environments.set('review', {
-        id: 'review',
-        meta: { ...test.environments.get('main')!.meta, primary: false },
-      });
+    replace(test.root.environments, 'fork', async () => {
+      test.environments.set('review', environment('review', false));
       throw rejection;
     });
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply(),
       (error: Error & ContentFailureContext) => {
         assert.equal(error === rejection, true);
         assert.equal(error.keptForkEnvironmentId, 'review');
@@ -629,30 +600,29 @@ describe('content migration execution', () => {
     assert.equal(test.environments.has('review'), true);
     assert.deepEqual(test.events, []);
   });
+
   it('refuses a fork ID that is already in use without touching it', async () => {
     const test = fixture();
-    test.environments.set('review', {
-      id: 'review',
-      meta: { ...test.environments.get('main')!.meta, primary: false },
+    test.environments.set('review', environment('review', false));
+    await assert.rejects(test.apply(), (error: ContentError) => {
+      assert.equal(error.code, 'FORK_ID_COLLISION');
+      assert.equal(
+        error.message,
+        'Environment "review" already exists. Choose another --fork-name.',
+      );
+      return true;
     });
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: ContentError) => error.code === 'FORK_ID_COLLISION',
-    );
     assert.equal(test.environments.has('review'), true);
     assert.deepEqual(test.events, []);
+    // Refused before the destination is checked.
+    assert.deepEqual(test.checks(), []);
   });
+
   it('reports the fork kept after failure', async () => {
     const test = fixture();
+    test.failPublication(new Error('Publication failed'));
     await assert.rejects(
-      applyMigration(
-        test.args(
-          async () => {
-            throw new Error('Script failed');
-          },
-          { keepFailedFork: true },
-        ),
-      ),
+      test.apply({ keepFailedFork: true }),
       (error: Error & ContentFailureContext) => {
         assert.equal(error.keptForkEnvironmentId, 'review');
         assert.equal(
@@ -664,78 +634,56 @@ describe('content migration execution', () => {
     );
     assert.equal(test.environments.has('review'), true);
     assert.deepEqual(test.events, ['fork:review']);
+    // The fork keeps the writes made before the failure.
+    assert.deepEqual(test.writes('review'), [`update:${RECORD}`]);
   });
-  it('reports a script that rejects with a value that is not an error, and the fork it kept', async () => {
-    const test = fixture();
-    await assert.rejects(
-      applyMigration(
-        test.args(() => Promise.reject('oops'), { keepFailedFork: true }),
-      ),
-      (error: ContentError) => {
-        assert.equal(error.code, 'MIGRATION_FAILED');
-        assert.equal(error.message, 'The migration callback failed: oops');
-        assert.equal(
-          error.outcome,
-          'The fork "review" was kept; "main" was not changed.',
-        );
-        assert.equal(error.keptForkEnvironmentId, 'review');
-        return true;
-      },
-    );
-    assert.equal(test.environments.has('review'), true);
-    assert.deepEqual(test.events, ['fork:review']);
-  });
-  it('reports a frozen script failure as it is', async () => {
+
+  it('reports a frozen failure as it is', async () => {
     for (const inPlace of [false, true]) {
       const test = fixture();
-      const frozen = Object.freeze(new Error('Frozen script failure'));
+      const frozen = Object.freeze(new Error('Frozen failure'));
+      test.failPublication(frozen);
       await assert.rejects(
-        applyMigration(
-          test.args(
-            async () => {
-              throw frozen;
-            },
-            inPlace
-              ? { inPlace: true, allowPrimary: true, forkName: undefined }
-              : {},
-          ),
+        test.apply(
+          inPlace
+            ? { inPlace: true, allowPrimary: true, forkName: undefined }
+            : {},
         ),
         (error: unknown) => error === frozen,
       );
     }
   });
 
-  it('wraps CMA rejections raised by the script and removes the fork', async () => {
+  it('wraps CMA rejections of an operation with its line and removes the fork', async () => {
     const test = fixture();
-    await assert.rejects(
-      applyMigration(
-        test.args(async () => {
-          throw validationError('VALIDATION_UNIQUE');
-        }),
-      ),
-      (error: ContentError) => {
-        assert.equal(error.code, 'CMA_VALIDATION_FAILED');
-        assert.match(
-          error.message,
-          new RegExp(
-            `^The CMA rejected PUT /items/${RECORD}: INVALID_FIELD \\(title: VALIDATION_UNIQUE\\)\\. A unique value may still be held by another record`,
-          ),
-        );
-        assert.match(error.outcome ?? '', /The fork "review" was deleted/);
-        assert.equal(error.details?.status, 422);
-        return true;
-      },
-    );
+    test.failPublication(validationError('VALIDATION_UNIQUE'));
+    await assert.rejects(test.apply(), (error: ContentError) => {
+      assert.equal(error.code, 'CMA_VALIDATION_FAILED');
+      assert.match(
+        error.message,
+        new RegExp(
+          `^operations/000001\\.jsonl line 2, Publish Article "Edited" \\(${RECORD}\\): The CMA rejected PUT /items/${RECORD}/publish: INVALID_FIELD \\(title: VALIDATION_UNIQUE\\)\\. A unique value may still be held by another record`,
+        ),
+      );
+      assert.match(error.outcome ?? '', /The fork "review" was deleted/);
+      assert.equal(error.details?.status, 422);
+      assert.deepEqual(error.details?.operation, {
+        where: 'operations/000001.jsonl line 2',
+        label: LABEL,
+      });
+      return true;
+    });
     assert.deepEqual(test.events, ['fork:review', 'destroy:review']);
   });
+
   it('requests a fast fork unless a regular fork is asked for', async () => {
     const fast = fixture();
-    await applyMigration(fast.args(async () => {}));
+    await fast.apply();
     assert.deepEqual(fast.forkQueries, [
       { immediate_return: true, fast: true },
     ]);
     const regular = fixture();
-    await applyMigration(regular.args(async () => {}, { fastFork: false }));
+    await regular.apply({ fastFork: false });
     assert.deepEqual(regular.forkQueries, [{ immediate_return: true }]);
   });
 
@@ -768,11 +716,11 @@ describe('content migration execution', () => {
       'Run again once nobody is editing records in the destination',
       'Use --no-fast-fork to create a regular fork, which does not block the destination while it copies',
     ];
-    replace(test.client('main').environments, 'fork', async () => {
+    replace(test.root.environments, 'fork', async () => {
       throw refusal;
     });
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply(),
       (
         error: ContentError &
           ContentFailureContext & { suggestions?: string[] },
@@ -787,15 +735,12 @@ describe('content migration execution', () => {
     assert.deepEqual(test.events, []);
     // A refused request creates no fork, so an environment that answers to
     // the ID afterwards is reported as kept and never removed.
-    replace(test.client('main').environments, 'fork', async () => {
-      test.environments.set('review', {
-        id: 'review',
-        meta: { ...test.environments.get('main')!.meta, primary: false },
-      });
+    replace(test.root.environments, 'fork', async () => {
+      test.environments.set('review', environment('review', false));
       throw refusal;
     });
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
+      test.apply(),
       (
         error: ContentError &
           ContentFailureContext & { suggestions?: string[] },
@@ -818,61 +763,45 @@ describe('content migration execution', () => {
   it('leaves forking a read-only destination to the CMA and refuses it only in place', async () => {
     const test = fixture();
     test.environments.get('main')!.meta.read_only_mode = true;
-    const result = await applyMigration(test.args(async () => {}));
+    const result = await test.apply();
     assert.equal(result.environmentId, 'review');
     assert.deepEqual(test.events, ['fork:review']);
     await assert.rejects(
-      applyMigration(
-        test.args(async () => assert.fail(), {
-          inPlace: true,
-          allowPrimary: true,
-          forkName: undefined,
-        }),
-      ),
+      test.apply({ inPlace: true, allowPrimary: true, forkName: undefined }),
       (error: ContentError) => error.code === 'DESTINATION_UNAVAILABLE',
     );
+    assert.deepEqual(test.writes('main'), []);
   });
 
   it('looks a possibly created fork up in the listing, never by its name', async () => {
     const test = fixture();
-    const environments = test.client('main').environments;
-    const find = environments.find.bind(environments);
+    const find = test.root.environments.find;
     const forkName = 'x/../../items/record';
     const found: string[] = [];
-    replace(environments, 'find', async (id: string) => {
+    replace(test.root.environments, 'find', async (id: string) => {
       found.push(id);
       return find(id);
     });
-    replace(environments, 'fork', async () => {
+    replace(test.root.environments, 'fork', async () => {
       throw new Error('Uncertain fork request');
     });
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail(), { forkName })),
-      /Uncertain fork request/,
-    );
+    await assert.rejects(test.apply({ forkName }), /Uncertain fork request/);
     assert.deepEqual(found, ['main']);
     assert.deepEqual(test.events, []);
   });
 
   it('reports a kept fork with the original failure when its lookup fails', async () => {
     const test = fixture();
-    const environments = test.client('main').environments;
-    const list = environments.list.bind(environments);
-    let ran = false;
-    replace(environments, 'list', async () => {
-      if (ran) throw new Error('lookup failed');
+    const list = test.root.environments.list;
+    let lists = 0;
+    // Both fork ID checks succeed; the lookup after the failure does not.
+    replace(test.root.environments, 'list', async () => {
+      if (++lists > 2) throw new Error('lookup failed');
       return list();
     });
+    test.failPublication(validationError('VALIDATION_UNIQUE'));
     await assert.rejects(
-      applyMigration(
-        test.args(
-          async () => {
-            ran = true;
-            throw validationError('VALIDATION_UNIQUE');
-          },
-          { keepFailedFork: true },
-        ),
-      ),
+      test.apply({ keepFailedFork: true }),
       (error: ContentError) => {
         assert.equal(error.code, 'CMA_VALIDATION_FAILED');
         assert.equal(error.keptForkEnvironmentId, 'review');
@@ -889,120 +818,28 @@ describe('content migration execution', () => {
   it('requests no fork when interrupted while the fork ID is checked again', async () => {
     const test = fixture();
     const controller = new AbortController();
-    const environments = test.client('main').environments;
-    const list = environments.list.bind(environments);
+    const list = test.root.environments.list;
     let lists = 0;
-    environments.list = async () => {
+    replace(test.root.environments, 'list', async () => {
       // The second check runs right before the fork request.
       if (++lists === 2) controller.abort();
       return list();
-    };
+    });
     await assert.rejects(
-      applyMigration(
-        test.args(async () => assert.fail(), { signal: controller.signal }),
-      ),
+      test.apply({ signal: controller.signal }),
       (error: ContentError) => error.code === 'INTERRUPTED',
     );
     assert.equal(lists, 2);
     assert.deepEqual(test.events, []);
   });
 
-  it('reports a schema change that fails a capture request as a changed destination', async () => {
+  it('checks an in-place destination once and leaves a failure exactly as the run left it', async () => {
     const test = fixture();
-    const missing = new CmaClient.ApiError({
-      request: { method: 'GET', url: '/items', headers: {} },
-      response: {
-        status: 422,
-        statusText: 'Unprocessable Entity',
-        headers: {},
-        body: { data: [] },
-      },
-    });
-    let schemaReads = 0;
-    replace(schemaApi, 'fetchSchema', async () => {
-      schemaReads++;
-      // The model disappears while its records are listed.
-      return schemaReads === 1
-        ? clone(test.schema)
-        : { ...clone(test.schema), models: [], hash: 'changed' };
-    });
-    replace(capture, 'captureSnapshot', async () => {
-      throw missing;
-    });
+    test.failPublication(new Error('Publication failed'));
     await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: ContentError) => {
-        assert.equal(error.code, 'DESTINATION_CHANGED');
-        assert.equal(error.message, DESTINATION_CHANGED_MESSAGE);
-        assert.deepEqual(error.details, { reason: 'schema' });
-        return true;
-      },
-    );
-    // An unchanged schema keeps the request's own error.
-    replace(schemaApi, 'fetchSchema', async () => clone(test.schema));
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: unknown) => error === missing,
-    );
-  });
-
-  it('reports a schema change that leaves a captured block unreadable as a changed destination', async () => {
-    const test = fixture();
-    const unknownModel = new ContentError(
-      'INVALID_MODEL',
-      'Content refers to unknown model new-block.',
-    );
-    let schemaReads = 0;
-    replace(schemaApi, 'fetchSchema', async () => {
-      schemaReads++;
-      // A block model is added and used while records are listed.
-      return schemaReads === 1
-        ? clone(test.schema)
-        : { ...clone(test.schema), hash: 'changed' };
-    });
-    replace(capture, 'captureSnapshot', async () => {
-      throw unknownModel;
-    });
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: ContentError) => {
-        assert.equal(error.code, 'DESTINATION_CHANGED');
-        assert.deepEqual(error.details, { reason: 'schema' });
-        return true;
-      },
-    );
-    replace(schemaApi, 'fetchSchema', async () => clone(test.schema));
-    await assert.rejects(
-      applyMigration(test.args(async () => assert.fail())),
-      (error: unknown) => error === unknownModel,
-    );
-  });
-
-  it('leaves an in-place failure exactly as the script left it and says so', async () => {
-    const test = fixture();
-    test.original.schedules.publication = {
-      at: '2099-01-01T00:00:00.000Z',
-      selective: null,
-    };
-    test.original.hash = recordHash(test.original);
-    test.records.set('main', clone(test.original));
-    await assert.rejects(
-      applyMigration(
-        test.args(
-          async () => {
-            test.records.get('main')!.schedules.publication = null;
-            throw new Error('Cancelled before content writes');
-          },
-          {
-            inPlace: true,
-            allowPrimary: true,
-            forkName: undefined,
-            verification: 'full',
-          },
-        ),
-      ),
+      test.apply({ inPlace: true, allowPrimary: true, forkName: undefined }),
       (error: Error & ContentFailureContext) => {
-        assert.equal(error.message, 'Cancelled before content writes');
+        assert.equal(error.message, 'Publication failed');
         assert.equal(
           error.outcome,
           'Writes made before the failure remain in "main".',
@@ -1010,8 +847,12 @@ describe('content migration execution', () => {
         return true;
       },
     );
-    assert.equal(test.records.get('main')!.schedules.publication, null);
+    assert.deepEqual(test.writes('main'), [`update:${RECORD}`]);
+    assert.equal(test.record('main').current.title, 'Edited');
+    assert.equal(test.record('main').published, null);
     assert.deepEqual(test.events, []);
-    assert.deepEqual(test.verifications, [['main', 'full']]);
+    assert.deepEqual(test.checks(), [
+      'Checking what the diff touches in "main".',
+    ]);
   });
 });

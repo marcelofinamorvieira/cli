@@ -84,8 +84,7 @@ type DestinationDifference =
       id: string;
       reason: 'added' | 'removed' | 'changed';
     }
-  | { reason: 'schema' }
-  | { reason: 'drift'; description: string };
+  | { reason: 'schema' };
 
 export const DESTINATION_CHANGED_MESSAGE =
   'The destination environment has changed since the diff generation. Please re-generate a diff to apply.';
@@ -127,8 +126,6 @@ export function firstDifference(
   if (!details) return undefined;
   if (details.reason === 'schema')
     return 'First difference: the schema changed.';
-  if (details.reason === 'drift' && typeof details.description === 'string')
-    return `First difference: ${details.description}`;
   if (typeof details.kind === 'string' && typeof details.id === 'string')
     return `First difference: ${details.kind} ${details.id} was ${details.reason}.`;
   return undefined;

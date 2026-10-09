@@ -1,6 +1,6 @@
-import type { ContentMigrationClient } from './content-migration-client';
-import { compareIds } from './engine/compare-ids';
-import { ContentError } from './engine/errors';
+import { compareIds } from './compare-ids';
+import { ContentError } from './errors';
+import type { Client } from './types';
 
 /** One sibling group of a sortable or tree model and its complete final order. */
 export interface RecordOrder {
@@ -20,7 +20,7 @@ interface Sibling {
 const PASSES = 3;
 
 async function siblings(
-  client: ContentMigrationClient,
+  client: Client,
   { model, parent }: RecordOrder,
 ): Promise<Sibling[]> {
   const group: Sibling[] = [];
@@ -139,7 +139,7 @@ function moves(group: Sibling[], order: string[]): Sibling[] {
  * group already in order costs one listing and no writes.
  */
 export async function reorderRecords(
-  client: ContentMigrationClient,
+  client: Client,
   target: RecordOrder,
 ): Promise<void> {
   for (let pass = 0; ; pass++) {

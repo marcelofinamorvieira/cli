@@ -12,6 +12,7 @@ import * as DashboardClient from '@datocms/dashboard-client';
 import { describe, it } from 'mocha';
 import ContentApplyCommand from '../src/commands/content/apply';
 import ContentDiffCommand from '../src/commands/content/diff';
+import ContentExportCommand from '../src/commands/content/export';
 import { ContentError, contentErrorReport } from '../src/engine/errors';
 import * as profileAuth from '../src/utils/profile-auth';
 import {
@@ -426,8 +427,9 @@ describe('command authentication', () => {
     );
   });
 
-  it('builds content:apply on the native client command and content:diff on the configuration command', () => {
+  it('builds content:apply and content:export on the native client command and content:diff on the configuration command', () => {
     assert.equal(Object.getPrototypeOf(ContentApplyCommand), CmaClientCommand);
+    assert.equal(Object.getPrototypeOf(ContentExportCommand), CmaClientCommand);
     assert.equal(
       Object.getPrototypeOf(Object.getPrototypeOf(ContentDiffCommand)),
       DatoConfigCommand,

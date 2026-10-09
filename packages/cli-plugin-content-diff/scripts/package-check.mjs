@@ -44,7 +44,7 @@ function sourceFiles(directory, prefix = '') {
 
 try {
   const metadata = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  assert.equal(metadata.engines.node, '^22.23.1 || >=24.18.0');
+  assert.equal(metadata.engines.node, '>=18.0.0');
   // Without it, oclif describes the topic with the first command's summary.
   assert.ok(
     metadata.oclif.topics?.content?.description,
@@ -56,6 +56,7 @@ try {
   assert.deepEqual(Object.keys(manifest.commands).sort(), [
     'content:apply',
     'content:diff',
+    'content:export',
   ]);
   const packed = JSON.parse(
     run('npm', ['pack', '--dry-run', '--json', '--ignore-scripts']),
@@ -81,7 +82,7 @@ try {
     expected.sort(),
     'package dry-run contains unexpected or missing files',
   );
-  for (const command of ['content:diff', 'content:apply']) {
+  for (const command of ['content:export', 'content:diff', 'content:apply']) {
     const help = run(process.execPath, [
       join(root, 'bin/run'),
       command,
@@ -90,7 +91,7 @@ try {
     assert.ok(help.includes(command), `compiled help is missing ${command}`);
   }
   console.log(
-    `Verified ${files.length} package files and both content commands without publishing.`,
+    `Verified ${files.length} package files and every content command without publishing.`,
   );
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

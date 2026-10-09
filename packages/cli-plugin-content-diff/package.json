@@ -1,10 +1,10 @@
 {
   "name": "@datocms/cli-plugin-content-diff",
   "version": "4.2.1",
-  "description": "Generate and execute guarded TypeScript content migrations",
-  "keywords": ["datocms", "cli", "content", "diff", "migration", "typescript"],
+  "description": "Export, diff and apply DatoCMS content between environments, projects and project dumps",
+  "keywords": ["datocms", "cli", "content", "diff", "dump", "migration"],
   "engines": {
-    "node": "^22.23.1 || >=24.18.0"
+    "node": ">=18.0.0"
   },
   "author": "DatoCMS <support@datocms.com>",
   "homepage": "https://github.com/datocms/cli#readme",
@@ -37,14 +37,16 @@
     "@oclif/core": "^4",
     "tslib": "^2.8.1",
     "lodash": "^4.17.21",
-    "prettier": "^3.4.2",
     "@datocms/dashboard-client": "^6.1.0",
     "@datocms/rest-client-utils": "^6.1.1",
-    "tsx": "^4.19.2"
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
     "@datocms/cma-client": "^6.1.0",
     "@datocms/cma-client-node": "^6.1.0",
+    "@types/yauzl": "^3.4.0",
+    "@types/yazl": "^3.3.1",
     "mocha": "^12.0.2",
     "oclif": "^4",
     "ts-node": "^10.2.1",
@@ -55,7 +57,7 @@
     "repositoryPrefix": "<%- repo %>/blob/@datocms/cli-plugin-content-diff@<%- version %>/packages/cli-plugin-content-diff/<%- commandPath %>",
     "topics": {
       "content": {
-        "description": "Generate and run TypeScript content migrations"
+        "description": "Export environments, and generate and run content diffs"
       }
     }
   },
@@ -63,10 +65,6 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
-    },
-    "./migration": {
-      "types": "./lib/migration.d.ts",
-      "default": "./lib/migration.js"
     },
     "./package.json": "./package.json"
   }
