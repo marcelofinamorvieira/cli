@@ -54,7 +54,7 @@ npx datocms content:diff syncContent \
   --source-profile=source-project --destination-profile=target-project
 ```
 
-`--source-profile` and `--destination-profile` go together. `--source-api-token` and `--destination-api-token` override the token of their profile. Paired profiles cannot be combined with `--profile` or `--api-token`. The two projects are read concurrently, since they have separate rate limits.
+`--source-profile` and `--destination-profile` go together. `--source-api-token` and `--destination-api-token` override the token of their profile. Paired profiles cannot be combined with `--profile` or `--api-token`. The two projects are read concurrently, since they have separate rate limits. Records, uploads and folders are matched by ID, and the schema check requires the same model and field IDs on both sides, so this only works between projects whose schemas share their IDs: two projects whose schemas were built separately are refused as incompatible, even when they look identical.
 
 ### Schema compatibility
 
@@ -77,7 +77,7 @@ Without `--allow-partial` the first refusal fails generation (`UNSAFE_REQUESTED_
 Invalid records cannot be diffed. The CMA only accepts an invalid record as a draft in a model with draft mode and "Save invalid drafts" enabled, so the script could not reproduce any other invalid record. After planning, and before writing any file, generation checks every source record the script would create or update against the source CMA's own verdict (`is_current_version_valid` and `is_published_version_valid`):
 
 - an invalid published version always stops generation;
-- an invalid current version stops it, unless the model has draft mode with "Save invalid drafts" enabled.
+- an invalid current version stops it, unless the destination model has draft mode with "Save invalid drafts" enabled (the CMA applies the destination's setting when the script writes the draft).
 
 Generation then fails with `INVALID_SOURCE_RECORDS`, listing the records (the first 20 in the message, all of them in the JSON `details.records`). Fix them in the source environment and run `content:diff` again. Records the script does not write are not checked, and `--allow-partial` does not skip them. The plugin evaluates no validators itself: it reads the source CMA's verdict, which the CMA updates in the background after a schema change, so a check right after a validation change can still see the previous verdict.
 
@@ -165,19 +165,18 @@ The destination environment has changed since the diff generation. Please re-gen
 First difference: record AbCdEfGhIjKlMnOpQrStUv was changed.
 ```
 
-It also refuses to start when a destination schedule falls due within the schedule window. By default it then creates a new fork of the destination, waits for it with progress output, checks the same baseline in the fork, and runs the script there. It reports the environment it ran in and never promotes a fork.
+By default it then creates a new fork of the destination with DatoCMS's fast fork, waits for it with progress output, checks the same baseline in the fork, and runs the script there. It reports the environment it ran in and never promotes a fork.
 
 | Argument or flag | Default | Behavior |
 | --- | --- | --- |
 | `SCRIPT` | Required | The generated `.ts` entrypoint. |
-| `--preflight-only` | Off | Check the artifact, read access, the destination baseline and the schedule window without evaluating the script or creating a fork. |
+| `--preflight-only` | Off | Check the artifact, read access and the destination baseline without evaluating the script or creating a fork. |
 | `--fork-name=content-review` | `content-apply-<UUID>` | ID of the new fork; an existing environment ID is refused. Cannot be combined with `--in-place`. |
 | `--destination=ENVIRONMENT_ID` | The recorded destination | Apply against another environment of the same project that matches the baseline. |
 | `--in-place` | Off | Run the script directly in the destination instead of a fork. |
 | `--allow-primary` | Off | Permit in-place writes to the primary environment; requires `--in-place`. |
 | `--keep-failed-fork` | Off | Keep the fork after a failure instead of deleting it. Cannot be combined with `--preflight-only`. |
-| `--schedule-window` | `120` | Refuse to start when a destination schedule falls due within this many minutes; `0` disables the check. |
-| `--fast-fork` | Off | Create the fork with DatoCMS's fast fork, which blocks writes to the destination while it copies. |
+| `--no-fast-fork` | Fast fork | Create a regular fork instead of DatoCMS's fast fork. A fast fork blocks writes to the destination while it copies, so destination schedules due during the copy may not run, and DatoCMS refuses it while users are editing records (`FAST_FORK_BLOCKED`). |
 | `--verification` | `versions` | How a baseline capture is confirmed: `versions` lists record versions once more (uploads and folders are reread in full); `full` rereads everything. In fork mode only the fork's capture is confirmed, since a change during the destination capture is carried into the fork. |
 | `--concurrency` | `8` | Maximum concurrent baseline read requests, from 1 to 16; script calls run as written. |
 
@@ -209,7 +208,8 @@ Keep content scripts under `migrations/content/` and run them with `content:appl
 - Publication cycles between records are broken by publishing first without the top-level links to records published later, then publishing again with them. Running in place can briefly expose a record without those links and adds an extra published version. Cycles made only of links inside blocks or structured text cannot be broken this way.
 - IDs or upload URLs embedded in arbitrary JSON or text fields are not typed references; referenced-upload selection and deletion ordering cannot see them.
 - New records and uploads belong to the account or token running the migration. Version history, original creators and read-only timestamps are not copied; writable `created_at` and `first_published_at` are.
-- Content writes trigger configured webhooks. Forks carry schedules that may run before promotion. Fast forks block destination writes while copying and may interfere with schedules due during the copy.
+- Content writes trigger configured webhooks. Forks carry schedules that may run before promotion.
+- Apply does not pause scheduled publications or unpublishings. A schedule that runs during the baseline checks fails them with `DESTINATION_CHANGED`. One that runs while the script runs is not detected, because publishing and unpublishing do not change the version that record locks compare: it can publish or unpublish a record the script has only partly written, the script's later writes can override it, and a generated call that removes a schedule which has already run fails the script. While the default fast fork copies, the destination is read-only, so a destination schedule due during the copy may not run; `--no-fast-fork` avoids this.
 - The complete destination namespace is checked even for a small change. Schema, workflow and folder endpoints are read unpaginated, as the API serves them. SQLite working data can need substantial temporary disk space.
 
 ## Output and errors

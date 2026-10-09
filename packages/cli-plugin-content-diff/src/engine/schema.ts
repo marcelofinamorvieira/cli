@@ -120,6 +120,10 @@ export async function fetchSchema(
   const semantics: JsonObject = {
     timezone: string(site.timezone, 'site timezone'),
   };
+  const meta: unknown = site.meta;
+  // Like the SDK's environment flag helpers, anything short of an explicit
+  // true reads as off, so a flag the API stops reporting does not stop
+  // generation. Both sides are read the same way.
   for (const key of [
     'improved_timezone_management',
     'improved_boolean_fields',
@@ -127,16 +131,8 @@ export async function fetchSchema(
     'milliseconds_in_datetime',
     'non_localized_focal_points',
     'improved_hex_management',
-  ]) {
-    const meta: unknown = site.meta;
-    const value = object(meta) ? meta[key] : undefined;
-    if (typeof value !== 'boolean')
-      throw new ContentError(
-        'INVALID_SCHEMA',
-        `Missing environment semantics setting ${key}.`,
-      );
-    semantics[key] = value;
-  }
+  ])
+    semantics[key] = object(meta) && meta[key] === true;
   const schema: SchemaState = {
     siteId: site.id,
     environmentId,

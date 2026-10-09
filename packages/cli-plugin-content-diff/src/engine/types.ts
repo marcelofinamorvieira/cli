@@ -30,9 +30,9 @@ export interface ModelSchema {
   tree: boolean;
   draftMode: boolean;
   /**
-   * Hashed into the destination binding. Generation also reads it to accept
-   * source records whose draft the CMA reports invalid; required locales are
-   * never interpreted.
+   * Hashed into the destination binding. Generation also reads the
+   * destination's setting to accept source records whose draft the CMA
+   * reports invalid; required locales are never interpreted.
    */
   saveInvalidDrafts: boolean;
   allLocalesRequired: boolean;
@@ -211,10 +211,11 @@ export interface ApplyOptions {
   /** Check original artifacts and destination state without executing the script. */
   preflightOnly?: boolean;
   concurrency: number;
-  /** Refuse to start when a schedule falls due within this many minutes. */
-  scheduleWindowMinutes: number;
-  /** Use DatoCMS's fast fork, which blocks destination writes while it copies. */
-  fastFork?: boolean;
+  /**
+   * Use DatoCMS's fast fork (the command's default), which blocks destination
+   * writes while it copies; false creates a regular fork.
+   */
+  fastFork: boolean;
   /**
    * 'versions' (the default) skips rereading records whose version did not
    * change; 'full' rereads every record in each check.

@@ -155,7 +155,7 @@ describe('source record validity', () => {
           ].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
         );
         assert.throws(
-          () => assertSourceRecordsValid(store, definition),
+          () => assertSourceRecordsValid(store, definition, definition),
           (error: unknown) => {
             assert.ok(error instanceof ContentError);
             assert.equal(error.code, 'INVALID_SOURCE_RECORDS');
@@ -186,7 +186,46 @@ describe('source record validity', () => {
       [],
       (store) => {
         assert.deepEqual(invalidSourceRecords(store, definition), []);
-        assertSourceRecordsValid(store, definition);
+        assertSourceRecordsValid(store, definition, definition);
+      },
+    );
+  });
+
+  it('accepts invalid drafts by the destination model setting and names records as the source does', async () => {
+    const draft = { current: true, published: false };
+    // The CMA applies the destination's invalid draft saving when the script
+    // writes the draft, whatever the source model allows.
+    const destination: SchemaState = {
+      ...definition,
+      environmentId: 'target',
+      models: definition.models.map((entry) =>
+        entry.id === LENIENT
+          ? { ...entry, name: 'Renamed', saveInvalidDrafts: false }
+          : entry.id === STRICT
+            ? { ...entry, saveInvalidDrafts: true }
+            : entry,
+      ),
+    };
+    await planned(
+      [
+        record('lenient-draft', LENIENT, draft),
+        record('strict-draft', STRICT, draft),
+      ],
+      [],
+      (store) => {
+        assert.deepEqual(
+          invalidSourceRecords(store, destination).map((entry) => entry.id),
+          [id('lenient-draft')],
+        );
+        assert.throws(
+          () => assertSourceRecordsValid(store, definition, destination),
+          (error: unknown) => {
+            assert.ok(error instanceof ContentError);
+            assert.match(error.message, /- Lenient "lenient-draft" /);
+            assert.doesNotMatch(error.message, /Renamed|strict-draft/);
+            return true;
+          },
+        );
       },
     );
   });
@@ -198,7 +237,7 @@ describe('source record validity', () => {
     });
     await planned([unchanged], [record('unchanged', STRICT)], (store) => {
       assert.equal(store.getPlan('record', unchanged.id)?.action, 'noop');
-      assertSourceRecordsValid(store, definition);
+      assertSourceRecordsValid(store, definition, definition);
     });
   });
 
@@ -211,7 +250,7 @@ describe('source record validity', () => {
     );
     await planned(many, [], (store) => {
       assert.throws(
-        () => assertSourceRecordsValid(store, definition),
+        () => assertSourceRecordsValid(store, definition, definition),
         (error: unknown) => {
           assert.ok(error instanceof ContentError);
           assert.equal(

@@ -1,3 +1,4 @@
+import { compareIds } from './compare-ids';
 import { ContentError } from './errors';
 import { recordSubject } from './migration-emit';
 import type { SnapshotStore } from './store';
@@ -17,14 +18,15 @@ export interface InvalidSourceRecord {
  * invalid. This reads the CMA's verdict; it never evaluates validators.
  *
  * An invalid published version always stops generation. An invalid current
- * version stops it too, unless the model has draft mode with invalid draft
- * saving, where the CMA accepts that draft.
+ * version stops it too, unless the destination model has draft mode with
+ * invalid draft saving: the destination's setting is the one the CMA applies
+ * when the script writes that draft.
  */
 export function invalidSourceRecords(
   store: SnapshotStore,
-  schema: SchemaState,
+  destination: SchemaState,
 ): InvalidSourceRecord[] {
-  const models = new Map(schema.models.map((model) => [model.id, model]));
+  const models = new Map(destination.models.map((model) => [model.id, model]));
   const result: InvalidSourceRecord[] = [];
   for (const action of ['create', 'update'] as const)
     for (const entry of store.planEntries('record', action)) {
@@ -42,14 +44,16 @@ export function invalidSourceRecords(
       if (versions.length)
         result.push({ id: state.id, modelId: state.modelId, versions });
     }
-  return result.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return result.sort((a, b) => compareIds(a.id, b.id));
 }
 
+/** Records are named with the source schema, where they must be fixed. */
 export function assertSourceRecordsValid(
   store: SnapshotStore,
-  schema: SchemaState,
+  source: SchemaState,
+  destination: SchemaState,
 ): void {
-  const invalid = invalidSourceRecords(store, schema);
+  const invalid = invalidSourceRecords(store, destination);
   if (!invalid.length) return;
   const lines = invalid.slice(0, LISTED).map((record) => {
     const state = store.getRecord('source', record.id);
@@ -60,7 +64,7 @@ export function assertSourceRecordsValid(
       .join(' and ');
     return `- ${recordSubject(
       record,
-      schema,
+      source,
       state?.current,
     )}: ${which} invalid`;
   });
@@ -71,7 +75,7 @@ export function assertSourceRecordsValid(
     [
       `The diff cannot be generated: ${invalid.length} source record${
         invalid.length === 1 ? ' is' : 's are'
-      } invalid, and invalid records cannot be diffed. Fix them in the source environment and run content:diff again. Only models with draft mode and "Save invalid drafts" enabled may keep an invalid draft.`,
+      } invalid, and invalid records cannot be diffed. Fix them in the source environment and run content:diff again. Only destination models with draft mode and "Save invalid drafts" enabled may keep an invalid draft.`,
       ...lines,
     ].join('\n'),
     { records: invalid },

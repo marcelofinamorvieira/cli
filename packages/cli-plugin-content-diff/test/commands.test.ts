@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { CmaClient } from '@datocms/cli-utils';
+import { CmaClient, oclif } from '@datocms/cli-utils';
 import { afterEach, describe, it } from 'mocha';
 import ContentApplyCommand from '../src/commands/content/apply';
 import ContentDiffCommand from '../src/commands/content/diff';
@@ -475,6 +475,73 @@ describe('content command integration', () => {
           /\(broken\): published version invalid/.test(error.message),
       );
       assert.equal(existsSync(working.directory), false);
+      // An invalid draft is accepted by the destination model's invalid
+      // draft saving, whatever the source model allows, and the record is
+      // named as the source schema names it.
+      const draftSaving = (source: boolean, destination: boolean) =>
+        replace(
+          schema,
+          'fetchSchema',
+          async (_client: unknown, environmentId: string) => {
+            const state = schemaState(environmentId);
+            const target = environmentId === 'target';
+            state.models = state.models.map((model) => ({
+              ...model,
+              name: target ? `Destination ${model.name}` : model.name,
+              saveInvalidDrafts: target ? destination : source,
+            }));
+            return state;
+          },
+        );
+      replace(planner, 'createPlan', async (store: SnapshotStore) => {
+        store.putRecord('source', {
+          id: 'draft',
+          modelId: 'article-id',
+          current: { title: 'Draft' },
+          published: null,
+          currentVersion: '1',
+          publishedUpdatedAt: null,
+          createdAt: '2020-01-01T00:00:00.000Z',
+          firstPublishedAt: null,
+          parentId: null,
+          position: null,
+          stage: null,
+          schedules: { publication: null, unpublishing: null },
+          invalid: { current: true, published: false },
+          hash: 'hash',
+        });
+        store.putPlan({
+          kind: 'record',
+          id: 'draft',
+          modelId: 'article-id',
+          action: 'create',
+          inDestination: false,
+          diagnostics: [],
+        });
+        return metadata;
+      });
+      let written = 0;
+      replace(
+        artifact,
+        'writeMigration',
+        async (args: Parameters<typeof artifact.writeMigration>[0]) => {
+          written++;
+          return args.outputPath;
+        },
+      );
+      draftSaving(false, true);
+      await generation.generateContentMigration(args);
+      assert.equal(written, 1);
+      draftSaving(true, false);
+      await assert.rejects(
+        generation.generateContentMigration(args),
+        (error: unknown) =>
+          error instanceof ContentError &&
+          error.code === 'INVALID_SOURCE_RECORDS' &&
+          /- Article \(draft\): current version invalid/.test(error.message) &&
+          !/Destination Article/.test(error.message),
+      );
+      assert.equal(written, 1);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -952,7 +1019,6 @@ describe('content command integration', () => {
               'fork-name': 'content-review',
               'in-place': false,
               'allow-primary': false,
-              'schedule-window': 120,
               'keep-failed-fork': false,
               concurrency: 4,
             },
@@ -1001,8 +1067,7 @@ describe('content command integration', () => {
             keepFailedFork: true,
             destinationEnvironmentId: 'target',
             concurrency: 2,
-            scheduleWindowMinutes: 45,
-            fastFork: true,
+            fastFork: false,
             verification: 'full',
             log: undefined,
           },
@@ -1019,8 +1084,7 @@ describe('content command integration', () => {
             destination: 'target',
             'in-place': false,
             'allow-primary': false,
-            'schedule-window': 45,
-            'fast-fork': true,
+            'fast-fork': false,
             verification: 'full',
             'keep-failed-fork': true,
             concurrency: 2,
@@ -1037,6 +1101,19 @@ describe('content command integration', () => {
     assert.deepEqual(await command.run(), result);
   });
 
+  it('creates fast forks unless --no-fast-fork is given', async () => {
+    const parse = async (argv: string[]) =>
+      (
+        await oclif.Parser.parse(argv, {
+          args: ContentApplyCommand.args,
+          flags: ContentApplyCommand.flags,
+        })
+      ).flags['fast-fork'];
+    assert.equal(await parse(['./migration.ts']), true);
+    assert.equal(await parse(['./migration.ts', '--no-fast-fork']), false);
+    assert.equal(await parse(['./migration.ts', '--fast-fork']), true);
+  });
+
   it('builds content:apply environment clients from the native client options', async () => {
     let resolutions = 0;
     const command = Object.assign(
@@ -1049,7 +1126,6 @@ describe('content command integration', () => {
             'log-level': 'BODY',
             'in-place': false,
             'allow-primary': false,
-            'schedule-window': 120,
             'keep-failed-fork': false,
             concurrency: 4,
           },
@@ -1195,7 +1271,6 @@ describe('content command integration', () => {
             flags: {
               'in-place': false,
               'allow-primary': false,
-              'schedule-window': 120,
               'keep-failed-fork': true,
               concurrency: 4,
             },
@@ -1473,11 +1548,6 @@ describe('content command integration', () => {
             '--autogenerate=schema',
           ],
           message: /Nonexistent flag: --autogenerate=schema/,
-          status: 2,
-        },
-        {
-          args: ['content:apply', './migration.ts', '--schedule-window=-5'],
-          message: /Expected an integer greater than or equal to 0/,
           status: 2,
         },
         {

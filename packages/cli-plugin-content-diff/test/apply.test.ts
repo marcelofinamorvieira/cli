@@ -119,6 +119,7 @@ function fixture() {
   const records = new Map([['main', clone(original)]]);
   const clients = new Map<string, Client>();
   const events: string[] = [];
+  const forkQueries: Array<Record<string, unknown>> = [];
   const hooks: { afterCapture?: (environment: string) => void } = {};
   let uncertain = false;
   let wrongProject = false;
@@ -147,8 +148,13 @@ function fixture() {
           if (!found) throw notFound();
           return clone(found);
         },
-        fork: async (source: string, { id }: { id: string }) => {
+        fork: async (
+          source: string,
+          { id }: { id: string },
+          query: Record<string, unknown>,
+        ) => {
           events.push(`fork:${id}`);
+          forkQueries.push(query);
           const env = {
             id,
             meta: {
@@ -234,7 +240,7 @@ function fixture() {
     allowPrimary: false,
     keepFailedFork: false,
     concurrency: 2,
-    scheduleWindowMinutes: 120,
+    fastFork: true,
     forkName: 'review',
   };
   const builds: Array<[string, boolean]> = [];
@@ -263,6 +269,7 @@ function fixture() {
     records,
     environments,
     events,
+    forkQueries,
     hooks,
     client,
     args,
@@ -698,27 +705,91 @@ describe('content migration execution', () => {
     );
     assert.deepEqual(test.events, ['fork:review', 'destroy:review']);
   });
-  it('disables schedule-window checks explicitly at zero and otherwise refuses near schedules', async () => {
+  it('requests a fast fork unless a regular fork is asked for', async () => {
+    const fast = fixture();
+    await applyMigration(fast.args(async () => {}));
+    assert.deepEqual(fast.forkQueries, [
+      { immediate_return: true, fast: true },
+    ]);
+    const regular = fixture();
+    await applyMigration(regular.args(async () => {}, { fastFork: false }));
+    assert.deepEqual(regular.forkQueries, [{ immediate_return: true }]);
+  });
+
+  it('explains a fast fork refused while users are editing, and removes nothing', async () => {
     const test = fixture();
-    test.original.schedules.publication = {
-      at: '2020-01-01T00:00:00.000Z',
-      selective: null,
-    };
-    test.original.hash = recordHash(test.original);
-    test.records.set('main', clone(test.original));
+    const refusal = new CmaClient.ApiError({
+      request: { method: 'POST', url: '/environments/main/fork', headers: {} },
+      response: {
+        status: 422,
+        statusText: 'Unprocessable Entity',
+        headers: {},
+        body: {
+          data: [
+            {
+              id: 'error',
+              type: 'api_error',
+              attributes: {
+                code: 'ACTIVE_EDITING_SESSIONS',
+                details: {},
+                doc_url: '',
+              },
+            },
+          ],
+        },
+      },
+    });
+    const message =
+      'Cannot proceed with a fast fork of "main", as some users are currently editing records.';
+    const suggestions = [
+      'Run again once nobody is editing records in the destination',
+      'Use --no-fast-fork to create a regular fork, which does not block the destination while it copies',
+    ];
+    replace(test.client('main').environments, 'fork', async () => {
+      throw refusal;
+    });
     await assert.rejects(
-      applyMigration(
-        test.args(async () => assert.fail(), { preflightOnly: true }),
-      ),
-      /schedule.*within the 120-minute schedule window/,
+      applyMigration(test.args(async () => assert.fail())),
+      (
+        error: ContentError &
+          ContentFailureContext & { suggestions?: string[] },
+      ) => {
+        assert.equal(error.code, 'FAST_FORK_BLOCKED');
+        assert.equal(error.message, message);
+        assert.deepEqual(error.suggestions, suggestions);
+        assert.equal(error.keptForkEnvironmentId, undefined);
+        return true;
+      },
     );
-    const result = await applyMigration(
-      test.args(async () => assert.fail(), {
-        preflightOnly: true,
-        scheduleWindowMinutes: 0,
-      }),
+    assert.deepEqual(test.events, []);
+    // A refused request creates no fork, so an environment that answers to
+    // the ID afterwards is reported as kept and never removed.
+    replace(test.client('main').environments, 'fork', async () => {
+      test.environments.set('review', {
+        id: 'review',
+        meta: { ...test.environments.get('main')!.meta, primary: false },
+      });
+      throw refusal;
+    });
+    await assert.rejects(
+      applyMigration(test.args(async () => assert.fail())),
+      (
+        error: ContentError &
+          ContentFailureContext & { suggestions?: string[] },
+      ) => {
+        assert.equal(error.code, 'FAST_FORK_BLOCKED');
+        assert.equal(error.keptForkEnvironmentId, 'review');
+        assert.equal(error.forkOutcomeStated, true);
+        assert.ok(error.message.startsWith(message));
+        assert.match(
+          error.message,
+          /The fork "review" was kept: an environment with that ID exists after the fork request failed/,
+        );
+        assert.deepEqual(error.suggestions, suggestions);
+        return true;
+      },
     );
-    assert.equal(result.scriptExecuted, false);
+    assert.equal(test.environments.has('review'), true);
     assert.deepEqual(test.events, []);
   });
 

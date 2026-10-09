@@ -499,9 +499,8 @@ export async function emitMigrationCalls(
         ['reorderRecords'],
       );
     // Schedules change last, and only where baseline and desired differ, so a
-    // new schedule never sees a half-migrated record; existing schedules are
-    // kept from firing mid-run by the apply-time schedule window. Deleting a
-    // record removes its schedules with it.
+    // new schedule never sees a half-migrated record. Deleting a record
+    // removes its schedules with it.
     for (const entry of records(['create', 'update']))
       await emitSchedules(entry, subject(entry), writer, call);
   } finally {

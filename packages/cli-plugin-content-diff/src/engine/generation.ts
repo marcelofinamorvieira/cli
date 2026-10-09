@@ -196,7 +196,7 @@ export async function generateContentMigration({
     });
     // Only records this migration writes matter, so check after planning and
     // before any file is written.
-    assertSourceRecordsValid(store, sourceSchema);
+    assertSourceRecordsValid(store, sourceSchema, destinationSchema);
     progress('Writing TypeScript content migration.');
     const scriptPath = await writeMigration({
       signal,

@@ -53,20 +53,15 @@ export default class ContentApplyCommand extends CmaClientCommand {
       description: 'Permit in-place writes to primary',
       dependsOn: ['in-place'],
     }),
-    'schedule-window': oclif.Flags.integer({
-      description:
-        'Refuse to start when a schedule falls due within this many minutes',
-      default: 120,
-      min: 0,
-    }),
     'keep-failed-fork': oclif.Flags.boolean({
       description: 'Keep a fork created by this run after failure',
       default: false,
     }),
     'fast-fork': oclif.Flags.boolean({
       description:
-        'Create the fork with a fast fork, which blocks writes to the destination while it copies',
-      default: false,
+        'Create the fork with a fast fork (the default), which blocks writes to the destination while it copies; use --no-fast-fork for a regular fork',
+      default: true,
+      allowNo: true,
     }),
     verification: oclif.Flags.custom<'versions' | 'full'>({
       description:
@@ -138,7 +133,6 @@ export default class ContentApplyCommand extends CmaClientCommand {
           : {}),
         ...(flags['preflight-only'] ? { preflightOnly: true } : {}),
         concurrency: flags.concurrency,
-        scheduleWindowMinutes: flags['schedule-window'],
         fastFork: flags['fast-fork'],
         verification: flags.verification,
         log: (message) => this.progress(message),

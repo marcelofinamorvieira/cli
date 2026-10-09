@@ -169,7 +169,7 @@ describe('TypeScript content execution', () => {
         allowPrimary: false,
         keepFailedFork: false,
         concurrency: 8,
-        scheduleWindowMinutes: 120,
+        fastFork: true,
       },
     };
     await assert.rejects(
@@ -222,7 +222,7 @@ describe('TypeScript content execution', () => {
           allowPrimary: false,
           keepFailedFork: false,
           concurrency: 8,
-          scheduleWindowMinutes: 120,
+          fastFork: true,
         },
       }),
       (error) =>
@@ -256,7 +256,7 @@ describe('TypeScript content execution', () => {
           allowPrimary: false,
           keepFailedFork: false,
           concurrency: 8,
-          scheduleWindowMinutes: 120,
+          fastFork: true,
         },
       }),
       (error) => (error as NodeJS.ErrnoException).code === 'ENOENT',
@@ -291,7 +291,7 @@ describe('TypeScript content execution', () => {
             allowPrimary: false,
             keepFailedFork: false,
             concurrency: 8,
-            scheduleWindowMinutes: 120,
+            fastFork: true,
             preflightOnly,
           },
         }),

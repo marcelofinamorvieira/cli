@@ -151,6 +151,23 @@ describe('fresh bulk schema hydration', () => {
     }
   });
 
+  it('reads an environment flag the API does not report as off', async () => {
+    const response = bulk();
+    const { improved_hex_management: _omitted, ...reported } =
+      response.data.meta;
+    Object.assign(response.data, {
+      meta: { ...reported, non_localized_focal_points: 'yes' },
+    });
+    const client = {
+      site: { rawFind: async () => response },
+      workflows: { list: async () => [] },
+    } as unknown as Client;
+    const { semantics } = await fetchSchema(client, 'sandbox');
+    assert.equal(semantics.improved_hex_management, false);
+    assert.equal(semantics.non_localized_focal_points, false);
+    assert.equal(semantics.improved_boolean_fields, true);
+  });
+
   it('accepts a genuinely empty schema without field requests', async () => {
     const client = {
       site: { rawFind: async () => bulk(0) },

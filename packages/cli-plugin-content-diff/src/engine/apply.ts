@@ -40,27 +40,6 @@ async function findMaybe<T>(read: () => Promise<T>): Promise<T | null> {
     throw error;
   }
 }
-function assertScheduleWindow(store: SnapshotStore, minutes: number): void {
-  if (minutes === 0) return;
-  const deadline = Date.now() + minutes * 60_000;
-  for (const row of store.database
-    .prepare(`SELECT id,at FROM (
-    SELECT id,json_extract(state_json,'$.schedules.publication.at') AS at FROM records WHERE side='target'
-    UNION ALL SELECT id,json_extract(state_json,'$.schedules.unpublishing.at') FROM records WHERE side='target'
-  ) WHERE at IS NOT NULL ORDER BY id`)
-    .iterate()) {
-    if (
-      Number.isFinite(Date.parse(String(row.at))) &&
-      Date.parse(String(row.at)) > deadline
-    )
-      continue;
-    throw new ContentError(
-      'SCHEDULE_DUE_DURING_APPLY',
-      `Record ${row.id} has a schedule at ${row.at}, within the ${minutes}-minute schedule window. Apply after it has run, or lower --schedule-window.`,
-      { recordId: String(row.id), at: String(row.at), windowMinutes: minutes },
-    );
-  }
-}
 async function waitForFork(
   client: Client,
   id: string,
@@ -122,6 +101,30 @@ function forkMayExist(error: unknown): boolean {
     error instanceof CmaClient.ApiError &&
     error.response.status >= 400 &&
     error.response.status < 500
+  );
+}
+
+/** The native message for a fast fork refused while editors are at work. */
+function fastForkBlocked(
+  error: unknown,
+  destinationId: string,
+): ContentError | undefined {
+  if (
+    !(error instanceof CmaClient.ApiError) ||
+    !error.findError('ACTIVE_EDITING_SESSIONS')
+  )
+    return undefined;
+  return Object.assign(
+    new ContentError(
+      'FAST_FORK_BLOCKED',
+      `Cannot proceed with a fast fork of "${destinationId}", as some users are currently editing records.`,
+    ),
+    {
+      suggestions: [
+        'Run again once nobody is editing records in the destination',
+        'Use --no-fast-fork to create a regular fork, which does not block the destination while it copies',
+      ],
+    },
   );
 }
 
@@ -223,7 +226,6 @@ async function assertBaseline(
       : destinationChanged({ reason: 'drift', description: error.message });
   }
   compareBaseline(store, 'target');
-  assertScheduleWindow(store, options.scheduleWindowMinutes);
 }
 
 /** The real path, or the path itself when it does not exist (yet). */
@@ -383,6 +385,7 @@ export async function applyMigration(
         );
       } catch (error) {
         forkRequested = forkMayExist(error);
+        const failure = fastForkBlocked(error, destinationId) ?? error;
         // The SDK retries a fork request that timed out, so a 4xx may answer
         // the retry of a request that did create the fork. An environment
         // under the ID may still belong to someone else: report it, never
@@ -393,11 +396,11 @@ export async function applyMigration(
         ) {
           forkAppeared = true;
           forkStated = explain(
-            error,
+            failure,
             `The fork "${forkId}" was kept: an environment with that ID exists after the fork request failed and may have been created by a retried request of this run.`,
           );
         }
-        throw error;
+        throw failure;
       }
       forkRequested = true;
       await waitForFork(args.rootClient, forkId, options.signal, options.log);
