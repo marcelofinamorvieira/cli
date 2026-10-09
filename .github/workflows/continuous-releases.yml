@@ -28,8 +28,6 @@ permissions: {}
 
 jobs:
   publish:
-    # Preview publication is upstream-only; fork pushes must not publish packages.
-    if: github.repository == 'datocms/cli'
     runs-on: ubuntu-latest
 
     steps:
