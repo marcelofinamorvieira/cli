@@ -6,7 +6,9 @@ export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
 export type JsonObject = { [key: string]: JsonValue };
 export type Side = 'source' | 'target';
 export type Action = 'create' | 'update' | 'delete' | 'noop' | 'skip';
-export type Kind = 'record' | 'upload' | 'collection';
+/** Plan entry kinds; `collection` is an upload folder. */
+export const KINDS = ['record', 'upload', 'collection'] as const;
+export type Kind = (typeof KINDS)[number];
 
 export interface FieldSchema {
   id: string;

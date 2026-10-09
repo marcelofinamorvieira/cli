@@ -3,35 +3,6 @@ import { assertNotAborted } from './cancellation';
 import { ContentError } from './errors';
 import type { Client } from './types';
 
-/**
- * Observes the execution client's work. The SDK sends every request through
- * `client.config.fetchFn` (job polling, upload and download transfers
- * included), so wrapping it can refuse writes without touching the client the
- * script receives. Retries, job polling and response parsing happen inside the
- * SDK call, between raw fetches, so calls passed to `track` count as in flight
- * until they settle too. Work an SDK helper does with nothing in flight (such
- * as streaming a download to disk) is not observed.
- */
-interface RequestTracker {
-  readonly fetchFn: typeof fetch;
-  /** Requests and tracked calls that have not settled yet. */
-  readonly pending: number;
-  /**
-   * Pending work that may change content. Reads can outlive a correct
-   * script: a paged iterator the script leaves early keeps fetching the
-   * pages it already queued.
-   */
-  readonly pendingWrites: number;
-  /** Writes refused because they started after `close()`. */
-  readonly refusedWrites: number;
-  /** Counts `work` as in flight until it settles. */
-  track<T>(work: Promise<T>, method: string): Promise<T>;
-  /** Rejects writes issued once the migration callback has settled. */
-  close(): void;
-  /** Waits until nothing is in flight, including work started meanwhile. */
-  drain(): Promise<void>;
-}
-
 function requestMethod(input: Parameters<typeof fetch>[0], init?: RequestInit) {
   return (
     init?.method ??
@@ -43,82 +14,13 @@ function requestMethod(input: Parameters<typeof fetch>[0], init?: RequestInit) {
 
 const isRead = (method: string) => method === 'GET' || method === 'HEAD';
 
-export function trackRequests(
-  signal?: AbortSignal,
-  base?: typeof fetch,
-): RequestTracker {
-  const inFlight = new Set<Promise<unknown>>();
-  const writes = new Set<Promise<unknown>>();
-  let closed = false;
-  let refusedWrites = 0;
-  const track = <T>(work: Promise<T>, method: string): Promise<T> => {
-    const write = !isRead(method.toUpperCase());
-    inFlight.add(work);
-    if (write) writes.add(work);
-    // The caller gets a derived promise, so a rejection it never handles is
-    // still reported as unhandled; draining waits on `work` and leaves the
-    // caller's copy alone.
-    return work.finally(() => {
-      inFlight.delete(work);
-      writes.delete(work);
-    });
-  };
-  const fetchFn: typeof fetch = (input, init) => {
-    const method = requestMethod(input, init);
-    // Reads keep flowing after an interrupt so jobs the script already
-    // submitted can still be observed to completion.
-    if (!isRead(method)) {
-      try {
-        assertNotAborted(signal);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      if (closed) {
-        refusedWrites++;
-        return Promise.reject(
-          new ContentError(
-            'UNAWAITED_MIGRATION_CALL',
-            `A ${method} request started after the migration callback finished. Await every client call.`,
-          ),
-        );
-      }
-    }
-    return track((base ?? globalThis.fetch)(input, init), method);
-  };
-  return {
-    fetchFn,
-    track,
-    get pending() {
-      return inFlight.size;
-    },
-    get pendingWrites() {
-      return writes.size;
-    },
-    get refusedWrites() {
-      return refusedWrites;
-    },
-    close() {
-      closed = true;
-    },
-    async drain() {
-      do {
-        while (inFlight.size) await Promise.allSettled([...inFlight]);
-        // A settled call can resume a chain whose next call starts after
-        // pending callbacks run.
-        await new Promise((resolve) => setImmediate(resolve));
-      } while (inFlight.size);
-    },
-  };
-}
-
 /**
  * Keeps a rejection nobody handled, such as a call the script never awaited
- * that failed or was refused, from ending the process (Node's default) while
- * a migration and its cleanup are running. A rejection the script handles
- * later (a call it awaits after it failed) is forgotten again; the first one
- * still unhandled is kept for the report.
+ * that failed, from ending the process (Node's default) while the migration
+ * runs. A rejection the script handles later (a call it awaits after it
+ * failed) is forgotten again; the first one still unhandled is kept.
  */
-export function observeUnhandledRejections(): {
+function observeUnhandledRejections(): {
   readonly first: { reason: unknown } | undefined;
   dispose(): void;
 } {
@@ -219,9 +121,16 @@ export function cmaFailure(error: unknown): unknown {
 }
 
 /**
- * Runs a migration callback with a client whose requests are tracked. Every
- * request is settled before this returns or throws, so cleanup never races a
- * write the script submitted.
+ * Runs a migration callback with a client whose requests are tracked, and
+ * returns or throws only once every request the script started has settled,
+ * so apply never reports, or removes a fork, while a write is still running.
+ * The SDK sends every request (retries, job polling and file transfers
+ * included) through `fetchFn`; the client's `request` is tracked too, so a
+ * call waiting between attempts, or before polling its job, counts as in
+ * flight. After an interrupt new writes are refused, while reads continue so
+ * jobs already submitted can be observed. A call the script did not await
+ * still runs to completion; if one fails without being handled, the
+ * migration fails.
  */
 export async function runTrackedMigration(
   run: (client: Client) => Promise<void>,
@@ -229,17 +138,27 @@ export async function runTrackedMigration(
   signal?: AbortSignal,
   baseFetch?: typeof fetch,
 ): Promise<void> {
-  const tracker = trackRequests(signal, baseFetch);
-  const client = buildClient(tracker.fetchFn);
-  // The script receives the same client; only its `request` calls are
-  // counted so draining also waits for SDK retries and job polling.
+  const inFlight = new Set<Promise<unknown>>();
+  // The caller gets a derived promise, so a rejection it never handles is
+  // still reported as unhandled; draining waits on `work` itself.
+  const track = <T>(work: Promise<T>): Promise<T> => {
+    inFlight.add(work);
+    return work.finally(() => inFlight.delete(work));
+  };
+  const client = buildClient((input, init) => {
+    if (!isRead(requestMethod(input, init))) {
+      try {
+        assertNotAborted(signal);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+    return track((baseFetch ?? globalThis.fetch)(input, init));
+  });
   const request = client.request;
   if (typeof request === 'function')
     client.request = ((options) =>
-      tracker.track(
-        request.call(client, options),
-        options.method,
-      )) as Client['request'];
+      track(request.call(client, options))) as Client['request'];
   const floating = observeUnhandledRejections();
   try {
     let failure: { error: unknown } | undefined;
@@ -249,9 +168,12 @@ export async function runTrackedMigration(
     } catch (error) {
       failure = { error };
     }
-    tracker.close();
-    const unawaited = tracker.pendingWrites > 0;
-    await tracker.drain();
+    do {
+      while (inFlight.size) await Promise.allSettled([...inFlight]);
+      // A settled call can resume a chain whose next call starts after
+      // pending callbacks run.
+      await new Promise((resolve) => setImmediate(resolve));
+    } while (inFlight.size);
     assertNotAborted(signal);
     if (failure)
       throw failure.error instanceof Error
@@ -260,25 +182,13 @@ export async function runTrackedMigration(
             'MIGRATION_FAILED',
             `The migration callback failed: ${String(failure.error)}`,
           );
-    if (!unawaited && !tracker.refusedWrites && !floating.first) return;
-    const reason = floating.first?.reason;
-    // A refused write is the unawaited call itself; any other rejection is a
-    // failure the script never saw.
-    const unseen =
-      floating.first &&
-      !(
-        reason instanceof ContentError &&
-        reason.code === 'UNAWAITED_MIGRATION_CALL'
-      )
-        ? cmaFailure(reason)
-        : undefined;
-    const message =
-      'The migration callback did not await every CMA request. Await every client call.';
+    if (!floating.first) return;
+    const unseen = cmaFailure(floating.first.reason);
     throw new ContentError(
       'UNAWAITED_MIGRATION_CALL',
-      unseen instanceof Error
-        ? `${message} An unawaited call failed: ${unseen.message}`
-        : message,
+      `A call the migration did not await failed: ${
+        unseen instanceof Error ? unseen.message : String(unseen)
+      } Await every client call.`,
       unseen instanceof ContentError
         ? { cause: { code: unseen.code, details: unseen.details } }
         : undefined,

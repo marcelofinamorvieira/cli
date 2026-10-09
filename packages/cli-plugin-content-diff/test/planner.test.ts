@@ -156,7 +156,7 @@ async function fixture(
   try {
     for (const entry of source) store.putRecord('source', entry);
     for (const entry of target) store.putRecord('target', entry);
-    const metadata = await createPlan(
+    const metadata = createPlan(
       store,
       state,
       { ...state, environmentId: 'target' },
@@ -180,7 +180,7 @@ async function collectionFixture(
   try {
     for (const state of source) store.putCollection('source', state);
     for (const state of target) store.putCollection('target', state);
-    const metadata = await createPlan(
+    const metadata = createPlan(
       store,
       schema(),
       schema(),
@@ -317,25 +317,20 @@ describe('indexed planner', () => {
           );
           store.putRecord('source', record(B, { asset: null, link: A }));
           store.putRecord('source', record(C, safe));
-          await assert.rejects(
-            createPlan(store, state, state, options()),
+          assert.throws(
+            () => createPlan(store, state, state, options()),
             (error: unknown) =>
               error instanceof ContentError &&
               error.code === 'UNSAFE_REQUESTED_CHANGE' &&
               error.details?.reason === 'UNSUPPORTED_PAYLOAD_KEY',
           );
           assert.deepEqual([...store.planEntries()], []);
-          await createPlan(
-            store,
-            state,
-            state,
-            options({ allowPartial: true }),
-          );
+          createPlan(store, state, state, options({ allowPartial: true }));
           assert.equal(store.getPlan('record', A)?.action, 'skip');
           assert.equal(store.getPlan('record', B)?.action, 'skip');
           assert.equal(store.getPlan('record', C)?.action, 'create');
           store.putRecord('target', store.getRecord('source', A)!);
-          await createPlan(store, state, state, options());
+          createPlan(store, state, state, options());
           assert.equal(store.getPlan('record', A)?.action, 'noop');
           assert.equal(store.getPlan('record', B)?.action, 'create');
         } finally {
@@ -355,7 +350,7 @@ describe('indexed planner', () => {
         'target',
         record(B, { title: 'keep' }, { modelId: other.id }),
       );
-      const metadata = await createPlan(
+      const metadata = createPlan(
         store,
         source,
         target,
@@ -634,12 +629,7 @@ describe('indexed planner', () => {
       const store = new SnapshotStore();
       try {
         store.putUpload('source', upload(sourceId));
-        await createPlan(
-          store,
-          schema(),
-          schema(),
-          options({ uploads: 'all' }),
-        );
+        createPlan(store, schema(), schema(), options({ uploads: 'all' }));
         assert.equal(store.getPlan('upload', sourceId)?.action, 'create');
       } finally {
         store.dispose();
@@ -1161,7 +1151,7 @@ describe('indexed planner', () => {
       for (const entry of [linked(A, B, 0), linked(B, A, 1)])
         store.putRecord('source', entry);
       store.putRecord('target', record(C, { title: 'old' }, { position: 0 }));
-      const metadata = await createPlan(
+      const metadata = createPlan(
         store,
         state,
         { ...state, environmentId: 'target' },
@@ -1696,7 +1686,7 @@ describe('indexed planner', () => {
         record(B, { file: { upload_id: asset.id } }, { modelId: other.id }),
       );
       store.putUpload('target', asset);
-      const metadata = await createPlan(
+      const metadata = createPlan(
         store,
         state,
         state,
@@ -1838,7 +1828,7 @@ describe('indexed planner', () => {
               ),
             );
         });
-      const metadata = await createPlan(
+      const metadata = createPlan(
         store,
         state,
         { ...state, environmentId: 'target' },
@@ -2129,7 +2119,7 @@ describe('indexed planner', () => {
       store.putUpload('target', kept);
       store.putUpload('target', unrelated);
       store.putCollection('target', folder);
-      await createPlan(
+      createPlan(
         store,
         state,
         { ...state, environmentId: 'target' },

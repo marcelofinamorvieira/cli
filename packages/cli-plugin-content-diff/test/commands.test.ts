@@ -345,7 +345,7 @@ describe('content command integration', () => {
     replace(
       planner,
       'createPlan',
-      async (
+      (
         store: SnapshotStore,
         _source: SchemaState,
         _target: SchemaState,
@@ -436,7 +436,7 @@ describe('content command integration', () => {
       assert.equal(existsSync(working.directory), false);
       // A record the source CMA reports invalid stops generation before any
       // file is written.
-      replace(planner, 'createPlan', async (store: SnapshotStore) => {
+      replace(planner, 'createPlan', (store: SnapshotStore) => {
         const fields = { title: 'Broken' };
         store.putRecord('source', {
           id: 'broken',
@@ -493,7 +493,7 @@ describe('content command integration', () => {
             return state;
           },
         );
-      replace(planner, 'createPlan', async (store: SnapshotStore) => {
+      replace(planner, 'createPlan', (store: SnapshotStore) => {
         store.putRecord('source', {
           id: 'draft',
           modelId: 'article-id',
@@ -816,11 +816,7 @@ describe('content command integration', () => {
     replace(
       planner,
       'createPlan',
-      async (
-        _store: unknown,
-        source: SchemaState,
-        destination: SchemaState,
-      ) => {
+      (_store: unknown, source: SchemaState, destination: SchemaState) => {
         assert.equal(source.models.length, 3);
         assert.equal(destination.models.length, 3);
         throw new Error('projection verified');
@@ -925,7 +921,7 @@ describe('content command integration', () => {
         }
       },
     );
-    replace(planner, 'createPlan', async (store: SnapshotStore) => {
+    replace(planner, 'createPlan', (store: SnapshotStore) => {
       // The destination was read into its own store and imported here.
       assert.equal(store, stores.get('source'));
       assert.notEqual(store, stores.get('target'));

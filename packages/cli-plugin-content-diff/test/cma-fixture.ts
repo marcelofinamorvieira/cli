@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname } from 'node:path';
-import { basename, extname } from 'node:path';
+import { basename, dirname, extname, join } from 'node:path';
 import { compileFunction } from 'node:vm';
 import * as ts from 'typescript';
 import {
@@ -13,6 +12,7 @@ import {
   recordPayloadFields,
   recordReferences,
 } from '../src/engine/codec';
+import { companionDirectory } from '../src/engine/companion';
 import type { SnapshotStore } from '../src/engine/store';
 import type {
   CollectionState,
@@ -775,11 +775,17 @@ export async function executeGeneratedScript(
   };
   const runtime = {
     defineContentMigration: (
-      _options: unknown,
       callback: (client: ContentMigrationClient) => Promise<void>,
     ) => callback,
-    runMigrationPart: (client: ContentMigrationClient, path: string) =>
-      executeGeneratedScript(path, client),
+    runMigrationPart: (
+      client: ContentMigrationClient,
+      script: string,
+      part: string,
+    ) =>
+      executeGeneratedScript(
+        join(companionDirectory(script), 'parts', part),
+        client,
+      ),
     reorderRecords,
   };
   compileFunction(

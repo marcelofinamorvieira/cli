@@ -87,23 +87,13 @@ export function hashJson(value: unknown): string {
   return createHash('sha256').update(stableStringify(value)).digest('hex');
 }
 
-export function string(value: unknown, name: string): string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new ContentError('INVALID_RESPONSE', `Missing ${name}.`);
-  }
-  return value;
-}
-
 function nullableString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
-export function timestamp(value: unknown, name: string): string {
-  const text = string(value, name);
-  const date = new Date(text);
-  if (!Number.isFinite(date.getTime()))
-    throw new ContentError('INVALID_RESPONSE', `Invalid ${name}.`);
-  return date.toISOString();
+/** A CMA timestamp in one UTC form, so equal instants compare equal. */
+export function timestamp(value: string): string {
+  return new Date(value).toISOString();
 }
 
 export function referenceId(value: unknown): string | null {
@@ -112,37 +102,21 @@ export function referenceId(value: unknown): string | null {
 }
 
 /** The model of a record or block in the CMA's JSON:API shape. */
-function itemTypeId(resource: Record<string, unknown>): string | null {
-  const relationships = resource.relationships;
-  if (!object(relationships) || !object(relationships.item_type)) return null;
-  const data = relationships.item_type.data;
-  return object(data) && typeof data.id === 'string' ? data.id : null;
+function itemTypeId(resource: Record<string, unknown>): string {
+  return (
+    resource as { relationships: { item_type: { data: { id: string } } } }
+  ).relationships.item_type.data.id;
 }
 
-/** The model of a record resource as the CMA returns it. */
-export function recordModelId(resource: Record<string, unknown>): string {
-  const id = itemTypeId(resource);
-  if (id === null)
-    throw new ContentError('INVALID_RESPONSE', 'Record has no model identity.');
-  return id;
-}
+const modelIndexes = new WeakMap<SchemaState, Map<string, ModelSchema>>();
 
-const modelIndexes = new WeakMap<
-  SchemaState,
-  { models: ModelSchema[]; index: Map<string, ModelSchema> }
->();
-
-/** Schemas are immutable during a capture/plan; retain one index per schema. */
+/** Schemas are never mutated once read, so one index per schema object. */
 function modelIndex(schema: SchemaState): Map<string, ModelSchema> {
-  const cached = modelIndexes.get(schema);
-  if (
-    cached &&
-    cached.models === schema.models &&
-    cached.index.size === schema.models.length
-  )
-    return cached.index;
-  const index = new Map(schema.models.map((entry) => [entry.id, entry]));
-  modelIndexes.set(schema, { models: schema.models, index });
+  let index = modelIndexes.get(schema);
+  if (!index) {
+    index = new Map(schema.models.map((entry) => [entry.id, entry]));
+    modelIndexes.set(schema, index);
+  }
   return index;
 }
 
@@ -183,8 +157,6 @@ function documentValue(
 ): JsonValue {
   if (!object(node)) return json(node);
   const isBlock = node.type === 'block' || node.type === 'inlineBlock';
-  if (isBlock && !Object.hasOwn(node, 'item'))
-    throw new ContentError('INVALID_BLOCK', 'DAST block is missing its item.');
   const result: JsonObject = {};
   for (const key of Object.keys(node).sort()) {
     const entry = node[key];
@@ -217,14 +189,7 @@ function fieldValue(
   block: (value: unknown) => JsonValue,
 ): JsonValue {
   if (value === null) return null;
-  if (type === 'rich_text') {
-    if (!Array.isArray(value))
-      throw new ContentError(
-        'INVALID_BLOCK',
-        'Modular Content must be an array.',
-      );
-    return value.map(block);
-  }
+  if (type === 'rich_text') return (value as unknown[]).map(block);
   if (type === 'single_block') return block(value);
   if (type === 'structured_text') return documentValue(value, block);
   return json(value);
@@ -264,19 +229,16 @@ export function canonicalFields(
   schema: SchemaState,
 ): JsonObject {
   return mapFields(fields, modelId, schema, (value) => {
+    // Capture reads models with block fields nested; a bare block ID here
+    // means that choice missed a field type that holds blocks.
     if (!object(value) || !object(value.attributes))
       throw new ContentError(
         'INVALID_BLOCK',
         'Nested read returned a block reference without its content.',
       );
     const typeId = itemTypeId(value);
-    if (typeId === null)
-      throw new ContentError(
-        'INVALID_BLOCK',
-        'Nested block has no model identity.',
-      );
     return {
-      id: string(value.id, 'block ID'),
+      id: value.id as string,
       __itemTypeId: typeId,
       attributes: canonicalFields(value.attributes, typeId, schema),
     };
@@ -296,7 +258,7 @@ function canonicalBlock(value: unknown): {
   )
     throw new ContentError('INVALID_BLOCK', 'Block content is missing.');
   return {
-    id: string(value.id, 'block ID'),
+    id: value.id as string,
     modelId: value.__itemTypeId,
     attributes: value.attributes as JsonObject,
   };
@@ -515,16 +477,8 @@ type NativeRecord = Record<string, unknown> & {
   meta: Record<string, unknown>;
 };
 
-/** A record resource as the CMA returns it: `id`, `attributes`, `meta` and its model relationship. */
-function nativeRecord(value: unknown, name: string): NativeRecord {
-  if (!object(value) || !object(value.attributes) || !object(value.meta))
-    throw new ContentError('INVALID_RESPONSE', `${name} record is malformed.`);
-  string(value.id, 'record ID');
-  return value as NativeRecord;
-}
-
-function optionalTimestamp(value: unknown, name: string): string | null {
-  return value === null || value === undefined ? null : timestamp(value, name);
+function optionalTimestamp(value: unknown): string | null {
+  return typeof value === 'string' ? timestamp(value) : null;
 }
 
 /**
@@ -537,39 +491,21 @@ function nativeVersion(
   published: NativeRecord | null,
 ): RecordVersion {
   const { meta, attributes } = current;
-  const modelId = recordModelId(current);
-  if (
-    published &&
-    (published.id !== current.id || recordModelId(published) !== modelId)
-  )
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Published record identity is inconsistent.',
-    );
   return {
-    modelId,
+    modelId: itemTypeId(current),
     currentVersion: nullableString(meta.current_version),
     publishedUpdatedAt: published
       ? nullableString(published.meta.updated_at)
       : null,
     published: published !== null,
-    createdAt: timestamp(meta.created_at, 'creation timestamp'),
-    firstPublishedAt: optionalTimestamp(
-      meta.first_published_at,
-      'first publication timestamp',
-    ),
+    createdAt: timestamp(meta.created_at as string),
+    firstPublishedAt: optionalTimestamp(meta.first_published_at),
     parentId: nullableString(attributes.parent_id),
     position:
       typeof attributes.position === 'number' ? attributes.position : null,
     stage: nullableString(meta.stage),
-    publicationAt: optionalTimestamp(
-      meta.publication_scheduled_at,
-      'publication marker',
-    ),
-    unpublishingAt: optionalTimestamp(
-      meta.unpublishing_scheduled_at,
-      'unpublishing marker',
-    ),
+    publicationAt: optionalTimestamp(meta.publication_scheduled_at),
+    unpublishingAt: optionalTimestamp(meta.unpublishing_scheduled_at),
   };
 }
 
@@ -582,10 +518,7 @@ export function listingFingerprint(
   published: unknown | null,
 ): string {
   return hashJson(
-    nativeVersion(
-      nativeRecord(current, 'Current'),
-      published === null ? null : nativeRecord(published, 'Published'),
-    ),
+    nativeVersion(current as NativeRecord, published as NativeRecord | null),
   );
 }
 
@@ -596,8 +529,8 @@ export function canonicalRecord(
   schema: SchemaState,
   schedules: Schedules = { publication: null, unpublishing: null },
 ): RecordState {
-  const native = nativeRecord(current, 'Current');
-  const pub = published === null ? null : nativeRecord(published, 'Published');
+  const native = current as NativeRecord;
+  const pub = published as NativeRecord | null;
   const version = nativeVersion(native, pub);
   const state: RecordState = {
     id: native.id,
@@ -631,12 +564,16 @@ export function canonicalRecord(
  * field-keyed in every environment.
  */
 export function canonicalUpload(input: unknown): UploadState {
-  if (!object(input))
-    throw new ContentError('INVALID_RESPONSE', 'Upload is not an object.');
-  const id = string(input.id, 'upload ID');
-  const attributes: JsonObject = {
-    basename: string(input.basename, 'upload basename'),
+  const upload = input as Record<string, unknown> & {
+    id: string;
+    basename: string;
+    size: number;
+    md5: string;
+    url: string;
+    filename: string;
   };
+  const { id } = upload;
+  const attributes: JsonObject = { basename: upload.basename };
   for (const key of [
     'author',
     'copyright',
@@ -644,17 +581,15 @@ export function canonicalUpload(input: unknown): UploadState {
     'tags',
     'default_field_metadata',
   ]) {
-    if (input[key] !== undefined) attributes[key] = json(input[key]);
+    if (upload[key] !== undefined) attributes[key] = json(upload[key]);
   }
-  if (typeof input.size !== 'number')
-    throw new ContentError('INVALID_RESPONSE', 'Upload size is missing.');
   const state: UploadState = {
     id,
-    md5: string(input.md5, 'upload checksum').toLowerCase(),
-    size: input.size,
-    url: string(input.url, 'upload URL'),
-    filename: string(input.filename, 'upload filename'),
-    collectionId: referenceId(input.upload_collection),
+    md5: upload.md5.toLowerCase(),
+    size: upload.size,
+    url: upload.url,
+    filename: upload.filename,
+    collectionId: referenceId(upload.upload_collection),
     attributes,
     hash: '',
   };
@@ -682,21 +617,17 @@ export function collectionHash(
 
 /** An upload collection as the SDK's `uploadCollections.list` returns it. */
 export function canonicalCollection(resource: unknown): CollectionState {
-  if (!object(resource))
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Upload collection is not an object.',
-    );
-  if (typeof resource.position !== 'number')
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Upload collection position is missing.',
-    );
+  const collection = resource as {
+    id: string;
+    label: string;
+    parent: unknown;
+    position: number;
+  };
   const state = {
-    id: string(resource.id, 'collection ID'),
-    label: string(resource.label, 'collection label'),
-    parentId: referenceId(resource.parent),
-    position: resource.position,
+    id: collection.id,
+    label: collection.label,
+    parentId: referenceId(collection.parent),
+    position: collection.position,
     hash: '',
   };
   state.hash = collectionHash(state);

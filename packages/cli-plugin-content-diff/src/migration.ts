@@ -1,41 +1,45 @@
-import { resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { join } from 'node:path';
 import type { ContentMigrationClient } from './content-migration-client';
 export type * from './content-migration-client';
 export { type RecordOrder, reorderRecords } from './reorder-records';
+import { companionDirectory } from './engine/companion';
 import { ContentError } from './engine/errors';
 import { loadMigrationModule } from './engine/migration-loader';
 
-export interface ContentMigrationOptions {
-  baseline: string;
-}
-
-/** An executable CMA script with immutable metadata for the plugin runner. */
+/**
+ * An executable CMA script with immutable metadata for the plugin runner. Its
+ * destination baseline is the same-named `.content` directory beside it.
+ */
 export type ContentMigration = ((
   client: ContentMigrationClient,
 ) => Promise<void>) & {
   readonly format: 'datocms-content-migration';
   readonly version: 1;
-  readonly options: ContentMigrationOptions;
 };
 
 /**
- * Load one generated part through the same tsx API as the main script and
- * await its default export with the real client. The part is dropped from the
- * module cache afterwards; tsx keeps its compiled source in memory until the
- * process ends.
+ * Run one part of a split migration: the file `part` in the `parts` directory
+ * of the script's companion, found beside the script's real file as
+ * content:apply finds the baseline. The part is loaded through the same tsx
+ * API as the main script, its default export is awaited with the real client,
+ * and it is dropped from the module cache afterwards; tsx keeps its compiled
+ * source in memory until the process ends.
  */
 export async function runMigrationPart(
   client: ContentMigrationClient,
-  path: string,
+  script: string,
+  part: string,
 ): Promise<void> {
-  const part = (await loadMigrationModule<{ default?: unknown } | null>(path))
+  const path = join(companionDirectory(realpathSync(script)), 'parts', part);
+  const run = (await loadMigrationModule<{ default?: unknown } | null>(path))
     ?.default;
-  if (typeof part !== 'function')
+  if (typeof run !== 'function')
     throw new ContentError(
       'INVALID_CONTENT_MIGRATION',
-      `Migration part must export a default function: ${resolve(path)}`,
+      `Migration part must export a default function: ${path}`,
     );
-  await part(client);
+  await run(client);
 }
 
 /**
@@ -44,12 +48,10 @@ export async function runMigrationPart(
  * refuses to finish while any of them is still running.
  */
 export function defineContentMigration(
-  options: ContentMigrationOptions,
   run: (client: ContentMigrationClient) => Promise<void>,
 ): ContentMigration {
   return Object.assign((client: ContentMigrationClient) => run(client), {
     format: 'datocms-content-migration' as const,
     version: 1 as const,
-    options,
   });
 }

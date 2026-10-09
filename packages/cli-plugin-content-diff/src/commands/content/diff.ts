@@ -1,4 +1,4 @@
-import { lstat, stat } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
 import { camelCase } from 'lodash';
@@ -10,7 +10,9 @@ import {
 import {
   DEFAULT_MIGRATION_CHUNK_BYTES,
   MAX_MIGRATION_CHUNK_BYTES,
+  assertOutputAbsent,
 } from '../../engine/migration-artifact';
+import { KINDS } from '../../engine/types';
 import { withInterruptHandling } from '../../utils/interruption';
 import { PairedProfileCommand } from '../../utils/paired-profile-command';
 
@@ -150,15 +152,8 @@ export default class ContentDiffCommand extends PairedProfileCommand {
           requestedOutput,
           `${Math.floor(Date.now() / 1000)}_${migrationName}.ts`,
         );
-    try {
-      await lstat(outputPath);
-      throw new ContentError(
-        'MIGRATION_EXISTS',
-        `Migration output already exists: ${outputPath}`,
-      );
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
+    // Checked again when the files are written; this fails before reading.
+    await assertOutputAbsent(outputPath);
     const source = await this.endpoint(
       flags['source-profile'],
       flags['source-api-token'],
@@ -191,7 +186,7 @@ export default class ContentDiffCommand extends PairedProfileCommand {
     });
     if (!this.jsonEnabled()) {
       this.log(`TypeScript content migration: ${result.scriptPath}`);
-      for (const kind of ['record', 'upload', 'collection'] as const)
+      for (const kind of KINDS)
         this.log(
           `${kind}: ${Object.entries(result.counts[kind])
             .map(([action, count]) => `${count} ${action}`)

@@ -413,22 +413,13 @@ describe('expanded capture and native payload codec', () => {
     assert.deepEqual(canonicalFields(payload, MODEL, schema), record.current);
   });
 
-  it('rejects unexpanded or unidentified blocks', () => {
+  it('rejects blocks a read returned unexpanded', () => {
     const schema = state([
       model(MODEL, [field('blocks', 'rich_text')]),
       model(BLOCK, [], true),
     ]);
     assert.throws(
       () => canonicalFields({ blocks: [NESTED] }, MODEL, schema),
-      errorCode('INVALID_BLOCK'),
-    );
-    assert.throws(
-      () =>
-        canonicalFields(
-          { blocks: [{ id: NESTED, attributes: {} }] },
-          MODEL,
-          schema,
-        ),
       errorCode('INVALID_BLOCK'),
     );
   });
@@ -690,7 +681,6 @@ describe('expanded capture and native payload codec', () => {
       canonicalCollection({ ...input, position: -3 }),
       canonicalCollection({ ...input, position: 8 }),
     );
-    assert.throws(() => canonicalCollection(input), /position/);
     assert.equal(
       canonicalCollection({ ...input, position: 1.5 }).position,
       1.5,
@@ -1456,19 +1446,6 @@ describe('expanded capture and native payload codec', () => {
     }
   });
 
-  it('rejects unexpected IDs in focused reads', async () => {
-    const fixture = mockClient([model()], [rawRecord()]);
-    const schema = await fetchSchema(fixture.client, 'source');
-    const records = await readRecordBatch(fixture.client, [RECORD], schema);
-    assert.equal(records[0].id, RECORD);
-    assert.equal(fixture.calls.length, 2);
-    fixture.mock.items.rawList = async () => response([rawRecord(LINKED)]);
-    await assert.rejects(
-      readRecordBatch(fixture.client, [RECORD], schema),
-      errorCode('INVALID_RESPONSE'),
-    );
-  });
-
   it('checks consistency by version, rereading only records with a new version', async () => {
     for (const edit of ['none', 'version', 'content'] as const) {
       const records = Array.from({ length: 3 }, (_, index) =>
@@ -1587,7 +1564,7 @@ describe('expanded capture and native payload codec', () => {
     }
   });
 
-  it('captures exact private selective schedules and rejects incomplete or drifting state', async () => {
+  it('captures exact private selective schedules and rejects drifting state', async () => {
     const fixture = mockClient();
     const current = rawRecord();
     (current.meta as Record<string, unknown>).publication_scheduled_at = FUTURE;
@@ -1638,14 +1615,6 @@ describe('expanded capture and native payload codec', () => {
       },
       unpublishing: { at: '2090-02-01T12:30:00.000Z', locales: ['it'] },
     });
-    Reflect.set(fixture.mock.items, 'rawCurrentVsPublishedState', async () => ({
-      ...body,
-      included: [],
-    }));
-    await assert.rejects(
-      readSchedules(fixture.client, current),
-      errorCode('INVALID_RESPONSE'),
-    );
     Reflect.set(fixture.mock.items, 'rawCurrentVsPublishedState', async () => ({
       ...body,
       included: [

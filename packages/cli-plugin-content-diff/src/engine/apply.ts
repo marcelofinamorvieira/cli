@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
-import { basename, dirname, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { assertNotAborted } from './cancellation';
 import { captureSnapshot } from './capture';
+import { companionDirectory } from './companion';
 import { ContentError, contentErrorReport, destinationChanged } from './errors';
-import { observeUnhandledRejections, runTrackedMigration } from './execution';
+import { runTrackedMigration } from './execution';
 import {
   type BaselineManifest,
   compareBaseline,
@@ -18,9 +19,7 @@ import { fetchSchema } from './schema';
 import { SnapshotStore } from './store';
 import type { ApplyOptions, ApplyOutcome, Client, SchemaState } from './types';
 
-type Definition = ((client: Client) => Promise<void>) & {
-  options: { baseline: string };
-};
+type Definition = (client: Client) => Promise<void>;
 interface Arguments {
   rootClient: Client;
   buildEnvironmentClient: (
@@ -228,58 +227,56 @@ async function assertBaseline(
   compareBaseline(store, 'target');
 }
 
-/** The real path, or the path itself when it does not exist (yet). */
-const canonical = (path: string) => realpath(path).catch(() => path);
-
 /**
- * Load the script and apply it. Its baseline must be its generated sibling
+ * Load the script and apply it with the baseline in its sibling `.content`
  * companion. --preflight-only checks the file without evaluating it.
  */
 export async function applyContentMigration(
   args: Arguments,
 ): Promise<ApplyOutcome> {
-  // Node runs a module under its real path, so a generated script's
-  // `__dirname` has every symlink resolved: its companion and the baseline it
-  // references are found from the canonical script path.
-  if (args.options.preflightOnly) {
+  let definition: Definition | undefined;
+  if (args.options.preflightOnly)
     assertMigrationFile(args.scriptPath, args.options.signal);
-    return applyMigration({
-      ...args,
-      scriptPath: await realpath(resolve(args.scriptPath)),
-    });
-  }
-  const definition = await loadContentMigration(
-    args.scriptPath,
-    args.options.signal,
-  );
-  const script = await realpath(resolve(args.scriptPath));
-  const companion = await canonical(
-    resolve(dirname(script), `${basename(script, '.ts')}.content`),
-  );
-  if (
-    (await canonical(resolve(dirname(script), definition.options.baseline))) !==
-    companion
-  )
-    throw new ContentError(
-      'MIGRATION_BASELINE_MISMATCH',
-      'The migration must reference its generated sibling .content companion directory.',
+  else
+    definition = await loadContentMigration(
+      args.scriptPath,
+      args.options.signal,
     );
-  return applyMigration({ ...args, scriptPath: script, definition });
+  // Node runs a module under its real path, so a generated script's
+  // `__dirname`, which its parts are found from, has every symlink resolved;
+  // its companion is found beside the same path.
+  const scriptPath = await realpath(resolve(args.scriptPath));
+  return applyMigration({ ...args, scriptPath, definition });
 }
 
 /**
- * Append to a failure message without assuming the error is writable. Returns
- * whether the message says it.
+ * The failure to report when removing the fork failed too. Its message says
+ * the fork was not removed; the original failure stays machine-readable
+ * under `cause`, with its exit status.
  */
-function explain(error: unknown, sentence: string): boolean {
-  if (!(error instanceof Error)) return false;
-  try {
-    error.message = `${error.message} ${sentence}`;
-    return true;
-  } catch {
-    // A frozen error keeps its original message.
-    return false;
-  }
+function cleanupIncomplete(
+  error: unknown,
+  forkId: string,
+  cleanup: unknown,
+): ContentError {
+  const original =
+    error instanceof Error ? contentErrorReport(error) : undefined;
+  const exit = error as { exitCode?: number; oclif?: { exit?: number } };
+  return Object.assign(
+    new ContentError(
+      'APPLY_FAILED_CLEANUP_INCOMPLETE',
+      `${
+        error instanceof Error ? error.message : String(error)
+      } The failed fork "${forkId}" could not be removed: ${String(cleanup)}`,
+      {
+        forkId,
+        ...(original && {
+          cause: { code: original.code, details: original.details },
+        }),
+      },
+    ),
+    { exitCode: exit?.exitCode, oclif: exit?.oclif },
+  );
 }
 
 /**
@@ -295,19 +292,13 @@ export async function applyMigration(
   let forkId: string | undefined;
   let forkRequested = false;
   let forkAppeared = false;
-  let forkStated = false;
   let scriptStarted = false;
   let destinationId: string | undefined;
-  let floating: { dispose(): void } | undefined;
   try {
     assertNotAborted(options.signal);
     options.log?.('Validating migration baseline.');
     const baseline = await loadBaseline(
-      resolve(
-        dirname(resolve(args.scriptPath)),
-        definition?.options.baseline ??
-          `${basename(args.scriptPath, '.ts')}.content`,
-      ),
+      companionDirectory(args.scriptPath),
       store,
       options.signal,
     );
@@ -390,16 +381,10 @@ export async function applyMigration(
         // the retry of a request that did create the fork. An environment
         // under the ID may still belong to someone else: report it, never
         // remove it.
-        if (
-          !forkRequested &&
-          (await environmentExists(args.rootClient, forkId).catch(() => false))
-        ) {
-          forkAppeared = true;
-          forkStated = explain(
-            failure,
-            `The fork "${forkId}" was kept: an environment with that ID exists after the fork request failed and may have been created by a retried request of this run.`,
+        if (!forkRequested)
+          forkAppeared = await environmentExists(args.rootClient, forkId).catch(
+            () => false,
           );
-        }
         throw failure;
       }
       forkRequested = true;
@@ -419,9 +404,6 @@ export async function applyMigration(
       `Executing TypeScript against the CMA in "${environmentId}".`,
     );
     scriptStarted = true;
-    // Covers the fork cleanup too: a call the script never awaited may still
-    // be rejected while the fork is removed.
-    floating = observeUnhandledRejections();
     await runTrackedMigration(
       definition,
       (fetchFn) => args.buildEnvironmentClient(environmentId, fetchFn),
@@ -444,49 +426,33 @@ export async function applyMigration(
         }
       } catch (cleanup) {
         kept = true;
-        forkStated = true;
-        const exit = error as { exitCode?: number; oclif?: { exit?: number } };
-        // The original failure stays machine-readable under `cause`.
-        const original =
-          error instanceof Error ? contentErrorReport(error) : undefined;
-        failure = Object.assign(
-          new ContentError(
-            'APPLY_FAILED_CLEANUP_INCOMPLETE',
-            `${
-              error instanceof Error ? error.message : String(error)
-            } The failed fork "${forkId}" could not be removed: ${String(
-              cleanup,
-            )}`,
-            {
-              forkId,
-              ...(original && {
-                cause: { code: original.code, details: original.details },
-              }),
-            },
-          ),
-          { exitCode: exit?.exitCode, oclif: exit?.oclif },
-        );
+        failure = cleanupIncomplete(error, forkId, cleanup);
       }
     }
-    if (scriptStarted && failure === error) {
-      const stated = explain(
-        failure,
-        !forkId
-          ? `Writes made before the failure remain in "${destinationId}".`
-          : kept
-            ? `The fork "${forkId}" was kept; "${destinationId}" was not changed.`
-            : `The fork "${forkId}" was deleted; "${destinationId}" was not changed.`,
-      );
-      if (forkId) forkStated = stated;
-    }
-    if (kept && failure instanceof Error)
+    // What the failure left behind, said once. A failed cleanup says it in
+    // its own message.
+    const outcome = (): string | undefined => {
+      if (failure !== error) return undefined;
+      if (forkAppeared)
+        return `The fork "${forkId}" was kept: an environment with that ID exists after the fork request failed and may have been created by a retried request of this run.`;
+      if (kept)
+        return scriptStarted
+          ? `The fork "${forkId}" was kept; "${destinationId}" was not changed.`
+          : `The fork "${forkId}" was kept.`;
+      if (!scriptStarted) return undefined;
+      return forkId
+        ? `The fork "${forkId}" was deleted; "${destinationId}" was not changed.`
+        : `Writes made before the failure remain in "${destinationId}".`;
+    };
+    const said = outcome();
+    // A frozen failure is reported as it is.
+    if (failure instanceof Error && Object.isExtensible(failure))
       Object.assign(failure, {
-        keptForkEnvironmentId: forkId,
-        ...(forkStated && { forkOutcomeStated: true }),
+        ...(kept && { keptForkEnvironmentId: forkId }),
+        ...(said && { outcome: said }),
       });
     throw failure;
   } finally {
-    floating?.dispose();
     store.dispose();
   }
 }

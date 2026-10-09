@@ -1,12 +1,5 @@
 import type { CmaClient } from '@datocms/cli-utils';
-import {
-  hashJson,
-  json,
-  jsonObject,
-  object,
-  referenceId,
-  string,
-} from './codec';
+import { hashJson, json, jsonObject, object, referenceId } from './codec';
 import { compareIds } from './compare-ids';
 import { ContentError } from './errors';
 import type { Client, JsonObject, ModelSchema, SchemaState } from './types';
@@ -50,43 +43,14 @@ export async function fetchSchema(
   const fields = included.filter(
     (entry): entry is CmaClient.RawApiTypes.Field => entry.type === 'field',
   );
-  const modelIds = new Set(models.map((model) => model.id));
-  const fieldIds = new Set(fields.map((field) => field.id));
-  const expectedModels = response.data.relationships.item_types.data;
-  const invalid = (message: string): never => {
-    throw new ContentError('INVALID_SCHEMA', message);
-  };
-  if (modelIds.size !== models.length || fieldIds.size !== fields.length)
-    invalid('Bulk schema contains duplicate model or field identities.');
-  if (
-    expectedModels.length !== models.length ||
-    expectedModels.some((model) => !modelIds.has(model.id)) ||
-    new Set(expectedModels.map((model) => model.id)).size !==
-      expectedModels.length
-  )
-    invalid('Bulk schema does not include every declared model.');
   const fieldsByModel = new Map<string, CmaClient.RawApiTypes.Field[]>();
   for (const field of fields) {
     const owner = field.relationships.item_type.data.id;
-    if (!modelIds.has(owner))
-      invalid(`Bulk schema field ${field.id} has an unknown model.`);
-    const group = fieldsByModel.get(owner) ?? [];
-    group.push(field);
-    fieldsByModel.set(owner, group);
+    fieldsByModel.set(owner, [...(fieldsByModel.get(owner) ?? []), field]);
   }
   const normalized: ModelSchema[] = models.map((resource) => {
     const model = resource.attributes;
     const fields = fieldsByModel.get(resource.id) ?? [];
-    const expected = resource.relationships.fields.data;
-    const actual = new Set(fields.map((field) => field.id));
-    if (
-      expected.length !== fields.length ||
-      expected.some((field) => !actual.has(field.id)) ||
-      new Set(expected.map((field) => field.id)).size !== expected.length
-    )
-      invalid(
-        `Bulk schema does not include every declared field of model ${resource.id}.`,
-      );
     return {
       id: resource.id,
       apiKey: model.api_key,
@@ -107,7 +71,7 @@ export async function fetchSchema(
             apiKey: field.api_key,
             type: field.field_type,
             localized: field.localized,
-            validators: jsonObject(field.validators),
+            validators: json(field.validators) as JsonObject,
             defaultValue:
               field.default_value === undefined
                 ? null
@@ -118,7 +82,7 @@ export async function fetchSchema(
     };
   });
   const semantics: JsonObject = {
-    timezone: string(site.timezone, 'site timezone'),
+    timezone: site.timezone,
   };
   const meta: unknown = site.meta;
   // Like the SDK's environment flag helpers, anything short of an explicit

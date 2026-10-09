@@ -10,7 +10,7 @@ const script = `
 import type { CmaClient } from '@datocms/cli-utils';
 import { defineContentMigration, reorderRecords, runMigrationPart, type ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
 declare const actualClient: CmaClient.Client;
-const migration = defineContentMigration({ baseline: './fixture.content' }, async client => {
+const migration = defineContentMigration(async client => {
   const created = await client.items.create({ item_type: { id: 'model', type: 'item_type' }, title: 'Live' });
   const version: string = created.meta.current_version;
   const nested = await client.items.find(created.id, { nested: true });
@@ -28,7 +28,7 @@ const migration = defineContentMigration({ baseline: './fixture.content' }, asyn
   await reorderRecords(client, { model: 'model', parent: null, order: [1] });
   for await (const record of client.items.listPagedIterator({ filter: { type: 'model' } })) record.id;
   const environment: string | undefined = client.config.environment;
-  await runMigrationPart(client, './part.ts');
+  await runMigrationPart(client, __filename, '000001.ts');
   // @ts-expect-error Real SDK signatures reject malformed options.
   client.items.destroy(123);
 });

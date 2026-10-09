@@ -25,12 +25,14 @@ describe('content error reporting contract', () => {
       details: { step: 'records' },
       suggestions: ['Retry', 3],
       keptForkEnvironmentId: 'review-kept',
+      outcome: 'The fork "review-kept" was kept.',
       parse: { input: { argv: ['--api-token=flag-token'] } },
       request: { headers: { Authorization: 'Bearer header-token' } },
     });
+    // The JSON message also says what the failure left behind.
     assert.deepEqual(contentErrorReport(failure), {
       name: 'Error',
-      message: 'Request failed',
+      message: 'Request failed The fork "review-kept" was kept.',
       code: 'APPLY_FAILED',
       details: { step: 'records' },
       suggestions: ['Retry'],
@@ -142,13 +144,18 @@ describe('content error reporting contract', () => {
             },
           );
         }
-        // A kept fork is named after the native message.
+        // What the failure left behind follows the native message.
         const human = Object.assign(
           Object.create(ContentApplyCommand.prototype),
           { jsonEnabled: () => false },
         );
         await assert.rejects(
-          human.catch(failure({ keptForkEnvironmentId: 'review' })),
+          human.catch(
+            failure({
+              keptForkEnvironmentId: 'review',
+              outcome: 'The fork "review" was kept.',
+            }),
+          ),
           (error: Error & NativeError) => {
             const [first, ...rest] = error.message.split('\n');
             assert.match(first!, message);
@@ -162,6 +169,33 @@ describe('content error reporting contract', () => {
         Object.assign(console, { log, dir });
       }
     }
+  });
+
+  it('prints the failure details before the message and what the failure left behind', async () => {
+    const human = Object.assign(Object.create(ContentApplyCommand.prototype), {
+      jsonEnabled: () => false,
+    });
+    const failure = Object.assign(new Error('Script failed'), {
+      outcome: 'The fork "review" was deleted; "main" was not changed.',
+    });
+    const dumped: unknown[] = [];
+    const { log, dir } = console;
+    console.log = () => undefined;
+    console.dir = (value: unknown) => dumped.push(value);
+    try {
+      await assert.rejects(human.catch(failure), (error: Error) => {
+        assert.equal(
+          error.message,
+          'Script failed\nThe fork "review" was deleted; "main" was not changed.',
+        );
+        return true;
+      });
+    } finally {
+      Object.assign(console, { log, dir });
+    }
+    // The stack of the failing line stays visible for debugging edited scripts.
+    assert.equal(dumped.length, 1);
+    assert.equal((dumped[0] as { stack?: string }).stack, failure.stack);
   });
 
   it('prints the destination-changed message, its first difference and a kept fork', async () => {
@@ -181,10 +215,13 @@ describe('content error reporting contract', () => {
       );
       return true;
     });
-    // A fork kept by a failure before the script started is named once.
+    // The first difference comes before what the failure left behind.
     const kept = Object.assign(
       destinationChanged({ kind: 'upload', id: 'u1', reason: 'added' }),
-      { keptForkEnvironmentId: 'review' },
+      {
+        keptForkEnvironmentId: 'review',
+        outcome: 'The fork "review" was kept.',
+      },
     );
     await assert.rejects(human.catch(kept), (error: Error) => {
       assert.equal(
@@ -195,7 +232,11 @@ describe('content error reporting contract', () => {
     });
     const interrupted = Object.assign(
       new ContentError('INTERRUPTED', 'Content operation was interrupted.'),
-      { keptForkEnvironmentId: 'review', exitCode: 130 },
+      {
+        keptForkEnvironmentId: 'review',
+        outcome: 'The fork "review" was kept.',
+        exitCode: 130,
+      },
     );
     await assert.rejects(
       human.catch(interrupted),
@@ -208,10 +249,12 @@ describe('content error reporting contract', () => {
         return true;
       },
     );
-    // Naming the fork is not the same as saying it was kept.
     const failedFork = Object.assign(
       new ContentError('FORK_FAILED', 'Fork "review" ended in status failed.'),
-      { keptForkEnvironmentId: 'review' },
+      {
+        keptForkEnvironmentId: 'review',
+        outcome: 'The fork "review" was kept.',
+      },
     );
     await assert.rejects(human.catch(failedFork), (error: Error) => {
       assert.equal(
@@ -229,7 +272,7 @@ describe('content error reporting contract', () => {
           cause: { code: 'DESTINATION_CHANGED', details: { reason: 'schema' } },
         },
       ),
-      { keptForkEnvironmentId: 'review', forkOutcomeStated: true },
+      { keptForkEnvironmentId: 'review' },
     );
     await assert.rejects(human.catch(cleanup), (error: Error) => {
       assert.equal(

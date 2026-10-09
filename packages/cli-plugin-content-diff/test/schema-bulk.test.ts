@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'mocha';
-import { ContentError } from '../src/engine/errors';
 import { fetchSchema } from '../src/engine/schema';
 import type { Client } from '../src/engine/types';
 
@@ -108,47 +107,6 @@ describe('fresh bulk schema hydration', () => {
     assert.notEqual(first.hash, second.hash);
     assert.deepEqual(first.models[0].fields[0].defaultValue, { en: 'Before' });
     assert.deepEqual(second.models[0].fields[0].defaultValue, { en: 'After' });
-  });
-
-  it('rejects incomplete, duplicate, and wrongly owned included resources', async () => {
-    for (const mutate of [
-      (r: ReturnType<typeof bulk>) => {
-        r.included = r.included.filter((v) => v.id !== 'field-0');
-      },
-      (r: ReturnType<typeof bulk>) => {
-        r.included = r.included.filter((v) => v.id !== 'model-0');
-      },
-      (r: ReturnType<typeof bulk>) => {
-        r.included.push(r.included[0]);
-      },
-      (r: ReturnType<typeof bulk>) => {
-        const field = r.included.find((v) => v.id === 'field-0')!;
-        Object.assign(field.relationships, {
-          item_type: { data: { id: 'unknown', type: 'item_type' } },
-        });
-      },
-      (r: ReturnType<typeof bulk>) => {
-        r.data.relationships.item_types.data[1] =
-          r.data.relationships.item_types.data[0];
-      },
-      (r: ReturnType<typeof bulk>) => {
-        Object.assign(r.included[0].relationships, {
-          fields: { data: [{ id: 'field-1', type: 'field' }] },
-        });
-      },
-    ]) {
-      const response = bulk();
-      mutate(response);
-      const client = {
-        site: { rawFind: async () => response },
-        workflows: { list: async () => [] },
-      } as unknown as Client;
-      await assert.rejects(
-        fetchSchema(client, 'sandbox'),
-        (error) =>
-          error instanceof ContentError && error.code === 'INVALID_SCHEMA',
-      );
-    }
   });
 
   it('reads an environment flag the API does not report as off', async () => {

@@ -44,7 +44,7 @@ async function fixture(before: CollectionState[], after: CollectionState[]) {
   for (const state of before) store.putCollection('target', state);
   for (const state of after) store.putCollection('source', state);
   try {
-    const metadata = await createPlan(
+    const metadata = createPlan(
       store,
       { ...schema, environmentId: 'source' },
       schema,

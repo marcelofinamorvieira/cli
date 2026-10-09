@@ -8,12 +8,9 @@ import {
   canonicalRecord,
   canonicalUpload,
   listingFingerprint,
-  object,
   recordGuard,
-  recordModelId,
   stableStringify,
   stateFingerprint,
-  string,
   timestamp,
 } from './codec';
 import { compareIds } from './compare-ids';
@@ -23,6 +20,7 @@ import { SnapshotStore } from './store';
 import type {
   CaptureOptions,
   Client,
+  JsonObject,
   ModelSchema,
   RecordState,
   Schedules,
@@ -42,6 +40,13 @@ function readsBlocks(model: ModelSchema): boolean {
   );
 }
 type RecordPage = Awaited<ReturnType<Client['items']['rawList']>>;
+/** The parts of a listed record resource capture reads directly. */
+type NativeRow = {
+  id: string;
+  meta: { published_at?: string | null };
+  relationships: unknown;
+  attributes: { parent_id?: unknown; position?: unknown };
+};
 
 function readNativeRecordPage(
   client: Client,
@@ -59,18 +64,8 @@ function readNativeRecordPage(
 }
 
 function pageBody(body: unknown): { data: unknown[]; total: number } {
-  if (
-    !object(body) ||
-    !Array.isArray(body.data) ||
-    !object(body.meta) ||
-    !Number.isSafeInteger(body.meta.total_count) ||
-    Number(body.meta.total_count) < 0
-  )
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'A paginated CMA response has no authoritative total count.',
-    );
-  return { data: body.data, total: Number(body.meta.total_count) };
+  const page = body as { data: unknown[]; meta: { total_count: number } };
+  return { data: page.data, total: page.meta.total_count };
 }
 
 async function pages(
@@ -109,135 +104,90 @@ async function pages(
   return total;
 }
 
-function locales(value: unknown): string[] {
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string'))
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Exact schedule locales are unavailable.',
-    );
-  return [...value].sort();
+type ScheduleBody = {
+  data: { relationships: Record<string, { data: { id: string } | null }> };
+  included?: Array<{ id: string; type: string; attributes: JsonObject }>;
+};
+
+/** The attributes of a record's scheduled publication or unpublishing. */
+function scheduleResource(
+  body: ScheduleBody,
+  key: 'scheduled_publication' | 'scheduled_unpublishing',
+): JsonObject | null {
+  const id = body.data.relationships[key]?.data?.id;
+  if (!id) return null;
+  return (
+    body.included?.find((entry) => entry.id === id && entry.type === key)
+      ?.attributes ?? null
+  );
 }
 
-function scheduleResource(
-  body: Record<string, unknown>,
-  key: string,
-): Record<string, unknown> | null {
-  if (
-    !object(body.data) ||
-    !object(body.data.relationships) ||
-    !Array.isArray(body.included)
-  )
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Exact schedule relationships are unavailable.',
-    );
-  const relation = body.data.relationships[key];
-  if (!object(relation) || !Object.hasOwn(relation, 'data'))
-    throw new ContentError('INVALID_RESPONSE', `Missing ${key} relationship.`);
-  if (relation.data === null) return null;
-  if (
-    !object(relation.data) ||
-    relation.data.type !== key ||
-    typeof relation.data.id !== 'string'
-  )
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      `Malformed ${key} relationship.`,
-    );
-  const id = relation.data.id;
-  const included = body.included.find(
-    (entry) => object(entry) && entry.id === id && entry.type === key,
-  );
-  if (!object(included) || !object(included.attributes))
-    throw new ContentError('INVALID_RESPONSE', `Incomplete ${key} details.`);
-  return included.attributes;
-}
+const sortedLocales = (value: unknown) => [...(value as string[])].sort();
 
 export async function readSchedules(
   client: Client,
   current: unknown,
 ): Promise<Schedules> {
-  if (!object(current) || !object(current.meta))
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Record schedule metadata is unavailable.',
-    );
-  const pubAt = current.meta.publication_scheduled_at;
-  const unpubAt = current.meta.unpublishing_scheduled_at;
+  const record = current as {
+    id: string;
+    meta: Record<string, string | null | undefined>;
+  };
+  const pubAt = record.meta.publication_scheduled_at;
+  const unpubAt = record.meta.unpublishing_scheduled_at;
   if (!pubAt && !unpubAt) return { publication: null, unpublishing: null };
-  const id = string(current.id, 'record ID');
-  let raw: unknown;
+  let body: ScheduleBody;
   try {
-    raw = await client.items.rawCurrentVsPublishedState(id);
+    body = (await client.items.rawCurrentVsPublishedState(
+      record.id,
+    )) as unknown as ScheduleBody;
   } catch (error) {
     // The record was listed a moment ago, so it was deleted meanwhile.
     if (error instanceof CmaClient.ApiError && error.response.status === 404)
       throw new ContentError(
         'CAPTURE_DRIFT',
-        `Record ${id} was deleted during capture.`,
+        `Record ${record.id} was deleted during capture.`,
       );
     throw error;
   }
-  if (!object(raw))
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Exact schedule state is unavailable.',
-    );
-  const publication = scheduleResource(raw, 'scheduled_publication');
-  const unpublishing = scheduleResource(raw, 'scheduled_unpublishing');
-  if (
-    Boolean(pubAt) !== Boolean(publication) ||
-    Boolean(unpubAt) !== Boolean(unpublishing)
-  )
-    throw new ContentError(
-      'CAPTURE_DRIFT',
-      'A record schedule changed during capture.',
-    );
-  let selective: { locales: string[]; nonLocalized: boolean } | null = null;
-  if (publication && publication.selective_publication !== null) {
-    const scope = publication.selective_publication;
-    if (!object(scope) || typeof scope.non_localized_content !== 'boolean')
-      throw new ContentError(
-        'INVALID_RESPONSE',
-        'Exact publication scope is unavailable.',
-      );
-    selective = {
-      locales: locales(scope.content_in_locales),
-      nonLocalized: scope.non_localized_content,
-    };
-  }
+  const publication = scheduleResource(body, 'scheduled_publication');
+  const unpublishing = scheduleResource(body, 'scheduled_unpublishing');
+  const selective = publication?.selective_publication as {
+    content_in_locales: string[];
+    non_localized_content: boolean;
+  } | null;
   const schedules: Schedules = {
     publication: publication
       ? {
-          at: timestamp(
-            publication.publication_scheduled_at,
-            'publication schedule',
-          ),
-          selective,
+          at: timestamp(publication.publication_scheduled_at as string),
+          selective: selective
+            ? {
+                locales: sortedLocales(selective.content_in_locales),
+                nonLocalized: selective.non_localized_content,
+              }
+            : null,
         }
       : null,
     unpublishing: unpublishing
       ? {
-          at: timestamp(
-            unpublishing.unpublishing_scheduled_at,
-            'unpublishing schedule',
-          ),
+          at: timestamp(unpublishing.unpublishing_scheduled_at as string),
           locales:
             unpublishing.content_in_locales === null
               ? null
-              : locales(unpublishing.content_in_locales),
+              : sortedLocales(unpublishing.content_in_locales),
         }
       : null,
   };
+  // The listing and this read are two requests: a schedule that changed
+  // between them makes the marker and the details disagree.
   if (
-    (schedules.publication &&
-      schedules.publication.at !== timestamp(pubAt, 'publication marker')) ||
-    (schedules.unpublishing &&
-      schedules.unpublishing.at !== timestamp(unpubAt, 'unpublishing marker'))
+    Boolean(pubAt) !== Boolean(schedules.publication) ||
+    Boolean(unpubAt) !== Boolean(schedules.unpublishing) ||
+    (pubAt && schedules.publication?.at !== timestamp(pubAt)) ||
+    (unpubAt && schedules.unpublishing?.at !== timestamp(unpubAt))
   )
     throw new ContentError(
       'CAPTURE_DRIFT',
-      'Schedule markers and details disagree.',
+      'A record schedule changed during capture.',
     );
   return schedules;
 }
@@ -263,49 +213,22 @@ export async function readRecordBatch(
       page: { limit: 30 },
     }),
   ]);
-  const current = pageBody(currentBody);
-  const published = pageBody(publishedBody);
-  if (
-    current.total !== current.data.length ||
-    published.total !== published.data.length
-  )
-    throw new ContentError('INVALID_RESPONSE', 'An ID batch was truncated.');
-  const wanted = new Set(ids);
-  const byId = new Map<string, unknown>();
-  for (const resource of published.data) {
-    if (!object(resource))
-      throw new ContentError(
-        'INVALID_RESPONSE',
-        'Published record is malformed.',
-      );
-    const id = string(resource.id, 'record ID');
-    if (!wanted.has(id) || byId.has(id))
-      throw new ContentError(
-        'INVALID_RESPONSE',
-        'An ID batch contains an unexpected or duplicate record.',
-      );
-    byId.set(id, resource);
-  }
+  type Resource = { id: string; meta: { published_at?: string | null } };
+  const current = pageBody(currentBody).data as Resource[];
+  const byId = new Map(
+    (pageBody(publishedBody).data as Resource[]).map((resource) => [
+      resource.id,
+      resource,
+    ]),
+  );
   const result: RecordState[] = [];
   const seen = new Set<string>();
-  await boundedWork(current.data, 4, async (resource) => {
-    if (!object(resource))
-      throw new ContentError(
-        'INVALID_RESPONSE',
-        'Current record is malformed.',
-      );
-    const id = string(resource.id, 'record ID');
-    if (!wanted.has(id) || seen.has(id))
-      throw new ContentError(
-        'INVALID_RESPONSE',
-        'An ID batch contains an unexpected or duplicate record.',
-      );
+  await boundedWork(current, 4, async (resource) => {
+    const { id } = resource;
     seen.add(id);
     const pub = byId.get(id) ?? null;
-    if (
-      object(resource.meta) &&
-      Boolean(resource.meta.published_at) !== Boolean(pub)
-    )
+    // The current and published versions are two requests.
+    if (Boolean(resource.meta.published_at) !== Boolean(pub))
       throw new ContentError(
         'CAPTURE_DRIFT',
         `Publication state changed while reading record ${id}.`,
@@ -398,16 +321,8 @@ async function captureAssets(input: {
       'The collection changed while it was being paginated.',
     );
   assertNotAborted(signal);
-  for (const raw of await client.uploadCollections.list()) {
-    assertNotAborted(signal);
-    const collection = canonicalCollection(raw);
-    if (store.getCollection(side, collection.id))
-      throw new ContentError(
-        'CAPTURE_DRIFT',
-        `Duplicate collection ${collection.id}.`,
-      );
-    store.putCollection(side, collection);
-  }
+  for (const raw of await client.uploadCollections.list())
+    store.putCollection(side, canonicalCollection(raw));
   assertNotAborted(signal);
 }
 
@@ -446,17 +361,9 @@ async function scanFingerprints(input: {
         options.concurrency,
         (rows) => {
           store.transaction(() => {
-            for (const row of rows) {
+            for (const raw of rows) {
               assertNotAborted(signal);
-              if (
-                !object(row) ||
-                !object(row.attributes) ||
-                recordModelId(row) !== model.id
-              )
-                throw new ContentError(
-                  'INVALID_RESPONSE',
-                  'A model listing contains a foreign record.',
-                );
+              const row = raw as NativeRow;
               // Only what the fingerprint needs is kept, not the content.
               const kept = {
                 id: row.id,
@@ -467,13 +374,9 @@ async function scanFingerprints(input: {
                   position: row.attributes.position,
                 },
               };
+              // A record listed twice moved between pages meanwhile.
               if (
-                !insert.run(
-                  scan,
-                  version,
-                  string(row.id, 'record ID'),
-                  JSON.stringify(kept),
-                ).changes
+                !insert.run(scan, version, row.id, JSON.stringify(kept)).changes
               )
                 throw new ContentError(
                   'CAPTURE_DRIFT',
@@ -641,23 +544,14 @@ async function captureOnce(input: CaptureInput): Promise<void> {
             store.transaction(() => {
               for (const row of rows) {
                 assertNotAborted(signal);
-                if (!object(row))
-                  throw new ContentError(
-                    'INVALID_RESPONSE',
-                    'Record is malformed.',
-                  );
                 // Records are canonicalized once, below, with both versions.
-                if (recordModelId(row) !== model.id)
-                  throw new ContentError(
-                    'INVALID_RESPONSE',
-                    'A model page contains a foreign record.',
-                  );
-                // Only a repeated identity is ignored. Other SQLite or I/O
-                // failures, such as a full temporary disk, keep their error.
+                // A record listed twice moved between pages meanwhile; other
+                // SQLite or I/O failures, such as a full temporary disk, keep
+                // their error.
                 const inserted = insert.run(
                   side,
                   version,
-                  string(row.id, 'record ID'),
+                  (row as NativeRow).id,
                   JSON.stringify(row),
                 );
                 if (!inserted.changes)
@@ -716,14 +610,11 @@ async function captureOnce(input: CaptureInput): Promise<void> {
       assertNotAborted(signal);
       const states: RecordState[] = [];
       for (const row of batch) {
-        const current: unknown = JSON.parse(String(row.data));
+        const current: NativeRow = JSON.parse(String(row.data));
         const pubRow = published.get(side, String(row.id));
         const pub: unknown = pubRow ? JSON.parse(String(pubRow.data)) : null;
-        if (
-          !object(current) ||
-          !object(current.meta) ||
-          Boolean(current.meta.published_at) !== Boolean(pub)
-        )
+        // The current and published versions are separate listings.
+        if (Boolean(current.meta.published_at) !== Boolean(pub))
           throw new ContentError(
             'CAPTURE_DRIFT',
             `Publication state changed for record ${row.id}.`,

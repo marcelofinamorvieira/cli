@@ -17,19 +17,21 @@ import { setImmediate } from 'node:timers/promises';
 import { format, resolveConfig } from 'prettier';
 import { assertNotAborted } from './cancellation';
 import { hashJson, object, recordGuard } from './codec';
+import { companionDirectory } from './companion';
 import { ContentError, destinationChanged } from './errors';
 import { emitMigrationCalls } from './migration-emit';
 import type { MigrationTrackingBinding } from './migration-schema';
 import type { SnapshotStore } from './store';
-import type {
-  ArtifactChunk,
-  ArtifactChunkIndex,
-  JsonObject,
-  Kind,
-  PlanMetadata,
-  RecordGuard,
-  RecordState,
-  Side,
+import {
+  type ArtifactChunk,
+  type ArtifactChunkIndex,
+  type JsonObject,
+  KINDS,
+  type Kind,
+  type PlanMetadata,
+  type RecordGuard,
+  type RecordState,
+  type Side,
 } from './types';
 
 /** The size cap of every companion file read when applying. */
@@ -40,7 +42,6 @@ export const DEFAULT_MIGRATION_CHUNK_BYTES = 1024 * 1024;
 
 const FORMAT = 'datocms-content-migration-baseline/1';
 const MAX_METADATA = MAX_MIGRATION_FILE_BYTES;
-const kinds = ['record', 'upload', 'collection'] as const;
 const sha256 = (data: string | Buffer) =>
   createHash('sha256').update(data).digest('hex');
 
@@ -123,7 +124,8 @@ const exists = (path: string) =>
     'MIGRATION_EXISTS',
     `Migration output already exists: ${path}`,
   );
-async function absent(path: string): Promise<void> {
+/** Refuses a path that already exists, so output is never overwritten. */
+export async function assertOutputAbsent(path: string): Promise<void> {
   try {
     await lstat(path);
   } catch (error) {
@@ -307,9 +309,7 @@ ${statements.map((statement) => statement.code).join('')}
     );
     const body = parts.length
       ? `  for (const part of ${JSON.stringify(parts)})
-    await runMigrationPart(client, join(__dirname, ${JSON.stringify(
-      this.companionName,
-    )}, 'parts', part));
+    await runMigrationPart(client, __filename, part);
 `
       : this.statements.map((statement) => statement.code).join('');
     const runtime = ['defineContentMigration'];
@@ -317,11 +317,9 @@ ${statements.map((statement) => statement.code).join('')}
     else
       for (const statement of this.statements)
         runtime.push(...statement.runtime);
-    return `import { join } from 'node:path';
-${runtimeImport(runtime)}
+    return `${runtimeImport(runtime)}
 
 export default defineContentMigration(
-  { baseline: join(__dirname, ${JSON.stringify(this.companionName)}) },
   async (client: ContentMigrationClient): Promise<void> => {
 ${body || '    // No content changes.\n'}  },
 );
@@ -346,11 +344,11 @@ export async function writeMigration(args: {
   assertNotAborted(signal);
   const maximum = args.chunkBytes ?? DEFAULT_MIGRATION_CHUNK_BYTES;
   const output = resolve(args.outputPath);
-  const companionName = `${basename(output, '.ts')}.content`;
-  const companion = join(dirname(output), companionName);
+  const companion = companionDirectory(output);
+  const companionName = basename(companion);
   await mkdir(dirname(output), { recursive: true });
-  await absent(output);
-  await absent(companion);
+  await assertOutputAbsent(output);
+  await assertOutputAbsent(companion);
   assertNotAborted(signal);
   const temporary = await mkdtemp(join(dirname(output), '.content-migration-'));
   const staging = join(temporary, companionName);
@@ -360,7 +358,7 @@ export async function writeMigration(args: {
   let complete = false;
   try {
     await writer.begin();
-    for (const kind of kinds) {
+    for (const kind of KINDS) {
       const states =
         kind === 'record'
           ? store.records('target')
@@ -412,7 +410,7 @@ export async function writeMigration(args: {
       flag: 'wx',
       signal,
     });
-    await absent(output);
+    await assertOutputAbsent(output);
     // Creating the directory claims the companion name exclusively; the staged
     // files then move into it under names nothing else can hold, which needs
     // no directory replacement and works the same on every platform.
@@ -475,7 +473,7 @@ function validateManifest(value: unknown): asserts value is BaselineManifest {
     invalid('Invalid baseline schema.');
   if (
     !object(value.counts) ||
-    kinds.some(
+    KINDS.some(
       (kind) =>
         !object((value.counts as JsonObject)[kind]) ||
         ['create', 'update', 'delete', 'noop', 'skip'].some(
@@ -498,7 +496,7 @@ function validateManifest(value: unknown): asserts value is BaselineManifest {
 function validateRow(value: unknown): asserts value is BaselineRow {
   if (
     !object(value) ||
-    !kinds.includes(value.kind as Kind) ||
+    !KINDS.includes(value.kind as Kind) ||
     !text(value.id) ||
     !object(value.guard)
   )

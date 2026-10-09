@@ -132,7 +132,7 @@ async function fixture(
   const store = new SnapshotStore(directory);
   for (const state of before) put(store, 'target', state, definition);
   for (const state of after) put(store, 'source', state, definition);
-  const metadata = await createPlan(
+  const metadata = createPlan(
     store,
     definition,
     { ...definition, environmentId: 'target' },
@@ -197,7 +197,7 @@ async function replay(test: Awaited<ReturnType<typeof fixture>>) {
     const remote = cmaFixture(store, test.definition, test.store);
     await runScript(test.output, remote.client);
     remote.snapshot(store);
-    const plan = await createPlan(
+    const plan = createPlan(
       store,
       test.definition,
       { ...test.definition, environmentId: 'target' },
@@ -299,14 +299,12 @@ describe('TypeScript migration artifacts', () => {
       const script = await readFile(test.output, 'utf8');
       assert.equal(
         script,
-        `import { join } from "node:path";
-import {
+        `import {
   type ContentMigrationClient,
   defineContentMigration,
 } from "@datocms/cli-plugin-content-diff/migration";
 
 export default defineContentMigration(
-  { baseline: join(__dirname, "123_change.content") },
   async (client: ContentMigrationClient): Promise<void> => {
     // Update Page "After" (${after.id})
     await client.items.update("${after.id}", {
@@ -574,7 +572,7 @@ export default defineContentMigration(
       assert(parts.length > 1);
       assert(
         main.startsWith(
-          'import { join } from "node:path"; import { type ContentMigrationClient, defineContentMigration, runMigrationPart, } from "@datocms/cli-plugin-content-diff/migration"; ',
+          'import { type ContentMigrationClient, defineContentMigration, runMigrationPart, } from "@datocms/cli-plugin-content-diff/migration"; ',
         ),
         main,
       );
@@ -582,11 +580,7 @@ export default defineContentMigration(
         main.includes(
           `for (const part of [ ${parts
             .map((part) => `"${part}",`)
-            .join(
-              ' ',
-            )} ]) await runMigrationPart( client, join(__dirname, ${JSON.stringify(
-            basename(test.baseline),
-          )}, "parts", part), );`,
+            .join(' ')} ]) await runMigrationPart(client, __filename, part);`,
         ),
         main,
       );
@@ -849,7 +843,7 @@ export default defineContentMigration(
         }),
       );
       test.store.putUpload('target', upload('removed', old));
-      test.metadata = await createPlan(
+      test.metadata = createPlan(
         test.store,
         test.definition,
         { ...test.definition, environmentId: 'target' },
@@ -990,7 +984,7 @@ export default defineContentMigration(
     ];
     for (const state of before) test.store.putCollection('target', state);
     for (const state of after) test.store.putCollection('source', state);
-    test.metadata = await createPlan(
+    test.metadata = createPlan(
       test.store,
       test.definition,
       { ...test.definition, environmentId: 'target' },

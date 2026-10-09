@@ -255,11 +255,7 @@ function fixture() {
     },
     scriptPath: '/fixture/migration.ts',
     // Preflight never loads the script.
-    definition: overrides.preflightOnly
-      ? undefined
-      : Object.assign(work, {
-          options: { baseline: './migration.content' },
-        }),
+    definition: overrides.preflightOnly ? undefined : work,
     options: { ...options, ...overrides },
   });
   return {
@@ -463,10 +459,11 @@ describe('content migration execution', () => {
           throw new Error('Script failed');
         }),
       ),
-      (error: Error & { keptForkEnvironmentId?: string }) => {
+      (error: Error & ContentFailureContext) => {
+        assert.equal(error.message, 'Script failed');
         assert.equal(
-          error.message,
-          'Script failed The fork "review" was deleted; "main" was not changed.',
+          error.outcome,
+          'The fork "review" was deleted; "main" was not changed.',
         );
         assert.equal(error.keptForkEnvironmentId, undefined);
         return true;
@@ -499,7 +496,8 @@ describe('content migration execution', () => {
       (error: ContentError) => {
         assert.equal(error.code, 'APPLY_FAILED_CLEANUP_INCOMPLETE');
         assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.equal(error.forkOutcomeStated, true);
+        // The message itself says the fork could not be removed.
+        assert.equal(error.outcome, undefined);
         assert.match(
           error.message,
           /^The CMA rejected PUT .* The failed fork "review" could not be removed: Error: destroy failed$/,
@@ -514,8 +512,9 @@ describe('content migration execution', () => {
         return true;
       },
     );
-    // Unawaited calls cannot end the process while the fork is removed.
-    assert.equal(during, before + 1);
+    // Every request the script started has settled before the fork is
+    // removed, so cleanup needs no listener and none is left behind.
+    assert.equal(during, before);
     assert.equal(process.listenerCount('unhandledRejection'), before);
     test.environments.delete('review');
     test.hooks.afterCapture = (environment) => {
@@ -534,7 +533,7 @@ describe('content migration execution', () => {
       },
     );
   });
-  it('removes a fork that ends in a failed status, or leaves its outcome to the caller when kept', async () => {
+  it('removes a fork that ends in a failed status, or says it was kept', async () => {
     for (const keepFailedFork of [false, true]) {
       const test = fixture();
       const environments = test.client('main').environments;
@@ -555,8 +554,10 @@ describe('content migration execution', () => {
             error.keptForkEnvironmentId,
             keepFailedFork ? 'review' : undefined,
           );
-          // The message does not say the fork was kept; the command adds it.
-          assert.equal(error.forkOutcomeStated, undefined);
+          assert.equal(
+            error.outcome,
+            keepFailedFork ? 'The fork "review" was kept.' : undefined,
+          );
           return true;
         },
       );
@@ -618,10 +619,9 @@ describe('content migration execution', () => {
       (error: Error & ContentFailureContext) => {
         assert.equal(error === rejection, true);
         assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.equal(error.forkOutcomeStated, true);
         assert.match(
-          error.message,
-          /The fork "review" was kept: an environment with that ID exists after the fork request failed/,
+          error.outcome ?? '',
+          /^The fork "review" was kept: an environment with that ID exists after the fork request failed/,
         );
         return true;
       },
@@ -655,8 +655,10 @@ describe('content migration execution', () => {
       ),
       (error: Error & ContentFailureContext) => {
         assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.equal(error.forkOutcomeStated, true);
-        assert.match(error.message, /The fork "review" was kept/);
+        assert.equal(
+          error.outcome,
+          'The fork "review" was kept; "main" was not changed.',
+        );
         return true;
       },
     );
@@ -671,9 +673,10 @@ describe('content migration execution', () => {
       ),
       (error: ContentError) => {
         assert.equal(error.code, 'MIGRATION_FAILED');
+        assert.equal(error.message, 'The migration callback failed: oops');
         assert.equal(
-          error.message,
-          'The migration callback failed: oops The fork "review" was kept; "main" was not changed.',
+          error.outcome,
+          'The fork "review" was kept; "main" was not changed.',
         );
         assert.equal(error.keptForkEnvironmentId, 'review');
         return true;
@@ -682,6 +685,26 @@ describe('content migration execution', () => {
     assert.equal(test.environments.has('review'), true);
     assert.deepEqual(test.events, ['fork:review']);
   });
+  it('reports a frozen script failure as it is', async () => {
+    for (const inPlace of [false, true]) {
+      const test = fixture();
+      const frozen = Object.freeze(new Error('Frozen script failure'));
+      await assert.rejects(
+        applyMigration(
+          test.args(
+            async () => {
+              throw frozen;
+            },
+            inPlace
+              ? { inPlace: true, allowPrimary: true, forkName: undefined }
+              : {},
+          ),
+        ),
+        (error: unknown) => error === frozen,
+      );
+    }
+  });
+
   it('wraps CMA rejections raised by the script and removes the fork', async () => {
     const test = fixture();
     await assert.rejects(
@@ -698,7 +721,7 @@ describe('content migration execution', () => {
             `^The CMA rejected PUT /items/${RECORD}: INVALID_FIELD \\(title: VALIDATION_UNIQUE\\)\\. A unique value may still be held by another record`,
           ),
         );
-        assert.match(error.message, /The fork "review" was deleted/);
+        assert.match(error.outcome ?? '', /The fork "review" was deleted/);
         assert.equal(error.details?.status, 422);
         return true;
       },
@@ -779,11 +802,10 @@ describe('content migration execution', () => {
       ) => {
         assert.equal(error.code, 'FAST_FORK_BLOCKED');
         assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.equal(error.forkOutcomeStated, true);
-        assert.ok(error.message.startsWith(message));
+        assert.equal(error.message, message);
         assert.match(
-          error.message,
-          /The fork "review" was kept: an environment with that ID exists after the fork request failed/,
+          error.outcome ?? '',
+          /^The fork "review" was kept: an environment with that ID exists after the fork request failed/,
         );
         assert.deepEqual(error.suggestions, suggestions);
         return true;
@@ -854,9 +876,9 @@ describe('content migration execution', () => {
       (error: ContentError) => {
         assert.equal(error.code, 'CMA_VALIDATION_FAILED');
         assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.match(
-          error.message,
-          /The fork "review" was kept; "main" was not changed\.$/,
+        assert.equal(
+          error.outcome,
+          'The fork "review" was kept; "main" was not changed.',
         );
         return true;
       },
@@ -979,10 +1001,11 @@ describe('content migration execution', () => {
           },
         ),
       ),
-      (error: Error) => {
+      (error: Error & ContentFailureContext) => {
+        assert.equal(error.message, 'Cancelled before content writes');
         assert.equal(
-          error.message,
-          'Cancelled before content writes Writes made before the failure remain in "main".',
+          error.outcome,
+          'Writes made before the failure remain in "main".',
         );
         return true;
       },

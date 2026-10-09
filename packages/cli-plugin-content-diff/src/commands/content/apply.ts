@@ -4,7 +4,8 @@ import {
   ContentError,
   type ContentFailureContext,
   contentErrorReport,
-  describeDestinationDifference,
+  exitStatus,
+  firstDifference,
 } from '../../engine/errors';
 import type { ApplyOutcome } from '../../engine/types';
 import { jsonFailure } from '../../utils/command-helpers';
@@ -160,51 +161,25 @@ export default class ContentApplyCommand extends CmaClientCommand {
   }
 
   protected async catch(
-    error: Error & { exitCode?: number | undefined },
+    error: Error & ContentFailureContext & { exitCode?: number },
   ): Promise<void> {
     if (this.jsonEnabled()) return this.logJson(jsonFailure(error));
     const report = contentErrorReport(error);
-    // The baseline message is fixed; the first difference follows it, also
-    // when removing the fork failed afterwards.
-    const cause = report.details?.cause as
-      | { code?: unknown; details?: Record<string, unknown> }
-      | undefined;
-    const changed =
-      report.code === 'DESTINATION_CHANGED'
-        ? report.details
-        : cause?.code === 'DESTINATION_CHANGED'
-          ? cause.details
-          : undefined;
-    const fork = report.keptForkEnvironmentId;
-    const notes = [
-      changed && describeDestinationDifference(changed),
-      fork && !(error as ContentFailureContext).forkOutcomeStated
-        ? `The fork "${fork}" was kept.`
-        : undefined,
-    ].filter((note): note is string => Boolean(note));
+    const notes = [firstDifference(report), error.outcome].filter(
+      (note): note is string => Boolean(note),
+    );
     if (!notes.length) return super.catch(error);
-    let { message } = error;
-    let { suggestions } = report;
-    let exit =
-      error.exitCode ??
-      (error as Error & { oclif?: { exit?: number } }).oclif?.exit ??
-      1;
-    if (error instanceof CmaClient.ApiError) {
-      // Authorization and permission failures keep the native message,
-      // suggestions and exit status; the notes follow the message.
-      const raised: unknown = await super
-        .catch(error)
-        .catch((native) => native);
-      if (raised !== error && raised instanceof Error) {
-        message = raised.message;
-        suggestions = (raised as { suggestions?: string[] }).suggestions;
-        exit = (raised as { oclif?: { exit?: number } }).oclif?.exit ?? exit;
-      }
-    }
-    this.error([message, ...notes].join('\n'), {
+    // The native handler still runs first: it prints the failure's stack and
+    // details, and gives authorization and permission failures their native
+    // message, suggestions and exit status. The notes follow the message.
+    const native: unknown = await super
+      .catch(error)
+      .catch((raised: unknown) => raised);
+    const base = native instanceof Error && native !== error ? native : error;
+    this.error([base.message, ...notes].join('\n'), {
       code: report.code,
-      exit,
-      suggestions,
+      exit: exitStatus(base),
+      suggestions: contentErrorReport(base).suggestions,
     });
   }
 

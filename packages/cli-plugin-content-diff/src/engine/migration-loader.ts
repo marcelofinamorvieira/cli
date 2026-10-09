@@ -7,10 +7,10 @@ import { ContentError } from './errors';
 
 /**
  * Check the migration file without reading, importing or evaluating it. The
- * check is synchronous so a part runs up to its first request in the same
- * turn as the `runMigrationPart` call: a script that does not await that call
- * then still has the part's write in flight when its callback returns, and
- * the runner reports it.
+ * check is synchronous, so a part runs up to its first request in the same
+ * turn as the `runMigrationPart` call, and apply, which waits for every
+ * request a script started, still sees the part at work when a script did not
+ * await it.
  */
 export function assertMigrationFile(path: string, signal?: AbortSignal): void {
   assertNotAborted(signal);
@@ -65,10 +65,7 @@ export async function loadContentMigration(
   if (
     typeof declaration !== 'function' ||
     Reflect.get(declaration, 'format') !== 'datocms-content-migration' ||
-    Reflect.get(declaration, 'version') !== 1 ||
-    !Reflect.get(declaration, 'options') ||
-    typeof Reflect.get(declaration, 'options').baseline !== 'string' ||
-    !Reflect.get(declaration, 'options').baseline
+    Reflect.get(declaration, 'version') !== 1
   )
     throw new ContentError(
       'INVALID_CONTENT_MIGRATION',

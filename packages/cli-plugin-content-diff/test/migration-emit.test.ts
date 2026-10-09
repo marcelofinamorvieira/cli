@@ -180,7 +180,7 @@ async function generate(
   try {
     fill(store, 'target', before, definition);
     fill(store, 'source', after, definition);
-    const metadata = await createPlan(
+    const metadata = createPlan(
       store,
       definition,
       { ...definition, environmentId: 'target' },
@@ -225,7 +225,7 @@ async function generate(
             },
             definition,
           );
-          const plan = await createPlan(
+          const plan = createPlan(
             check,
             definition,
             { ...definition, environmentId: 'target' },

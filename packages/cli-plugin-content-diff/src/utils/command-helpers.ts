@@ -1,4 +1,4 @@
-import { contentErrorReport } from '../engine/errors';
+import { contentErrorReport, exitStatus } from '../engine/errors';
 
 /**
  * Under --json, the host would report a failure as an object dump on stdout.
@@ -12,6 +12,6 @@ import { contentErrorReport } from '../engine/errors';
 export function jsonFailure(
   error: Error & { exitCode?: number; oclif?: { exit?: number } },
 ): { error: ReturnType<typeof contentErrorReport> } {
-  process.exitCode ??= error.exitCode ?? error.oclif?.exit ?? 1;
+  process.exitCode ??= exitStatus(error);
   return { error: contentErrorReport(error) };
 }

@@ -1,18 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { pbkdf2 } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { describe, it } from 'mocha';
 import { ContentError } from '../src/engine/errors';
-import {
-  cmaFailure,
-  runTrackedMigration,
-  trackRequests,
-} from '../src/engine/execution';
+import { cmaFailure, runTrackedMigration } from '../src/engine/execution';
 import { runMigrationPart } from '../src/migration';
 
 function deferred() {
@@ -44,9 +40,6 @@ const recordData = (id: string) => ({
 });
 
 const record = (id: string) => json(200, { data: recordData(id) });
-
-const unawaited = (error: ContentError) =>
-  error.code === 'UNAWAITED_MIGRATION_CALL';
 
 /** A fake CMA transport that records requests and can hold them open. */
 function transport() {
@@ -140,7 +133,7 @@ describe('tracked migration execution', () => {
     ]);
   });
 
-  it('drains and refuses a callback that returns before its requests settle', async () => {
+  it('waits for a call the callback did not await before completing', async () => {
     const fake = transport();
     const release = fake.hold();
     const execution = runTrackedMigration(
@@ -152,21 +145,25 @@ describe('tracked migration execution', () => {
       fake.fetchFn,
     );
     let finished = false;
-    void execution.catch(() => {
+    void execution.then(() => {
       finished = true;
     });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(finished, false);
     release();
-    await assert.rejects(execution, unawaited);
+    await execution;
     assert.deepEqual(fake.settled, ['PUT /items/unawaited']);
   });
 
-  it('reports an unawaited part even while file I/O is slow', async () => {
+  it('waits for a part the callback did not await, even while file I/O is slow', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'content-execution-'));
-    const part = join(directory, 'part.ts');
+    const script = join(directory, 'migration.ts');
+    await writeFile(script, '');
+    await mkdir(join(directory, 'migration.content', 'parts'), {
+      recursive: true,
+    });
     await writeFile(
-      part,
+      join(directory, 'migration.content', 'parts', 'part.ts'),
       "export default async (client: any) => { await client.items.update('from-part', { title: 'late' }); };",
     );
     // Occupy libuv's thread pool so asynchronous file I/O completes late.
@@ -177,18 +174,17 @@ describe('tracked migration execution', () => {
           pbkdf2('busy', 'salt', 300_000, 32, 'sha256', resolve),
         ),
     );
+    const fake = transport();
     try {
-      await assert.rejects(
-        runTrackedMigration(
-          async (client) => {
-            void runMigrationPart(client, part);
-          },
-          build,
-          undefined,
-          transport().fetchFn,
-        ),
-        unawaited,
+      await runTrackedMigration(
+        async (client) => {
+          void runMigrationPart(client, script, 'part.ts');
+        },
+        build,
+        undefined,
+        fake.fetchFn,
       );
+      assert.deepEqual(fake.settled, ['PUT /items/from-part']);
     } finally {
       await Promise.all(busy);
       await rm(directory, { recursive: true, force: true });
@@ -215,22 +211,7 @@ describe('tracked migration execution', () => {
     assert.deepEqual(fake.settled, ['PUT /items/pending']);
   });
 
-  it('rejects writes issued after the callback settled', async () => {
-    const fake = transport();
-    const tracker = trackRequests(undefined, fake.fetchFn);
-    tracker.close();
-    await assert.rejects(
-      tracker.fetchFn('https://site-api.datocms.com/items/x', {
-        method: 'DELETE',
-      }),
-      (error: ContentError) => error.code === 'UNAWAITED_MIGRATION_CALL',
-    );
-    await tracker.fetchFn('https://site-api.datocms.com/items/x');
-    assert.deepEqual(fake.requests, ['GET /items/x']);
-    assert.equal(tracker.pending, 0);
-  });
-
-  it('waits for a call that is waiting to poll its job, and reports it unawaited', async () => {
+  it('waits for a call that is waiting to poll its job', async () => {
     const requests: string[] = [];
     const fetchFn: typeof fetch = async (input, init) => {
       const { pathname } = new URL(String(input));
@@ -245,23 +226,19 @@ describe('tracked migration execution', () => {
             },
           });
     };
-    await assert.rejects(
-      runTrackedMigration(
-        async (client) => {
-          // The 202 settles at once; the SDK then waits before polling.
-          void client.items.destroy('x');
-          await delay(50);
-        },
-        build,
-        undefined,
-        fetchFn,
-      ),
-      unawaited,
+    await runTrackedMigration(
+      async (client) => {
+        // The 202 settles at once; the SDK then waits before polling.
+        void client.items.destroy('x');
+      },
+      build,
+      undefined,
+      fetchFn,
     );
     assert.deepEqual(requests, ['DELETE /items/x', 'GET /job-results/job']);
   });
 
-  it('waits for a rate-limited call through its retry and refuses the retry once closed', async () => {
+  it('waits for a rate-limited call through its retry, awaited or not', async () => {
     const requests: string[] = [];
     const fetchFn: typeof fetch = async (input, init) => {
       const { pathname } = new URL(String(input));
@@ -285,24 +262,22 @@ describe('tracked migration execution', () => {
       fetchFn,
     );
     assert.deepEqual(requests, ['PUT /items/awaited', 'PUT /items/awaited']);
-    let retry: unknown;
-    await assert.rejects(
-      runTrackedMigration(
-        async (client) => {
-          client.items.update('floating', {}).catch((error) => {
-            retry = error;
-          });
-          await delay(50);
-        },
-        retrying,
-        undefined,
-        fetchFn,
-      ),
-      unawaited,
+    let retried: unknown;
+    await runTrackedMigration(
+      async (client) => {
+        void client.items.update('floating', {}).then((item) => {
+          retried = item.id;
+        });
+      },
+      retrying,
+      undefined,
+      fetchFn,
     );
-    assert.deepEqual(requests.slice(2), ['PUT /items/floating']);
-    assert(retry instanceof ContentError);
-    assert.equal(retry.code, 'UNAWAITED_MIGRATION_CALL');
+    assert.deepEqual(requests.slice(2), [
+      'PUT /items/floating',
+      'PUT /items/floating',
+    ]);
+    assert.equal(retried, 'floating');
   });
 
   it('keeps rejections of unawaited calls from ending the process before cleanup', async () => {
@@ -383,19 +358,20 @@ describe('tracked migration execution', () => {
     });
     assert.equal(code, 0, errors);
     const result = JSON.parse(output);
-    assert.match(result.chained, /^UNAWAITED_MIGRATION_CALL: /);
-    assert.match(
+    // Unawaited calls that succeed are waited for, not reported.
+    assert.equal(result.chained, 'completed');
+    assert.equal(
       result.failed,
-      /^UNAWAITED_MIGRATION_CALL: .* An unawaited call failed: The CMA rejected PUT \/items\/invalid: INVALID_FIELD\.$/,
+      'UNAWAITED_MIGRATION_CALL: A call the migration did not await failed: The CMA rejected PUT /items/invalid: INVALID_FIELD. Await every client call.',
     );
     // Calls that hand the SDK request promise straight to the script.
-    assert.match(
+    assert.equal(
       result.rawRequest,
-      /^UNAWAITED_MIGRATION_CALL: .* An unawaited call failed: The CMA rejected PUT \/items\/invalid: INVALID_FIELD\.$/,
+      'UNAWAITED_MIGRATION_CALL: A call the migration did not await failed: The CMA rejected PUT /items/invalid: INVALID_FIELD. Await every client call.',
     );
-    assert.match(
+    assert.equal(
       result.rawMethod,
-      /^UNAWAITED_MIGRATION_CALL: .* An unawaited call failed: The CMA rejected DELETE \/upload-collections\/invalid: INVALID_FIELD\.$/,
+      'UNAWAITED_MIGRATION_CALL: A call the migration did not await failed: The CMA rejected DELETE /upload-collections/invalid: INVALID_FIELD. Await every client call.',
     );
     // Awaiting a call after it failed handles its rejection.
     assert.equal(result.handledLate, 'completed');

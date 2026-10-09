@@ -7,13 +7,14 @@ import { assertSchemaCompatible, createPlan } from './planner';
 import { fetchSchema } from './schema';
 import { assertSourceRecordsValid } from './source-validity';
 import { SnapshotStore } from './store';
-import type {
-  Client,
-  Kind,
-  PlanCounts,
-  PlanOptions,
-  SchemaState,
-  Side,
+import {
+  type Client,
+  KINDS,
+  type Kind,
+  type PlanCounts,
+  type PlanOptions,
+  type SchemaState,
+  type Side,
 } from './types';
 
 interface GenerationEndpoint {
@@ -188,7 +189,7 @@ export async function generateContentMigration({
         destinationStore.dispose();
       }
     }
-    const metadata = await createPlan(store, sourceSchema, destinationSchema, {
+    const metadata = createPlan(store, sourceSchema, destinationSchema, {
       modelIds,
       uploads: options.uploads,
       includeDeletions: options.includeDeletions,
@@ -208,7 +209,7 @@ export async function generateContentMigration({
       chunkBytes: options.chunkBytes,
     });
     const skipped: ContentGenerationResult['skipped'] = [];
-    for (const kind of ['record', 'upload', 'collection'] as const)
+    for (const kind of KINDS)
       for (const entry of store.planEntries(kind, 'skip'))
         for (const { code, message } of entry.diagnostics)
           skipped.push({ kind, id: entry.id, code, message });

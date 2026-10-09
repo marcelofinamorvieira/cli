@@ -104,7 +104,7 @@ async function planned(
   try {
     for (const state of source) store.putRecord('source', state);
     for (const state of target) store.putRecord('target', state);
-    await createPlan(
+    createPlan(
       store,
       definition,
       { ...definition, environmentId: 'target' },

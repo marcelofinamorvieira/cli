@@ -88,14 +88,12 @@ Integers outside JavaScript's safe range (±9,007,199,254,740,991) in record val
 A small migration holds ordinary awaited CMA calls:
 
 ```ts
-import { join } from 'node:path';
 import {
   type ContentMigrationClient,
   defineContentMigration,
 } from '@datocms/cli-plugin-content-diff/migration';
 
 export default defineContentMigration(
-  { baseline: join(__dirname, '1791200000_syncContent.content') },
   async (client: ContentMigrationClient): Promise<void> => {
     // Update Article "Hello world" (AbCdEfGhIjKlMnOpQrStUv)
     await client.items.update('AbCdEfGhIjKlMnOpQrStUv', {
@@ -106,7 +104,7 @@ export default defineContentMigration(
 );
 ```
 
-`ContentMigrationClient` is the `@datocms/cma-client-node` `Client` (the client the DatoCMS CLI builds) bound to the environment being migrated. Every call runs immediately against the CMA and returns its real response. `defineContentMigration` attaches the baseline declaration to the callback. The script imports only the runtime helpers it uses: `defineContentMigration`, plus `runMigrationPart` and `reorderRecords` when needed.
+`ContentMigrationClient` is the `@datocms/cma-client-node` `Client` (the client the DatoCMS CLI builds) bound to the environment being migrated. Every call runs immediately against the CMA and returns its real response. `defineContentMigration` marks the callback as a content migration for `content:apply`. The script imports only the runtime helpers it uses: `defineContentMigration`, plus `runMigrationPart` and `reorderRecords` when needed.
 
 Calls are emitted in this order, each with one comment naming the action, the model, the record title when there is one, and the ID:
 
@@ -134,16 +132,16 @@ Calls are emitted in this order, each with one comment naming the action, the mo
 
 ```ts
 for (const part of ['000001.ts', '000002.ts'])
-  await runMigrationPart(client, join(__dirname, '1791200000_syncContent.content', 'parts', part));
+  await runMigrationPart(client, __filename, part);
 ```
 
-`runMigrationPart` loads each part in the same process through the same public `tsx` API as the main script, awaits its default export with the same client, and drops it from the module cache before the next part loads. `tsx` keeps each compiled part in memory until the process ends, so memory grows with the total size of the parts.
+`runMigrationPart` finds each part in the `parts/` directory of the companion beside the script's real file, as apply finds the baseline, so a script and its companion can be renamed together. It loads each part in the same process through the same public `tsx` API as the main script, awaits its default export with the same client, and drops it from the module cache before the next part loads. `tsx` keeps each compiled part in memory until the process ends, so memory grows with the total size of the parts.
 
 TypeScript loads through `tsx`: run from the project directory so its tsconfig and path aliases apply, or set `TSX_TSCONFIG_PATH`. Generated files are formatted with the project's Prettier configuration. Scripts, their imports and the formatter configuration are trusted Node code, not a sandbox; requests made by clients the script builds itself are outside apply's request tracking.
 
 ## Companion directory
 
-Keep the `.ts` file and its same-named `.content` directory together; apply only accepts a script whose `baseline` points at that sibling directory. The companion holds:
+Keep the `.ts` file and its same-named `.content` directory together: apply reads the baseline from the `.content` directory beside the script (beside its real file when the script is reached through a symbolic link). The companion holds:
 
 - `manifest.json` and its `manifest.sha256`: the format (`datocms-content-migration-baseline/1`), the creation time, source and destination project and environment IDs, the projected destination schema (its hash covers the whole projection, model names, validators and defaults included), the tracking-model bindings, the generation options, the planned counts and the chunk index descriptor;
 - `chunks.jsonl`: the SHA-256, byte count and entry count of every baseline chunk;
@@ -192,7 +190,7 @@ CMA errors raised by the script are reported once, with the request and the CMA'
 
 In fork mode the fork is deleted after a failure, unless `--keep-failed-fork` is set, and the message says whether it was deleted or kept and that the destination was not changed. In place, the message says that writes made before the failure remain. There is no transaction around the migration: stop competing writes while it runs.
 
-A script that returns while CMA writes are still running, or that leaves a call unawaited which is then refused or fails, fails with `UNAWAITED_MIGRATION_CALL` once every request settles. Reads still in flight are only drained. Detection only sees requests: an unawaited `uploads.createFromUrl` or `uploads.updateFromUrl` (or a `runMigrationPart` whose part starts with one) does local file work and a download before its first write, so a script that returns during that time is reported as a success and the upload is refused afterwards. Always `await` every call.
+Apply waits for every request the script started before it reports the result or removes the fork, including calls the script did not await. If such a call fails, apply fails with `UNAWAITED_MIGRATION_CALL`. Only requests are seen: an unawaited `uploads.createFromUrl` or `uploads.updateFromUrl` (or a `runMigrationPart` whose part starts with one) prepares a temporary file and streams the download to it with no request in flight before its upload request, so a script that returns during that time can be reported before the upload runs. Always `await` every call.
 
 ## Interruptions
 

@@ -31,10 +31,20 @@ describe('trusted TypeScript migration loader', () => {
     await rm(directory, { recursive: true, force: true });
   });
 
+  /** A split migration script under `root` and its parts directory. */
+  async function split(root = directory) {
+    const script = join(root, 'main.ts');
+    await writeFile(script, '');
+    const parts = join(root, 'main.content', 'parts');
+    await mkdir(parts, { recursive: true });
+    return { script, parts };
+  }
+
   it('awaits typed callbacks and resolves imports beside the migration', async () => {
-    const filename = join(directory, 'part.ts');
+    const { script, parts } = await split();
+    const filename = join(parts, 'part.ts');
     await writeFile(
-      join(directory, 'helper.cjs'),
+      join(parts, 'helper.cjs'),
       'module.exports = { value: "relative dependency" };',
     );
     await writeFile(
@@ -54,19 +64,20 @@ describe('trusted TypeScript migration loader', () => {
           calls.push(value);
         },
       }),
-      filename,
+      script,
+      'part.ts',
     );
     assert.deepEqual(calls, [
       {
         helper: 'relative dependency',
         file: 'part.ts',
-        directory,
+        directory: parts,
       },
     ]);
     assert.equal(require.cache[filename], undefined);
     // Ordinary imported dependencies intentionally retain standard semantics.
     const helperPath = tsxRequire.resolve(
-      join(directory, 'helper.cjs'),
+      join(parts, 'helper.cjs'),
       __filename,
     );
     assert.ok(require.cache[helperPath]);
@@ -74,7 +85,8 @@ describe('trusted TypeScript migration loader', () => {
   });
 
   it('loads fresh code on each call and preserves exported runtime markers', async () => {
-    const filename = join(directory, 'part.ts');
+    const { script, parts } = await split();
+    const filename = join(parts, 'part.ts');
     await writeFile(
       filename,
       `const migration = Object.assign(async () => 1, { marker: 'migration', [Symbol.for('content-migration')]: true });
@@ -96,7 +108,7 @@ describe('trusted TypeScript migration loader', () => {
       'export default async (client: number[]) => { client.push(2); };',
     );
     const seen: number[] = [];
-    await runMigrationPart(fakeClient(seen), filename);
+    await runMigrationPart(fakeClient(seen), script, 'part.ts');
     assert.deepEqual(seen, [2]);
     assert.equal(require.cache[filename], undefined);
   });
@@ -129,7 +141,8 @@ describe('trusted TypeScript migration loader', () => {
 
   it('maps initialization, inline callable callbacks and awaited part failures to source lines', async () => {
     const initialization = join(directory, 'initialization.ts');
-    const execution = join(directory, 'execution.ts');
+    const { script: main, parts } = await split();
+    const execution = join(parts, 'execution.ts');
     const inline = join(directory, 'inline.ts');
     await writeFile(
       initialization,
@@ -145,7 +158,7 @@ describe('trusted TypeScript migration loader', () => {
         resolve(__dirname, '../src/migration.ts'),
       )};
 interface Ignored { value: number }
-export default defineContentMigration({ baseline: './fixture.content' }, async () => {
+export default defineContentMigration(async () => {
   await Promise.resolve();
   throw new Error('inline failed');
 });`,
@@ -161,7 +174,7 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
       (async () => {
         for (const work of [
           () => loadMigrationModule(${JSON.stringify(initialization)}),
-          () => runMigrationPart({}, ${JSON.stringify(execution)}),
+          () => runMigrationPart({}, ${JSON.stringify(main)}, 'execution.ts'),
           async () => (await loadContentMigration(${JSON.stringify(inline)}))({}),
         ]) { try { await work(); } catch (error) { console.log(error.stack); } }
       })().catch(error => { console.error(error); process.exitCode = 1; });`;
@@ -197,7 +210,8 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
         join(root, 'helpers/value.ts'),
         'export interface Value { label: string }; export const value: Value = { label: "typed helper" };',
       );
-      const filename = join(root, 'migration.ts');
+      const { script: main, parts } = await split(root);
+      const filename = join(parts, 'migration.ts');
       await writeFile(
         filename,
         'import { value, type Value } from "@helpers/value"; export default async (client: { record(value: Value): void }) => { client.record(value); };',
@@ -210,13 +224,14 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
           resolve(__dirname, '../src/migration.ts'),
         )});
         const filename = ${JSON.stringify(filename)};
+        const main = ${JSON.stringify(main)};
         (async () => {
           const seen = [];
-          await runMigrationPart({ record: (value) => seen.push(value) }, filename);
+          await runMigrationPart({ record: (value) => seen.push(value) }, main, 'migration.ts');
           assert.deepEqual(seen, [{ label: 'typed helper' }]);
           await writeFile(filename, 'import { value } from "@helpers/value"; export default async (client) => { await client.items.update("record", value); };');
           const calls = [];
-          await runMigrationPart({ items: { update: async (...args) => { calls.push(args); } } }, filename);
+          await runMigrationPart({ items: { update: async (...args) => { calls.push(args); } } }, main, 'migration.ts');
           assert.deepEqual(calls, [['record', { label: 'typed helper' }]]);
           console.log('project aliases and fresh migration edits passed');
         })().catch(error => { console.error(error); process.exitCode = 1; });`;
@@ -239,20 +254,10 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
     for (const declaration of [
       'async () => {}',
       '{}',
-      '{ format: "datocms-content-migration", version: 1, options: { baseline: "baseline" } }',
-      callable(
-        '{ format: "other", version: 1, options: { baseline: "baseline" } }',
-      ),
-      callable(
-        '{ format: "datocms-content-migration", options: { baseline: "baseline" } }',
-      ),
-      callable(
-        '{ format: "datocms-content-migration", version: 2, options: { baseline: "baseline" } }',
-      ),
-      callable(
-        '{ format: "datocms-content-migration", version: 1, options: { baseline: "" } }',
-      ),
-      callable('{ format: "datocms-content-migration", version: 1 }'),
+      '{ format: "datocms-content-migration", version: 1 }',
+      callable('{ format: "other", version: 1 }'),
+      callable('{ format: "datocms-content-migration" }'),
+      callable('{ format: "datocms-content-migration", version: 2 }'),
     ]) {
       await writeFile(filename, `export default ${declaration};`);
       await assert.rejects(
@@ -263,19 +268,20 @@ export default defineContentMigration({ baseline: './fixture.content' }, async (
     await writeFile(
       filename,
       `export default ${callable(
-        '{ format: "datocms-content-migration", version: 1, options: { baseline: "baseline" } }',
+        '{ format: "datocms-content-migration", version: 1 }',
       )};`,
     );
-    assert.deepEqual((await loadContentMigration(filename)).options, {
-      baseline: 'baseline',
-    });
+    assert.equal(
+      (await loadContentMigration(filename)).format,
+      'datocms-content-migration',
+    );
   });
 
   it('rejects non-callable parts and directories', async () => {
-    const filename = join(directory, 'part.ts');
-    await writeFile(filename, 'export default { value: 1 };');
+    const { script, parts } = await split();
+    await writeFile(join(parts, 'part.ts'), 'export default { value: 1 };');
     await assert.rejects(
-      runMigrationPart(fakeClient({}), filename),
+      runMigrationPart(fakeClient({}), script, 'part.ts'),
       /default function/,
     );
     await assert.rejects(loadMigrationModule(directory), /regular file/);

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -49,9 +49,13 @@ describe('content migrations over the real CMA SDK transport', () => {
         baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
         environment: 'isolated',
       });
-      const part = join(directory, 'part.ts');
+      const script = join(directory, 'migration.ts');
+      await writeFile(script, '');
+      await mkdir(join(directory, 'migration.content', 'parts'), {
+        recursive: true,
+      });
       await writeFile(
-        part,
+        join(directory, 'migration.content', 'parts', 'part.ts'),
         `export default async function(client) {
           const result = await client.items.update('record-id', { title: 'part' });
           if (result.title !== 'part:server' || result.meta.current_version !== 'server-version-2') {
@@ -60,20 +64,17 @@ describe('content migrations over the real CMA SDK transport', () => {
           await client.items.update('record-id', { title: result.title });
         }`,
       );
-      const migration = defineContentMigration(
-        { baseline: join(directory, 'unused.content') },
-        async (actual) => {
-          assert.equal(actual, client);
-          const result = await actual.items.update('record-id', {
-            title: 'inline',
-          });
-          assert.equal(result.title, 'inline:server');
-          assert.equal(result.meta.current_version, 'server-version-1');
-          assert.deepEqual(writes, ['inline']);
-          await runMigrationPart(actual, part);
-          assert.deepEqual(writes, ['inline', 'part', 'part:server']);
-        },
-      );
+      const migration = defineContentMigration(async (actual) => {
+        assert.equal(actual, client);
+        const result = await actual.items.update('record-id', {
+          title: 'inline',
+        });
+        assert.equal(result.title, 'inline:server');
+        assert.equal(result.meta.current_version, 'server-version-1');
+        assert.deepEqual(writes, ['inline']);
+        await runMigrationPart(actual, script, 'part.ts');
+        assert.deepEqual(writes, ['inline', 'part', 'part:server']);
+      });
       await migration(client);
       assert.deepEqual(environments, ['isolated', 'isolated', 'isolated']);
     } finally {

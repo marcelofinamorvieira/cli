@@ -4,8 +4,8 @@ import type { Kind } from './types';
 export interface ContentFailureContext {
   /** A fork this run created, or may have created, that still exists. */
   keptForkEnvironmentId?: string;
-  /** The message already says what happened to that fork. */
-  forkOutcomeStated?: boolean;
+  /** What the failure left in the fork or the destination, in one sentence. */
+  outcome?: string;
 }
 
 /** The only error fields exposed by the plugin's JSON command contract. */
@@ -20,7 +20,7 @@ interface ContentErrorReport {
 
 export class ContentError extends Error implements ContentFailureContext {
   keptForkEnvironmentId?: string;
-  forkOutcomeStated?: boolean;
+  outcome?: string;
 
   constructor(
     readonly code: string,
@@ -49,7 +49,10 @@ export function contentErrorReport(error: Error): ContentErrorReport {
     : undefined;
   return {
     name: error.name,
-    message: error.message,
+    message:
+      typeof failure.outcome === 'string'
+        ? `${error.message} ${failure.outcome}`
+        : error.message,
     code:
       typeof failure.code === 'string'
         ? failure.code
@@ -98,22 +101,35 @@ export function destinationChanged(
   );
 }
 
-/** One human-readable line naming the first difference. */
-export function describeDestinationDifference(
-  details: Record<string, unknown> | undefined,
+/** The exit status a failure asks for: its own, oclif's, or 1. */
+export function exitStatus(
+  error: Error & { exitCode?: number; oclif?: { exit?: number } },
+): number {
+  return error.exitCode ?? error.oclif?.exit ?? 1;
+}
+
+/**
+ * One human-readable line naming the first difference of a changed
+ * destination, also when it is the cause of a failed fork cleanup.
+ */
+export function firstDifference(
+  report: ContentErrorReport,
 ): string | undefined {
+  const cause = report.details?.cause as
+    | { code?: unknown; details?: Record<string, unknown> }
+    | undefined;
+  const details =
+    report.code === 'DESTINATION_CHANGED'
+      ? report.details
+      : cause?.code === 'DESTINATION_CHANGED'
+        ? cause.details
+        : undefined;
   if (!details) return undefined;
   if (details.reason === 'schema')
     return 'First difference: the schema changed.';
   if (details.reason === 'drift' && typeof details.description === 'string')
     return `First difference: ${details.description}`;
   if (typeof details.kind === 'string' && typeof details.id === 'string')
-    return `First difference: ${details.kind} ${details.id} was ${
-      details.reason === 'added'
-        ? 'added'
-        : details.reason === 'removed'
-          ? 'removed'
-          : 'changed'
-    }.`;
+    return `First difference: ${details.kind} ${details.id} was ${details.reason}.`;
   return undefined;
 }

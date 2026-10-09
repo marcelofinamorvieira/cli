@@ -39,6 +39,23 @@ export function creationEmptyValue(type: string): JsonValue {
   return type === 'rich_text' || type === 'links' ? [] : null;
 }
 
+/**
+ * The action that brings an entry in scope to its source state: created when
+ * only the source has it, deleted (when deletions are on) when only the
+ * destination has it, updated when their hashes differ.
+ */
+function plannedAction(
+  inScope: boolean,
+  source: { hash: string } | undefined,
+  target: { hash: string } | undefined,
+  includeDeletions: boolean,
+): Action {
+  if (!inScope) return 'noop';
+  if (!target) return 'create';
+  if (!source) return includeDeletions ? 'delete' : 'noop';
+  return source.hash === target.hash ? 'noop' : 'update';
+}
+
 function blankCounts(): PlanCounts {
   const actions = () => ({ create: 0, update: 0, delete: 0, noop: 0, skip: 0 });
   return { record: actions(), upload: actions(), collection: actions() };
@@ -378,17 +395,12 @@ class Planning {
       // The hash leaves out the position: the emitter orders each changed
       // sibling group with one reorderRecords call, so a record that only
       // shifted within its group needs no entry of its own.
-      const action: Action = !managed
-        ? 'noop'
-        : !target
-          ? 'create'
-          : !source
-            ? this.options.includeDeletions
-              ? 'delete'
-              : 'noop'
-            : source.hash === target.hash
-              ? 'noop'
-              : 'update';
+      const action = plannedAction(
+        managed,
+        source,
+        target,
+        this.options.includeDeletions,
+      );
       const plan: RecordPlan = {
         kind: 'record',
         id,
@@ -460,17 +472,12 @@ class Planning {
         );
         const scoped = Boolean(inScope.get(kind, id));
         if (!scoped && !target) continue;
-        const action: Action = !scoped
-          ? 'noop'
-          : !target
-            ? 'create'
-            : !source
-              ? this.options.includeDeletions
-                ? 'delete'
-                : 'noop'
-              : source.hash === target.hash
-                ? 'noop'
-                : 'update';
+        const action = plannedAction(
+          scoped,
+          source,
+          target,
+          this.options.includeDeletions,
+        );
         const plan = {
           kind,
           id,
@@ -1186,12 +1193,12 @@ export function* orderedCollectionWrites(
     yield JSON.parse(String(row.data)) as CollectionPlan;
 }
 
-export async function createPlan(
+export function createPlan(
   store: SnapshotStore,
   sourceSchema: SchemaState,
   targetSchema: SchemaState,
   options: PlanOptions,
-): Promise<PlanMetadata> {
+): PlanMetadata {
   // This private working database has no competing readers or network awaits.
   // One disk-backed transaction avoids a journal/fsync cycle for every index
   // and plan write while leaving no partially planned result after an error.

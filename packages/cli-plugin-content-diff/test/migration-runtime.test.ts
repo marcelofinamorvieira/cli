@@ -28,6 +28,18 @@ describe('TypeScript content execution', () => {
   afterEach(async () => {
     await rm(directory, { recursive: true, force: true });
   });
+  /** A split migration script and the path of its part `part.ts`. */
+  async function split(name = 'migration') {
+    const script = join(directory, `${name}.ts`);
+    await writeFile(script, '');
+    await mkdir(join(directory, `${name}.content`, 'parts'), {
+      recursive: true,
+    });
+    return {
+      script,
+      file: join(directory, `${name}.content`, 'parts', 'part.ts'),
+    };
+  }
 
   it('passes the same real CMA client and actual server responses to inline scripts', async () => {
     const id = fixtureId('server-record');
@@ -55,16 +67,13 @@ describe('TypeScript content execution', () => {
       },
     });
     const original = client.items.update;
-    const migration = defineContentMigration(
-      { baseline: directory },
-      async (supplied) => {
-        assert.equal(supplied, client);
-        const response = await supplied.items.update(id, { title: 'Edited' });
-        assert.equal(response.meta.current_version, 'server-version');
-        assert.equal(response.title, 'Real response');
-        await supplied.items.find(response.id, { nested: true });
-      },
-    );
+    const migration = defineContentMigration(async (supplied) => {
+      assert.equal(supplied, client);
+      const response = await supplied.items.update(id, { title: 'Edited' });
+      assert.equal(response.meta.current_version, 'server-version');
+      assert.equal(response.title, 'Real response');
+      await supplied.items.find(response.id, { nested: true });
+    });
     assert.equal(typeof migration, 'function');
     assert.equal(migration.format, 'datocms-content-migration');
     assert.equal(migration.version, 1);
@@ -78,7 +87,7 @@ describe('TypeScript content execution', () => {
   });
 
   it('forwards real results between part calls only after the previous request finishes', async () => {
-    const file = join(directory, 'part.ts');
+    const { script, file } = await split();
     await writeFile(
       file,
       `export default async client => {
@@ -115,14 +124,14 @@ describe('TypeScript content execution', () => {
         },
       },
     } as unknown as ContentMigrationClient;
-    await defineContentMigration({ baseline: directory }, (client) =>
-      runMigrationPart(client, file),
+    await defineContentMigration((client) =>
+      runMigrationPart(client, script, 'part.ts'),
     )(client);
     assert.deepEqual(events, ['read', 'write-complete', 'publish']);
   });
 
   it('runs each part in-process with the real client and observes edits on the next run', async () => {
-    const file = join(directory, 'part.ts');
+    const { script, file } = await split();
     const seen: unknown[] = [];
     const client = {
       record: (value: unknown) => seen.push(value),
@@ -131,19 +140,53 @@ describe('TypeScript content execution', () => {
       file,
       'export default async (client: any) => { client.record(client); client.record(process.pid); };',
     );
-    await runMigrationPart(client, file);
+    await runMigrationPart(client, script, 'part.ts');
     assert.deepEqual(seen, [client, process.pid]);
     await writeFile(
       file,
       'export default async (client: any) => { client.record("edited"); };',
     );
-    await runMigrationPart(client, file);
+    await runMigrationPart(client, script, 'part.ts');
     assert.deepEqual(seen, [client, process.pid, 'edited']);
     await writeFile(
       file,
       'export default async () => { throw new Error("part failed"); };',
     );
-    await assert.rejects(runMigrationPart(client, file), /part failed/);
+    await assert.rejects(
+      runMigrationPart(client, script, 'part.ts'),
+      /part failed/,
+    );
+  });
+
+  it('runs the parts beside the real file of the script it is called from', async () => {
+    // A split main script names its parts, not its companion, so a copy
+    // under another name runs its own companion's parts, as apply checks
+    // its own companion's baseline.
+    const main = `import { defineContentMigration, runMigrationPart } from ${JSON.stringify(
+      resolve(__dirname, '../src/migration.ts'),
+    )};
+      export default defineContentMigration(async (client) => {
+        await runMigrationPart(client, __filename, 'part.ts');
+      });`;
+    for (const name of ['generated', 'copy']) {
+      const { script, file } = await split(name);
+      await writeFile(script, main);
+      await writeFile(
+        file,
+        `export default async (client: any) => { client.record(${JSON.stringify(
+          name,
+        )}); };`,
+      );
+    }
+    await symlink(join(directory, 'copy.ts'), join(directory, 'link.ts'));
+    const seen: unknown[] = [];
+    const client = {
+      record: (value: unknown) => seen.push(value),
+    } as unknown as ContentMigrationClient;
+    for (const name of ['generated', 'copy', 'link'])
+      await (await loadContentMigration(join(directory, `${name}.ts`)))(client);
+    await runMigrationPart(client, join(directory, 'link.ts'), 'part.ts');
+    assert.deepEqual(seen, ['generated', 'copy', 'copy', 'copy']);
   });
 
   it('preflights source and companion without evaluating top-level side effects or imports', async () => {
@@ -156,7 +199,7 @@ describe('TypeScript content execution', () => {
         resolve(__dirname, '../src/migration.ts'),
       )};
       writeFileSync(${JSON.stringify(marker)}, 'evaluated');
-      export default defineContentMigration({ baseline: './paired.content' }, async () => {});`,
+      export default defineContentMigration(async () => {});`,
     );
     const args = {
       rootClient: {} as CmaClient.Client,
@@ -202,14 +245,19 @@ describe('TypeScript content execution', () => {
     );
   });
 
-  it('rejects a normal script bound to a different companion before any API access', async () => {
-    const file = join(directory, 'paired.ts');
+  it('finds the companion of a script reached through a symlinked directory', async () => {
+    const real = join(directory, 'real');
+    await mkdir(real);
+    await symlink(real, join(directory, 'link'), 'dir');
+    const file = join(directory, 'link', 'paired.ts');
     await writeFile(
       file,
       `import { defineContentMigration } from ${JSON.stringify(
         resolve(__dirname, '../src/migration.ts'),
-      )}; export default defineContentMigration({baseline: './other.content'}, async () => {});`,
+      )};
+      export default defineContentMigration(async () => {});`,
     );
+    // The missing companion beside the real file fails the baseline load.
     await assert.rejects(
       applyContentMigration({
         rootClient: {} as CmaClient.Client,
@@ -226,40 +274,10 @@ describe('TypeScript content execution', () => {
         },
       }),
       (error) =>
-        (error as { code?: string }).code === 'MIGRATION_BASELINE_MISMATCH',
-    );
-  });
-
-  it('accepts a generated script reached through a symlinked directory', async () => {
-    const real = join(directory, 'real');
-    await mkdir(real);
-    await symlink(real, join(directory, 'link'), 'dir');
-    const file = join(directory, 'link', 'paired.ts');
-    await writeFile(
-      file,
-      `import { join } from 'node:path';
-      import { defineContentMigration } from ${JSON.stringify(
-        resolve(__dirname, '../src/migration.ts'),
-      )};
-      export default defineContentMigration({ baseline: join(__dirname, 'paired.content') }, async () => {});`,
-    );
-    // The binding check passes; the missing companion fails the baseline load.
-    await assert.rejects(
-      applyContentMigration({
-        rootClient: {} as CmaClient.Client,
-        buildEnvironmentClient: () => {
-          throw new Error('No API');
-        },
-        scriptPath: file,
-        options: {
-          inPlace: false,
-          allowPrimary: false,
-          keepFailedFork: false,
-          concurrency: 8,
-          fastFork: true,
-        },
-      }),
-      (error) => (error as NodeJS.ErrnoException).code === 'ENOENT',
+        (error as NodeJS.ErrnoException).code === 'ENOENT' &&
+        String((error as NodeJS.ErrnoException).path).includes(
+          join('real', 'paired.content'),
+        ),
     );
   });
 
@@ -269,11 +287,10 @@ describe('TypeScript content execution', () => {
     const file = join(real, '1_sync.ts');
     await writeFile(
       file,
-      `import { join } from 'node:path';
-      import { defineContentMigration } from ${JSON.stringify(
+      `import { defineContentMigration } from ${JSON.stringify(
         resolve(__dirname, '../src/migration.ts'),
       )};
-      export default defineContentMigration({ baseline: join(__dirname, '1_sync.content') }, async () => {});`,
+      export default defineContentMigration(async () => {});`,
     );
     await symlink(file, join(directory, 'latest.ts'), 'file');
     // A stale companion beside the link must not be the one checked.
@@ -309,10 +326,10 @@ describe('TypeScript content execution', () => {
       file,
       `import { defineContentMigration } from ${JSON.stringify(
         resolve(__dirname, '../src/migration.ts'),
-      )}; export default defineContentMigration({baseline: './proof'}, async client => { await client.items.find('record'); });`,
+      )}; export default defineContentMigration(async client => { await client.items.find('record'); });`,
     );
     const loaded = await loadContentMigration(file);
     assert.equal(typeof loaded, 'function');
-    assert.equal(loaded.options.baseline, './proof');
+    assert.equal(loaded.format, 'datocms-content-migration');
   });
 });
