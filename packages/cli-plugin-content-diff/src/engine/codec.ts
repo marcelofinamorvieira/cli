@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { ContentError } from './errors';
 import type {
-  BlockOwner,
   CollectionState,
   FieldSchema,
   JsonObject,
@@ -12,7 +11,6 @@ import type {
   Reference,
   Schedules,
   SchemaState,
-  UniqueValue,
   UploadState,
 } from './types';
 
@@ -21,7 +19,7 @@ export function object(value: unknown): value is Record<string, unknown> {
 }
 
 /** Native integer fields retain arbitrary integers; SDK JSON numbers do not. */
-export function assertIntegerFieldPrecision(
+function assertIntegerFieldPrecision(
   field: Pick<FieldSchema, 'type' | 'localized' | 'apiKey'>,
   value: unknown,
   modelId: string,
@@ -42,39 +40,19 @@ export function assertIntegerFieldPrecision(
   else check(value);
 }
 
-/** Validator metadata must also survive a later exact schema restoration. */
-export function assertMetadataIntegerPrecision(
-  value: unknown,
-  description: string,
-): void {
-  const pending: Array<{ value: unknown; path: string }> = [
-    { value, path: description },
-  ];
-  while (pending.length) {
-    const current = pending.pop()!;
-    if (
-      typeof current.value === 'number' &&
-      Number.isInteger(current.value) &&
-      !Number.isSafeInteger(current.value)
-    )
-      throw new ContentError(
-        'UNSUPPORTED_INTEGER_PRECISION',
-        `Numeric metadata ${current.path} cannot be represented as an exact safe integer.`,
-        { path: current.path },
-      );
-    if (Array.isArray(current.value)) {
-      for (let index = 0; index < current.value.length; index++)
-        pending.push({
-          value: current.value[index],
-          path: `${current.path}[${index}]`,
-        });
-    } else if (object(current.value)) {
-      for (const [key, entry] of Object.entries(current.value))
-        pending.push({ value: entry, path: `${current.path}.${key}` });
-    }
-  }
+/** Sets an own property, including `__proto__`, which plain assignment would treat as the prototype. */
+function assign(target: JsonObject, key: string, value: JsonValue): void {
+  if (key === '__proto__')
+    Object.defineProperty(target, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  else target[key] = value;
 }
 
+/** A copy with sorted keys and without undefined properties. */
 export function json(value: unknown): JsonValue {
   if (
     value === null ||
@@ -88,19 +66,8 @@ export function json(value: unknown): JsonValue {
   if (Array.isArray(value)) return value.map(json);
   if (object(value)) {
     const result: JsonObject = {};
-    for (const key of Object.keys(value).sort()) {
-      if (value[key] !== undefined) {
-        const entry = json(value[key]);
-        if (key === '__proto__')
-          Object.defineProperty(result, key, {
-            value: entry,
-            enumerable: true,
-            configurable: true,
-            writable: true,
-          });
-        else result[key] = entry;
-      }
-    }
+    for (const key of Object.keys(value).sort())
+      if (value[key] !== undefined) assign(result, key, json(value[key]));
     return result;
   }
   throw new ContentError('INVALID_JSON', 'Content contains a non-JSON value.');
@@ -127,7 +94,7 @@ export function string(value: unknown, name: string): string {
   return value;
 }
 
-export function nullableString(value: unknown): string | null {
+function nullableString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
@@ -135,7 +102,7 @@ export function timestamp(value: unknown, name: string): string {
   const text = string(value, name);
   const date = new Date(text);
   if (!Number.isFinite(date.getTime()))
-    throw new ContentError('INVALID_TIMESTAMP', `Invalid ${name}.`);
+    throw new ContentError('INVALID_RESPONSE', `Invalid ${name}.`);
   return date.toISOString();
 }
 
@@ -144,18 +111,20 @@ export function referenceId(value: unknown): string | null {
   return object(value) && typeof value.id === 'string' ? value.id : null;
 }
 
-function blockModelId(value: Record<string, unknown>): string {
-  if (typeof value.__itemTypeId === 'string') return value.__itemTypeId;
-  if (object(value.item_type) && typeof value.item_type.id === 'string')
-    return value.item_type.id;
-  if (object(value.relationships) && object(value.relationships.item_type)) {
-    const data = value.relationships.item_type.data;
-    if (object(data) && typeof data.id === 'string') return data.id;
-  }
-  throw new ContentError(
-    'INVALID_BLOCK',
-    'Nested block has no model identity.',
-  );
+/** The model of a record or block in the CMA's JSON:API shape. */
+function itemTypeId(resource: Record<string, unknown>): string | null {
+  const relationships = resource.relationships;
+  if (!object(relationships) || !object(relationships.item_type)) return null;
+  const data = relationships.item_type.data;
+  return object(data) && typeof data.id === 'string' ? data.id : null;
+}
+
+/** The model of a record resource as the CMA returns it. */
+export function recordModelId(resource: Record<string, unknown>): string {
+  const id = itemTypeId(resource);
+  if (id === null)
+    throw new ContentError('INVALID_RESPONSE', 'Record has no model identity.');
+  return id;
 }
 
 const modelIndexes = new WeakMap<
@@ -164,7 +133,7 @@ const modelIndexes = new WeakMap<
 >();
 
 /** Schemas are immutable during a capture/plan; retain one index per schema. */
-export function modelIndex(schema: SchemaState): Map<string, ModelSchema> {
+function modelIndex(schema: SchemaState): Map<string, ModelSchema> {
   const cached = modelIndexes.get(schema);
   if (
     cached &&
@@ -187,43 +156,65 @@ function model(schema: SchemaState, id: string): ModelSchema {
   return found;
 }
 
-function mapDocumentBlocks(
-  value: JsonValue,
-  map: (entry: JsonValue) => JsonValue,
+/*
+ * Field values come in two shapes, and every walker below accepts exactly one:
+ *
+ * - Native: the CMA's JSON:API record attributes, as `GET /items?nested=true`
+ *   returns them and as write payloads send them. A block is
+ *   `{ type: 'item', id, attributes, relationships: { item_type: { data: { id } } } }`.
+ *   `canonicalFields` reads this shape; `recordPayloadFields` writes it.
+ * - Canonical: what `RecordState` stores. A block is
+ *   `{ id, __itemTypeId, attributes }`, its attributes canonical too.
+ *   `recordPayloadFields` and `recordReferences` read this shape.
+ *
+ * Blocks sit in Modular Content arrays, single block values, and the `item` of
+ * `block`/`inlineBlock` nodes reachable through a DAST value's `document` and
+ * `children`. The SDK's block utilities are asynchronous and resolve block
+ * models through a schema repository, so these synchronous walkers use the
+ * captured schema instead. Each value is copied exactly once: a block's
+ * attributes are copied by the call that converts the block, never by the
+ * levels above it.
+ */
+
+/** A copy of a DAST value whose block items are converted with `block`. */
+function documentValue(
+  node: unknown,
+  block: (value: unknown) => JsonValue,
 ): JsonValue {
-  const copy = json(value);
-  const pending: JsonValue[] = [copy];
-  while (pending.length) {
-    const node = pending.pop();
-    if (!object(node)) continue;
-    if (node.type === 'block' || node.type === 'inlineBlock') {
-      if (!Object.hasOwn(node, 'item'))
-        throw new ContentError(
-          'INVALID_BLOCK',
-          'DAST block is missing its item.',
-        );
-      node.item = map(json(node.item));
-    }
-    if (object(node.document)) {
-      const document = json(node.document);
-      node.document = document;
-      pending.push(document);
-    }
-    if (Array.isArray(node.children)) {
-      for (let index = 0; index < node.children.length; index += 1) {
-        const child = json(node.children[index]);
-        node.children[index] = child;
-        pending.push(child);
-      }
-    }
+  if (!object(node)) return json(node);
+  const isBlock = node.type === 'block' || node.type === 'inlineBlock';
+  if (isBlock && !Object.hasOwn(node, 'item'))
+    throw new ContentError('INVALID_BLOCK', 'DAST block is missing its item.');
+  const result: JsonObject = {};
+  for (const key of Object.keys(node).sort()) {
+    const entry = node[key];
+    if (entry === undefined) continue;
+    assign(
+      result,
+      key,
+      isBlock && key === 'item'
+        ? block(entry)
+        : key === 'document'
+          ? documentValue(entry, block)
+          : key === 'children' && Array.isArray(entry)
+            ? entry.map((child) => documentValue(child, block))
+            : json(entry),
+    );
   }
-  return copy;
+  return result;
 }
 
-function mapBlocks(
-  value: JsonValue,
+const BLOCK_FIELD_TYPES = new Set([
+  'rich_text',
+  'single_block',
+  'structured_text',
+]);
+
+/** A copy of one locale's value of a field, its blocks converted with `block`. */
+function fieldValue(
+  value: unknown,
   type: string,
-  map: (entry: JsonValue) => JsonValue,
+  block: (value: unknown) => JsonValue,
 ): JsonValue {
   if (value === null) return null;
   if (type === 'rich_text') {
@@ -232,115 +223,196 @@ function mapBlocks(
         'INVALID_BLOCK',
         'Modular Content must be an array.',
       );
-    return value.map(map);
+    return value.map(block);
   }
-  if (type === 'single_block') return value === null ? null : map(value);
-  if (type === 'structured_text') return mapDocumentBlocks(value, map);
+  if (type === 'single_block') return block(value);
+  if (type === 'structured_text') return documentValue(value, block);
   return json(value);
 }
 
+/** A copy of a record's or block's fields in schema order. */
 function mapFields(
   fields: Record<string, unknown>,
   modelId: string,
   schema: SchemaState,
-  transform: (value: JsonValue) => JsonValue,
+  block: (value: unknown) => JsonValue,
 ): JsonObject {
   const result: JsonObject = {};
   for (const field of model(schema, modelId).fields) {
+    const value = fields[field.apiKey] ?? null;
     // A rounded native integer remains outside the safe range. Refuse it
     // before fingerprinting or writing; JSON strings and float fields retain
     // their distinct native semantics, including inside nested blocks.
-    assertIntegerFieldPrecision(field, fields[field.apiKey], modelId);
-    const value =
-      fields[field.apiKey] === undefined ? null : json(fields[field.apiKey]);
-    if (field.localized && value !== null) {
-      if (!object(value))
-        throw new ContentError(
-          'INVALID_LOCALE',
-          `Field ${field.apiKey} is not locale-keyed.`,
-        );
+    assertIntegerFieldPrecision(field, value, modelId);
+    if (field.localized && object(value)) {
       const locales: JsonObject = {};
       for (const locale of Object.keys(value).sort())
-        locales[locale] = mapBlocks(json(value[locale]), field.type, transform);
+        if (value[locale] !== undefined)
+          locales[locale] = fieldValue(value[locale], field.type, block);
       result[field.apiKey] = locales;
     } else {
-      result[field.apiKey] = mapBlocks(value, field.type, transform);
+      result[field.apiKey] = fieldValue(value, field.type, block);
     }
   }
   return result;
 }
 
+/** Canonical fields from native record or block attributes. */
 export function canonicalFields(
   fields: Record<string, unknown>,
   modelId: string,
   schema: SchemaState,
 ): JsonObject {
   return mapFields(fields, modelId, schema, (value) => {
-    if (!object(value))
+    if (!object(value) || !object(value.attributes))
       throw new ContentError(
         'INVALID_BLOCK',
         'Nested read returned a block reference without its content.',
       );
-    const id = string(value.id, 'block ID');
-    const typeId = blockModelId(value);
-    if (!model(schema, typeId).block)
+    const typeId = itemTypeId(value);
+    if (typeId === null)
       throw new ContentError(
         'INVALID_BLOCK',
-        'Nested content references a regular record model.',
+        'Nested block has no model identity.',
       );
-    const attributes = object(value.attributes) ? value.attributes : value;
     return {
-      id,
+      id: string(value.id, 'block ID'),
       __itemTypeId: typeId,
-      attributes: canonicalFields(attributes, typeId, schema),
+      attributes: canonicalFields(value.attributes, typeId, schema),
     };
   });
 }
 
+/** The parts of a canonical block, or an INVALID_BLOCK error. */
+function canonicalBlock(value: unknown): {
+  id: string;
+  modelId: string;
+  attributes: JsonObject;
+} {
+  if (
+    !object(value) ||
+    typeof value.__itemTypeId !== 'string' ||
+    !object(value.attributes)
+  )
+    throw new ContentError('INVALID_BLOCK', 'Block content is missing.');
+  return {
+    id: string(value.id, 'block ID'),
+    modelId: value.__itemTypeId,
+    attributes: value.attributes as JsonObject,
+  };
+}
+
+/** Native CMA write payload fields from canonical fields. */
 export function recordPayloadFields(
   fields: JsonObject,
   modelId: string,
   schema: SchemaState,
-  options: { validation?: boolean } = {},
-): JsonObject {
-  return payloadFields(fields, modelId, schema, options);
-}
-
-function payloadFields(
-  fields: JsonObject,
-  modelId: string,
-  schema: SchemaState,
-  options: { validation?: boolean },
   nativeBlocks?: WeakSet<object>,
 ): JsonObject {
-  return mapFields(fields, modelId, schema, (value) => {
-    if (!object(value))
-      throw new ContentError(
-        'INVALID_BLOCK',
-        'Executable block is not an object.',
-      );
-    const typeId = blockModelId(value);
-    if (!model(schema, typeId).block)
-      throw new ContentError(
-        'INVALID_BLOCK',
-        'Executable block references a regular record model.',
-      );
-    const attributes = object(value.attributes) ? value.attributes : value;
-    const result: JsonObject = {
+  return mapFields(fields, modelId, schema, (value) =>
+    nativeBlock(value, schema, nativeBlocks),
+  );
+}
+
+/** A canonical block as a complete native block. */
+function nativeBlock(
+  value: unknown,
+  schema: SchemaState,
+  nativeBlocks?: WeakSet<object>,
+): JsonObject {
+  const block = canonicalBlock(value);
+  const result: JsonObject = {
+    type: 'item',
+    id: block.id,
+    attributes: recordPayloadFields(
+      block.attributes,
+      block.modelId,
+      schema,
+      nativeBlocks,
+    ),
+    relationships: {
+      item_type: { data: { type: 'item_type', id: block.modelId } },
+    },
+  };
+  nativeBlocks?.add(result);
+  return result;
+}
+
+/**
+ * Native CMA update payload for the fields of `after` that differ from
+ * `before`. Inside a changed field, a block that keeps its ID and model in the
+ * same field and locale is sent as its bare ID when unchanged, or as
+ * `{ type, id, attributes }` with only its changed attributes; the CMA keeps
+ * an existing block's other content. New blocks are sent in full.
+ */
+export function recordUpdatePayloadFields(
+  before: JsonObject | null,
+  after: JsonObject,
+  modelId: string,
+  schema: SchemaState,
+): JsonObject {
+  const result: JsonObject = {};
+  for (const field of model(schema, modelId).fields) {
+    const key = field.apiKey;
+    if (!Object.hasOwn(after, key)) continue;
+    const value = after[key] ?? null;
+    const known = before !== null && Object.hasOwn(before, key);
+    const previous = known ? before[key] : null;
+    if (known && hashJson(previous) === hashJson(value)) continue;
+    assertIntegerFieldPrecision(field, value, modelId);
+    const convert = (next: unknown, old: unknown) =>
+      fieldValue(next, field.type, updatedBlock(old, field.type, schema));
+    if (field.localized && object(value)) {
+      const locales: JsonObject = {};
+      for (const locale of Object.keys(value).sort())
+        if (value[locale] !== undefined)
+          locales[locale] = convert(
+            value[locale],
+            object(previous) ? previous[locale] : null,
+          );
+      result[key] = locales;
+    } else {
+      result[key] = convert(value, previous);
+    }
+  }
+  return result;
+}
+
+/** Converts the blocks of a field's new value against its previous value. */
+function updatedBlock(
+  previous: unknown,
+  type: string,
+  schema: SchemaState,
+): (value: unknown) => JsonValue {
+  const existing = new Map<string, ReturnType<typeof canonicalBlock>>();
+  if (
+    BLOCK_FIELD_TYPES.has(type) &&
+    previous !== null &&
+    previous !== undefined
+  )
+    fieldValue(previous, type, (value) => {
+      const block = canonicalBlock(value);
+      existing.set(block.id, block);
+      return null;
+    });
+  return (value) => {
+    const block = canonicalBlock(value);
+    const old = existing.get(block.id);
+    if (!old || old.modelId !== block.modelId)
+      return nativeBlock(value, schema);
+    if (hashJson(old.attributes) === hashJson(block.attributes))
+      return block.id;
+    return {
       type: 'item',
-      attributes: payloadFields(
-        jsonObject(attributes),
-        typeId,
+      id: block.id,
+      attributes: recordUpdatePayloadFields(
+        old.attributes,
+        block.attributes,
+        block.modelId,
         schema,
-        options,
-        nativeBlocks,
       ),
-      relationships: { item_type: { data: { type: 'item_type', id: typeId } } },
     };
-    if (!options.validation) result.id = string(value.id, 'block ID');
-    nativeBlocks?.add(result);
-    return result;
-  });
+  };
 }
 
 /** Report content the SDK's recursive item request/response adapters mishandle. */
@@ -357,7 +429,7 @@ export function unsupportedRecordPayloadKey(
   // mistaken for a record by the SDK response adapter after a successful write.
   const nativeBlocks = new WeakSet<object>();
   const pending: JsonValue[] = [
-    payloadFields(fields, modelId, schema, {}, nativeBlocks),
+    recordPayloadFields(fields, modelId, schema, nativeBlocks),
   ];
   while (pending.length) {
     const value = pending.pop();
@@ -393,13 +465,9 @@ export function recordHash(
 export function recordGuard(record: RecordState): RecordGuard {
   return {
     hash: record.hash,
-    modelId: record.modelId,
     currentVersion: record.currentVersion,
     publishedUpdatedAt: record.publishedUpdatedAt,
-    parentId: record.parentId,
     position: record.position,
-    schedules: record.schedules,
-    validity: record.validity,
   };
 }
 
@@ -409,7 +477,7 @@ export function recordGuard(record: RecordState): RecordGuard {
  * moves the published version's update time. Schedules are compared by time,
  * which is all a plain listing exposes.
  */
-function versionFingerprint(fields: {
+interface RecordVersion {
   modelId: string;
   currentVersion: string | null;
   publishedUpdatedAt: string | null;
@@ -421,13 +489,11 @@ function versionFingerprint(fields: {
   stage: string | null;
   publicationAt: string | null;
   unpublishingAt: string | null;
-}): string {
-  return hashJson(fields);
 }
 
 /** The version fingerprint of a fully read record. */
 export function stateFingerprint(record: RecordState): string {
-  return versionFingerprint({
+  const version: RecordVersion = {
     modelId: record.modelId,
     currentVersion: record.currentVersion,
     publishedUpdatedAt: record.publishedUpdatedAt,
@@ -439,154 +505,138 @@ export function stateFingerprint(record: RecordState): string {
     stage: record.stage,
     publicationAt: record.schedules.publication?.at ?? null,
     unpublishingAt: record.schedules.unpublishing?.at ?? null,
-  });
+  };
+  return hashJson(version);
+}
+
+type NativeRecord = Record<string, unknown> & {
+  id: string;
+  attributes: Record<string, unknown>;
+  meta: Record<string, unknown>;
+};
+
+/** A record resource as the CMA returns it: `id`, `attributes`, `meta` and its model relationship. */
+function nativeRecord(value: unknown, name: string): NativeRecord {
+  if (!object(value) || !object(value.attributes) || !object(value.meta))
+    throw new ContentError('INVALID_RESPONSE', `${name} record is malformed.`);
+  string(value.id, 'record ID');
+  return value as NativeRecord;
+}
+
+function optionalTimestamp(value: unknown, name: string): string | null {
+  return value === null || value === undefined ? null : timestamp(value, name);
 }
 
 /**
- * The version fingerprint of a record from a plain listing of its current
- * version and, when published, its published version. Values are normalized
- * exactly as canonicalRecord and the schedule reader normalize them.
+ * The version of a record from its native current resource and, when
+ * published, its published resource. A plain listing and a full read yield
+ * the same version for the same record.
  */
-export function listingFingerprint(
-  current: unknown,
-  published: unknown | null,
-): string {
-  if (!object(current) || !object(current.meta))
-    throw new ContentError('INVALID_RESPONSE', 'Record has no metadata.');
-  const meta = current.meta;
-  const attributes = object(current.attributes) ? current.attributes : current;
-  const pub = published === null ? null : jsonObject(published);
-  const scheduled = (value: unknown, label: string) =>
-    value === null || value === undefined ? null : timestamp(value, label);
-  return versionFingerprint({
-    modelId: blockModelId(current),
+function nativeVersion(
+  current: NativeRecord,
+  published: NativeRecord | null,
+): RecordVersion {
+  const { meta, attributes } = current;
+  const modelId = recordModelId(current);
+  if (
+    published &&
+    (published.id !== current.id || recordModelId(published) !== modelId)
+  )
+    throw new ContentError(
+      'INVALID_RESPONSE',
+      'Published record identity is inconsistent.',
+    );
+  return {
+    modelId,
     currentVersion: nullableString(meta.current_version),
-    publishedUpdatedAt:
-      pub && object(pub.meta) ? nullableString(pub.meta.updated_at) : null,
-    published: pub !== null,
+    publishedUpdatedAt: published
+      ? nullableString(published.meta.updated_at)
+      : null,
+    published: published !== null,
     createdAt: timestamp(meta.created_at, 'creation timestamp'),
-    firstPublishedAt: scheduled(
+    firstPublishedAt: optionalTimestamp(
       meta.first_published_at,
       'first publication timestamp',
     ),
     parentId: nullableString(attributes.parent_id),
     position:
-      typeof attributes.position === 'number'
-        ? Number(attributes.position)
-        : null,
+      typeof attributes.position === 'number' ? attributes.position : null,
     stage: nullableString(meta.stage),
-    publicationAt: scheduled(
+    publicationAt: optionalTimestamp(
       meta.publication_scheduled_at,
       'publication marker',
     ),
-    unpublishingAt: scheduled(
+    unpublishingAt: optionalTimestamp(
       meta.unpublishing_scheduled_at,
       'unpublishing marker',
     ),
-  });
+  };
 }
 
+/**
+ * The version fingerprint of a record from a plain listing of its current
+ * version and, when published, its published version.
+ */
+export function listingFingerprint(
+  current: unknown,
+  published: unknown | null,
+): string {
+  return hashJson(
+    nativeVersion(
+      nativeRecord(current, 'Current'),
+      published === null ? null : nativeRecord(published, 'Published'),
+    ),
+  );
+}
+
+/** A record's state from its native current and published resources. */
 export function canonicalRecord(
   current: unknown,
   published: unknown | null,
   schema: SchemaState,
   schedules: Schedules = { publication: null, unpublishing: null },
 ): RecordState {
-  if (!object(current) || !object(current.meta))
-    throw new ContentError('INVALID_RESPONSE', 'Record has no metadata.');
-  const id = string(current.id, 'record ID');
-  const modelId = blockModelId(current);
-  const meta = current.meta;
-  if (typeof meta.is_current_version_valid !== 'boolean')
-    throw new ContentError('INVALID_RESPONSE', 'Record validity is missing.');
-  const pub = published === null ? null : jsonObject(published);
-  if (
-    pub &&
-    (pub.id !== id || blockModelId(pub) !== modelId || !object(pub.meta))
-  ) {
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Published record identity is inconsistent.',
-    );
-  }
-  if (pub && typeof meta.is_published_version_valid !== 'boolean')
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Published record validity is missing.',
-    );
+  const native = nativeRecord(current, 'Current');
+  const pub = published === null ? null : nativeRecord(published, 'Published');
+  const version = nativeVersion(native, pub);
   const state: RecordState = {
-    id,
-    modelId,
-    current: canonicalFields(
-      object(current.attributes) ? current.attributes : current,
-      modelId,
-      schema,
-    ),
+    id: native.id,
+    modelId: version.modelId,
+    current: canonicalFields(native.attributes, version.modelId, schema),
     published: pub
-      ? canonicalFields(
-          object(pub.attributes) ? pub.attributes : pub,
-          modelId,
-          schema,
-        )
+      ? canonicalFields(pub.attributes, version.modelId, schema)
       : null,
-    currentVersion: nullableString(meta.current_version),
-    publishedUpdatedAt:
-      pub && object(pub.meta) ? nullableString(pub.meta.updated_at) : null,
-    createdAt: timestamp(meta.created_at, 'creation timestamp'),
-    firstPublishedAt:
-      meta.first_published_at === null || meta.first_published_at === undefined
-        ? null
-        : timestamp(meta.first_published_at, 'first publication timestamp'),
-    parentId: nullableString(
-      object(current.attributes)
-        ? current.attributes.parent_id
-        : current.parent_id,
-    ),
-    position:
-      typeof (object(current.attributes)
-        ? current.attributes.position
-        : current.position) === 'number'
-        ? Number(
-            object(current.attributes)
-              ? current.attributes.position
-              : current.position,
-          )
-        : null,
-    stage: nullableString(meta.stage),
+    currentVersion: version.currentVersion,
+    publishedUpdatedAt: version.publishedUpdatedAt,
+    createdAt: version.createdAt,
+    firstPublishedAt: version.firstPublishedAt,
+    parentId: version.parentId,
+    position: version.position,
+    stage: version.stage,
     schedules,
-    validity: {
-      current: meta.is_current_version_valid,
-      published: pub ? meta.is_published_version_valid === true : null,
-    },
     hash: '',
   };
+  const invalid = {
+    current: native.meta.is_current_version_valid === false,
+    published: native.meta.is_published_version_valid === false,
+  };
+  if (invalid.current || invalid.published) state.invalid = invalid;
   state.hash = recordHash(state);
   return state;
 }
 
+/**
+ * An upload as the SDK's `uploads.list` returns it: flat attributes,
+ * `upload_collection` as `{ id }` or null, and `default_field_metadata`
+ * field-keyed in every environment.
+ */
 export function canonicalUpload(input: unknown): UploadState {
   if (!object(input))
     throw new ContentError('INVALID_RESPONSE', 'Upload is not an object.');
   const id = string(input.id, 'upload ID');
-  const collection =
-    object(input.relationships) && object(input.relationships.upload_collection)
-      ? referenceId(input.relationships.upload_collection.data)
-      : referenceId(input.upload_collection);
-  const resource = object(input.attributes)
-    ? { ...input.attributes, id }
-    : input;
-  if (!object(resource))
-    throw new ContentError(
-      'INVALID_RESPONSE',
-      'Upload attributes are missing.',
-    );
-  const basename = string(resource.basename, 'upload basename');
-  const format = nullableString(resource.format);
-  const filename =
-    typeof resource.filename === 'string'
-      ? resource.filename
-      : `${basename}${format ? `.${format}` : ''}`;
-  const attributes: JsonObject = { basename };
+  const attributes: JsonObject = {
+    basename: string(input.basename, 'upload basename'),
+  };
   for (const key of [
     'author',
     'copyright',
@@ -594,64 +644,25 @@ export function canonicalUpload(input: unknown): UploadState {
     'tags',
     'default_field_metadata',
   ]) {
-    if (resource[key] !== undefined) attributes[key] = json(resource[key]);
+    if (input[key] !== undefined) attributes[key] = json(input[key]);
   }
-  const metadata = attributes.default_field_metadata;
-  if (object(metadata) && !Object.hasOwn(metadata, 'focal_point')) {
-    const alt: JsonObject = {};
-    const title: JsonObject = {};
-    const customData: JsonObject = {};
-    let focalPoint: JsonValue = null;
-    let posterTime: JsonValue = null;
-    let first = true;
-    for (const [locale, entry] of Object.entries(metadata)) {
-      if (!object(entry))
-        throw new ContentError(
-          'INVALID_RESPONSE',
-          'Upload locale metadata is invalid.',
-        );
-      alt[locale] = json(entry.alt);
-      title[locale] = json(entry.title);
-      customData[locale] = json(entry.custom_data);
-      if (first) {
-        focalPoint = json(entry.focal_point);
-        posterTime = json(entry.poster_time);
-        first = false;
-      } else if (
-        stableStringify(entry.focal_point) !== stableStringify(focalPoint) ||
-        stableStringify(entry.poster_time) !== stableStringify(posterTime)
-      ) {
-        throw new ContentError(
-          'UNSUPPORTED_UPLOAD_METADATA',
-          'Upload focal point or poster time differs between locales and cannot be reproduced through the CMA client.',
-        );
-      }
-    }
-    attributes.default_field_metadata = {
-      alt,
-      title,
-      custom_data: customData,
-      focal_point: focalPoint,
-      poster_time: posterTime,
-    };
-  }
+  if (typeof input.size !== 'number')
+    throw new ContentError('INVALID_RESPONSE', 'Upload size is missing.');
   const state: UploadState = {
     id,
-    md5: string(resource.md5, 'upload checksum').toLowerCase(),
-    size: typeof resource.size === 'number' ? resource.size : -1,
-    url: string(resource.url, 'upload URL'),
-    filename,
-    collectionId: collection,
+    md5: string(input.md5, 'upload checksum').toLowerCase(),
+    size: input.size,
+    url: string(input.url, 'upload URL'),
+    filename: string(input.filename, 'upload filename'),
+    collectionId: referenceId(input.upload_collection),
     attributes,
     hash: '',
   };
-  if (state.size < 0)
-    throw new ContentError('INVALID_RESPONSE', 'Upload size is missing.');
   state.hash = hashJson({
     id,
     md5: state.md5,
     size: state.size,
-    filename,
+    filename: state.filename,
     collectionId: state.collectionId,
     attributes,
   });
@@ -669,64 +680,38 @@ export function collectionHash(
   });
 }
 
+/** An upload collection as the SDK's `uploadCollections.list` returns it. */
 export function canonicalCollection(resource: unknown): CollectionState {
   if (!object(resource))
     throw new ContentError(
       'INVALID_RESPONSE',
       'Upload collection is not an object.',
     );
-  const attributes = object(resource.attributes)
-    ? resource.attributes
-    : resource;
-  const parent =
-    object(resource.relationships) && object(resource.relationships.parent)
-      ? resource.relationships.parent.data
-      : resource.parent;
-  if (
-    typeof attributes.position !== 'number' ||
-    !Number.isSafeInteger(attributes.position)
-  )
+  if (typeof resource.position !== 'number')
     throw new ContentError(
       'INVALID_RESPONSE',
-      'Upload collection position is missing or invalid.',
+      'Upload collection position is missing.',
     );
   const state = {
     id: string(resource.id, 'collection ID'),
-    label: string(attributes.label, 'collection label'),
-    parentId: referenceId(parent),
-    position: attributes.position,
+    label: string(resource.label, 'collection label'),
+    parentId: referenceId(resource.parent),
+    position: resource.position,
     hash: '',
   };
   state.hash = collectionHash(state);
   return state;
 }
 
-function fieldRequired(field: FieldSchema): boolean {
-  if (Object.hasOwn(field.validators, 'required')) return true;
-  for (const key of ['size', 'length']) {
-    const validator = field.validators[key];
-    if (
-      object(validator) &&
-      typeof validator.min === 'number' &&
-      validator.min > 0
-    )
-      return true;
-  }
-  return false;
-}
-
-export function inspectRecord(
+/**
+ * Every record, upload and parent a record's current and published fields
+ * refer to, including references held inside nested blocks.
+ */
+export function recordReferences(
   record: RecordState,
   schema: SchemaState,
-): {
-  references: Reference[];
-  blockOwners: BlockOwner[];
-  uniqueValues: UniqueValue[];
-} {
+): Reference[] {
   const references: Reference[] = [];
-  const blockOwners: BlockOwner[] = [];
-  const uniqueValues: UniqueValue[] = [];
-  const models = modelIndex(schema);
   for (const slice of ['current', 'published'] as const) {
     const rootFields = record[slice];
     if (rootFields === null) continue;
@@ -734,26 +719,18 @@ export function inspectRecord(
       fields: JsonObject;
       modelId: string;
       path: string;
-      required: boolean;
-    }> = [
-      { fields: rootFields, modelId: record.modelId, path: '', required: true },
-    ];
+    }> = [{ fields: rootFields, modelId: record.modelId, path: '' }];
     while (pending.length) {
       const owner = pending.pop();
       if (!owner) break;
-      const ownerModel = models.get(owner.modelId);
-      if (!ownerModel)
-        throw new ContentError('INVALID_MODEL', 'Block model is missing.');
-      for (const field of ownerModel.fields) {
+      for (const field of model(schema, owner.modelId).fields) {
         const raw = owner.fields[field.apiKey] ?? null;
         const values: Array<[string, unknown]> =
           field.localized && object(raw) ? Object.entries(raw) : [['', raw]];
-        for (const [locale, unknownValue] of values) {
-          const value = json(unknownValue);
+        for (const [locale, value] of values) {
           const path = `${owner.path}${field.apiKey}${
             locale ? `.${locale}` : ''
           }`;
-          const required = owner.required && fieldRequired(field);
           const add = (targetId: string, kind: Reference['kind']) =>
             references.push({
               ownerId: record.id,
@@ -761,29 +738,13 @@ export function inspectRecord(
               kind,
               path,
               fieldId: field.id,
-              required,
             });
-          const block = (entry: JsonValue) => {
-            if (!object(entry))
-              throw new ContentError(
-                'INVALID_BLOCK',
-                'Block content is missing.',
-              );
-            const blockId = string(entry.id, 'block ID');
-            const blockType = blockModelId(entry);
-            const blockPath = `${path}.block:${blockId}`;
-            blockOwners.push({
-              blockId,
-              recordId: record.id,
-              modelId: blockType,
-              path,
-              slice,
-            });
+          const block = (entry: unknown) => {
+            const { id, modelId, attributes } = canonicalBlock(entry);
             pending.push({
-              fields: jsonObject(entry.attributes),
-              modelId: blockType,
-              path: `${blockPath}.`,
-              required,
+              fields: attributes,
+              modelId,
+              path: `${path}.block:${id}.`,
             });
           };
           if (field.type === 'link') {
@@ -815,44 +776,19 @@ export function inspectRecord(
           } else if (field.type === 'single_block' && value !== null) {
             block(value);
           } else if (field.type === 'structured_text') {
-            const nodes: JsonValue[] = [value];
+            const nodes: unknown[] = [value];
             while (nodes.length) {
               const node = nodes.pop();
               if (!object(node)) continue;
               if (node.type === 'block' || node.type === 'inlineBlock')
-                block(json(node.item));
+                block(node.item);
               else if (node.type === 'inlineItem' || node.type === 'itemLink') {
                 const target = referenceId(node.item);
                 if (target) add(target, slice);
               }
-              if (object(node.document)) nodes.push(json(node.document));
-              if (Array.isArray(node.children))
-                for (const child of node.children) nodes.push(json(child));
+              if (object(node.document)) nodes.push(node.document);
+              if (Array.isArray(node.children)) nodes.push(...node.children);
             }
-          }
-          if (
-            ownerModel.id === record.modelId &&
-            Object.hasOwn(field.validators, 'unique') &&
-            value !== null &&
-            // Native uniqueness excludes Rails blank strings. Unicode space
-            // includes NEL but excludes BOM, unlike JavaScript trim().
-            !(typeof value === 'string' && /^\p{White_Space}*$/u.test(value))
-          ) {
-            const rule = field.validators.unique;
-            const normalized =
-              typeof value === 'string' &&
-              object(rule) &&
-              rule.case_sensitive === false
-                ? value.toLowerCase()
-                : value;
-            uniqueValues.push({
-              recordId: record.id,
-              modelId: record.modelId,
-              fieldId: field.id,
-              locale,
-              slice,
-              valueKey: stableStringify(normalized),
-            });
           }
         }
       }
@@ -864,8 +800,7 @@ export function inspectRecord(
         kind: slice,
         path: 'parentId',
         fieldId: '',
-        required: true,
       });
   }
-  return { references, blockOwners, uniqueValues };
+  return references;
 }

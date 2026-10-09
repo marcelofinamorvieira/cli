@@ -1,7 +1,5 @@
 import type { CmaClient } from '@datocms/cli-utils';
 import {
-  assertIntegerFieldPrecision,
-  assertMetadataIntegerPrecision,
   hashJson,
   json,
   jsonObject,
@@ -9,27 +7,13 @@ import {
   referenceId,
   string,
 } from './codec';
+import { compareIds } from './compare-ids';
 import { ContentError } from './errors';
-import type { SnapshotStore } from './store';
 import type { Client, JsonObject, ModelSchema, SchemaState } from './types';
-
-// Code unit order, like SQLite, so bundles do not depend on the machine locale.
-export const compareIds = (a: string, b: string): number =>
-  a < b ? -1 : a > b ? 1 : 0;
 
 export function schemaHash(
   schema: Pick<SchemaState, 'locales' | 'semantics' | 'models' | 'workflows'>,
 ): string {
-  // Field settings may be restored during apply, including an imported bundle.
-  // A rounded integer must not become an apparently exact schema guard.
-  for (const model of schema.models)
-    for (const field of model.fields) {
-      assertIntegerFieldPrecision(field, field.defaultValue, model.id);
-      assertMetadataIntegerPrecision(
-        field.validators,
-        `Validators for ${model.id}.${field.apiKey}`,
-      );
-    }
   return hashJson({
     locales: schema.locales,
     semantics: schema.semantics,
@@ -44,7 +28,7 @@ export async function fetchSchema(
   project?: (schema: SchemaState) => SchemaState,
 ): Promise<SchemaState> {
   // Every consistency check makes a fresh bulk read. A retained SDK schema
-  // cache would hide concurrent changes or our temporary field settings.
+  // cache would hide concurrent changes.
   const results = await Promise.allSettled([
     client.site.rawFind({ include: 'item_types,item_types.fields' }),
     client.workflows.list(),
@@ -118,23 +102,11 @@ export async function fetchSchema(
       fields: fields
         .map((resource) => {
           const field = resource.attributes;
-          const shape = {
+          return {
+            id: resource.id,
             apiKey: field.api_key,
             type: field.field_type,
             localized: field.localized,
-          };
-          assertIntegerFieldPrecision(
-            shape,
-            field.default_value,
-            resource.relationships.item_type.data.id,
-          );
-          assertMetadataIntegerPrecision(
-            field.validators,
-            `Validators for ${resource.relationships.item_type.data.id}.${field.api_key}`,
-          );
-          return {
-            id: resource.id,
-            ...shape,
             validators: jsonObject(field.validators),
             defaultValue:
               field.default_value === undefined
@@ -172,18 +144,16 @@ export async function fetchSchema(
     semantics,
     models: normalized.sort((a, b) => compareIds(a.id, b.id)),
     workflows: workflows
-      .map((workflow) =>
-        jsonObject({
-          id: workflow.id,
-          apiKey: workflow.api_key,
-          stages: workflow.stages.map((stage) => ({
-            id: stage.id,
-            name: stage.name,
-            initial: stage.initial === true,
-          })),
-        }),
-      )
-      .sort((a, b) => compareIds(String(a.id), String(b.id))),
+      .map((workflow) => ({
+        id: workflow.id,
+        apiKey: workflow.api_key,
+        stages: workflow.stages.map((stage) => ({
+          id: stage.id,
+          name: stage.name,
+          initial: stage.initial === true,
+        })),
+      }))
+      .sort((a, b) => compareIds(a.id, b.id)),
     hash: '',
   };
   schema.hash = schemaHash(schema);
@@ -243,15 +213,6 @@ async function effectivePermissions(
   return jsonObject(role.meta.final_permissions);
 }
 
-export async function assertSchemaEditAccess(client: Client): Promise<void> {
-  const permissions = await effectivePermissions(client);
-  if (permissions && permissions.can_edit_schema !== true)
-    throw new ContentError(
-      'UNPROVEN_SCHEMA_EDIT_ACCESS',
-      'Temporary field changes require proven schema editing permission.',
-    );
-}
-
 export async function assertFullReadAccess(
   client: Client,
   schema: SchemaState,
@@ -298,109 +259,5 @@ export async function assertFullReadAccess(
     throw new ContentError(
       'UNPROVEN_FULL_ACCESS',
       `Cannot prove unrestricted upload reads in ${schema.environmentId}.`,
-    );
-}
-
-/** Reject unproven mutation authority before an in-place run can partially write. */
-export async function assertApplyAccess(
-  client: Client,
-  schema: SchemaState,
-  store: SnapshotStore,
-  inPlace: boolean,
-  managedModelIds?: readonly string[],
-): Promise<void> {
-  const models = new Set<string>();
-  for (const row of store.database
-    .prepare(
-      "SELECT DISTINCT model_id FROM plan WHERE kind='record' AND action IN ('create','update','delete') OR kind='record' AND json_extract(data,'$.guard.schedules.publication') IS NOT NULL OR kind='record' AND json_extract(data,'$.guard.schedules.unpublishing') IS NOT NULL",
-    )
-    .iterate()) {
-    const id = String(row.model_id);
-    if (!managedModelIds || managedModelIds.includes(id)) models.add(id);
-  }
-  const changed = (kind: string) =>
-    !!store.database
-      .prepare(
-        "SELECT 1 FROM plan WHERE kind=? AND action IN ('create','update','delete') LIMIT 1",
-      )
-      .get(kind);
-  return assertDirectApplyAccess(client, schema, {
-    modelIds: [...models],
-    uploads: changed('upload'),
-    collections: changed('collection'),
-    inPlace,
-  });
-}
-
-/** Prove permission for the declared generation scope; edited calls remain subject to CMA permissions. */
-export async function assertDirectApplyAccess(
-  client: Client,
-  schema: SchemaState,
-  scope: {
-    modelIds: readonly string[];
-    uploads: boolean;
-    collections: boolean;
-    inPlace: boolean;
-  },
-): Promise<void> {
-  const permissions = await effectivePermissions(client);
-  if (!permissions) return;
-  if (!scope.inPlace && permissions.can_manage_environments !== true)
-    throw new ContentError(
-      'UNPROVEN_APPLY_ACCESS',
-      'Fresh-fork execution requires proven environment management permission.',
-    );
-  const unrestricted = (rule: Record<string, unknown>) =>
-    rule.action === 'all' &&
-    rule.environment === schema.environmentId &&
-    rule.on_creator === 'anyone' &&
-    !rule.on_stage &&
-    !rule.to_stage &&
-    (rule.localization_scope === undefined ||
-      rule.localization_scope === null ||
-      rule.localization_scope === 'all');
-  const positives = rules(permissions.positive_item_type_permissions);
-  const negatives = rules(permissions.negative_item_type_permissions);
-  for (const id of scope.modelIds) {
-    const model = schema.models.find((entry) => entry.id === id);
-    if (!model)
-      throw new ContentError(
-        'INVALID_BUNDLE',
-        'A mutation model is absent from the destination schema.',
-      );
-    const matches = (rule: Record<string, unknown>) =>
-      rule.item_type
-        ? rule.item_type === model.id
-        : rule.workflow
-          ? rule.workflow === model.workflowId
-          : true;
-    if (
-      !positives.some((rule) => unrestricted(rule) && matches(rule)) ||
-      negatives.some(
-        (rule) => rule.environment === schema.environmentId && matches(rule),
-      )
-    )
-      throw new ContentError(
-        'UNPROVEN_APPLY_ACCESS',
-        `Cannot prove unrestricted mutations for model ${model.apiKey}.`,
-      );
-  }
-  if (
-    scope.uploads &&
-    (!rules(permissions.positive_upload_permissions).some(
-      (rule) => unrestricted(rule) && !rule.upload_collection,
-    ) ||
-      rules(permissions.negative_upload_permissions).some(
-        (rule) => rule.environment === schema.environmentId,
-      ))
-  )
-    throw new ContentError(
-      'UNPROVEN_APPLY_ACCESS',
-      'Cannot prove unrestricted upload mutations.',
-    );
-  if (scope.collections && permissions.can_manage_upload_collections !== true)
-    throw new ContentError(
-      'UNPROVEN_APPLY_ACCESS',
-      'Cannot prove upload collection mutation permission.',
     );
 }

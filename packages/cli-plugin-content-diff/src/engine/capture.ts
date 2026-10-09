@@ -1,26 +1,24 @@
 import { createHash } from 'node:crypto';
 import { setImmediate } from 'node:timers/promises';
-import { batches, boundedWork } from './apply-work';
+import { CmaClient } from '@datocms/cli-utils';
+import { batches, boundedWork } from './bounded-work';
 import { assertNotAborted } from './cancellation';
 import {
   canonicalCollection,
-  canonicalFields,
   canonicalRecord,
   canonicalUpload,
-  hashJson,
-  inspectRecord,
   listingFingerprint,
-  nullableString,
   object,
   recordGuard,
-  recordHash,
+  recordModelId,
   stableStringify,
   stateFingerprint,
   string,
   timestamp,
 } from './codec';
+import { compareIds } from './compare-ids';
 import { ContentError } from './errors';
-import { assertFullReadAccess, compareIds, fetchSchema } from './schema';
+import { assertFullReadAccess, fetchSchema } from './schema';
 import { SnapshotStore } from './store';
 import type {
   CaptureOptions,
@@ -33,16 +31,6 @@ import type {
 } from './types';
 
 type RecordPageQuery = Parameters<Client['items']['rawList']>[0];
-
-/** The model of a raw record resource, without canonicalizing the record. */
-function rawModelId(row: Record<string, unknown>): string {
-  const data =
-    object(row.relationships) && object(row.relationships.item_type)
-      ? row.relationships.item_type.data
-      : row.item_type;
-  if (object(data) && typeof data.id === 'string') return data.id;
-  throw new ContentError('INVALID_RESPONSE', 'Record has no model identity.');
-}
 
 /**
  * The nested flag only expands block fields, so a model without them reads
@@ -91,7 +79,7 @@ async function pages(
   concurrency: number,
   consume: (rows: unknown[]) => void,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<number> {
   assertNotAborted(signal);
   const first = pageBody(await read(0));
   const total = first.total;
@@ -118,12 +106,13 @@ async function pages(
     assertNotAborted(signal);
     accept(await read(offset), offset);
   });
+  return total;
 }
 
 function locales(value: unknown): string[] {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string'))
     throw new ContentError(
-      'SCHEDULE_CONTRACT',
+      'INVALID_RESPONSE',
       'Exact schedule locales are unavailable.',
     );
   return [...value].sort();
@@ -139,12 +128,12 @@ function scheduleResource(
     !Array.isArray(body.included)
   )
     throw new ContentError(
-      'SCHEDULE_CONTRACT',
+      'INVALID_RESPONSE',
       'Exact schedule relationships are unavailable.',
     );
   const relation = body.data.relationships[key];
   if (!object(relation) || !Object.hasOwn(relation, 'data'))
-    throw new ContentError('SCHEDULE_CONTRACT', `Missing ${key} relationship.`);
+    throw new ContentError('INVALID_RESPONSE', `Missing ${key} relationship.`);
   if (relation.data === null) return null;
   if (
     !object(relation.data) ||
@@ -152,7 +141,7 @@ function scheduleResource(
     typeof relation.data.id !== 'string'
   )
     throw new ContentError(
-      'SCHEDULE_CONTRACT',
+      'INVALID_RESPONSE',
       `Malformed ${key} relationship.`,
     );
   const id = relation.data.id;
@@ -160,7 +149,7 @@ function scheduleResource(
     (entry) => object(entry) && entry.id === id && entry.type === key,
   );
   if (!object(included) || !object(included.attributes))
-    throw new ContentError('SCHEDULE_CONTRACT', `Incomplete ${key} details.`);
+    throw new ContentError('INVALID_RESPONSE', `Incomplete ${key} details.`);
   return included.attributes;
 }
 
@@ -176,12 +165,22 @@ export async function readSchedules(
   const pubAt = current.meta.publication_scheduled_at;
   const unpubAt = current.meta.unpublishing_scheduled_at;
   if (!pubAt && !unpubAt) return { publication: null, unpublishing: null };
-  const raw: unknown = await client.items.rawCurrentVsPublishedState(
-    string(current.id, 'record ID'),
-  );
+  const id = string(current.id, 'record ID');
+  let raw: unknown;
+  try {
+    raw = await client.items.rawCurrentVsPublishedState(id);
+  } catch (error) {
+    // The record was listed a moment ago, so it was deleted meanwhile.
+    if (error instanceof CmaClient.ApiError && error.response.status === 404)
+      throw new ContentError(
+        'CAPTURE_DRIFT',
+        `Record ${id} was deleted during capture.`,
+      );
+    throw error;
+  }
   if (!object(raw))
     throw new ContentError(
-      'SCHEDULE_CONTRACT',
+      'INVALID_RESPONSE',
       'Exact schedule state is unavailable.',
     );
   const publication = scheduleResource(raw, 'scheduled_publication');
@@ -199,7 +198,7 @@ export async function readSchedules(
     const scope = publication.selective_publication;
     if (!object(scope) || typeof scope.non_localized_content !== 'boolean')
       throw new ContentError(
-        'SCHEDULE_CONTRACT',
+        'INVALID_RESPONSE',
         'Exact publication scope is unavailable.',
       );
     selective = {
@@ -249,11 +248,6 @@ export async function readRecordBatch(
   ids: string[],
   schema: SchemaState,
 ): Promise<RecordState[]> {
-  if (ids.length > 30)
-    throw new ContentError(
-      'INVALID_BATCH',
-      'Nested record reads accept at most 30 IDs.',
-    );
   if (!ids.length) return [];
   const [currentBody, publishedBody] = await Promise.all([
     readNativeRecordPage(client, {
@@ -342,14 +336,15 @@ interface CaptureInput {
   side: Side;
   options: CaptureOptions;
   /**
-   * true rereads everything and compares; 'versions' lists record versions
-   * instead, assuming every edit creates a new version; false skips the check.
+   * 'full' rereads everything and compares; 'versions' lists record versions
+   * instead, assuming every edit creates a new version; 'none' skips the
+   * check.
    */
-  verify?: boolean | 'versions';
+  verify: 'none' | 'versions' | 'full';
 }
 
 /** Uploads and collections. Their listings are cheap, so they are always reread. */
-export async function captureAssets(input: {
+async function captureAssets(input: {
   client: Client;
   store: SnapshotStore;
   side: Side;
@@ -358,14 +353,29 @@ export async function captureAssets(input: {
   const { client, store, side, options } = input;
   const signal = options.signal;
   options.progress?.('Reading asset metadata');
-  await pages(
-    (offset) =>
-      client.uploads.rawList({
-        order_by: 'id_ASC',
-        page: { offset, limit: 500 },
-      }),
+  // The SDK's uploads.list returns default_field_metadata field-keyed in every
+  // environment, but no total count. A single-row raw page read supplies the
+  // live total: the first page's finishes before that page is listed, every
+  // later page reads one alongside its listing, and one more follows the last
+  // page. An upload added or removed after the first count changes a page's
+  // total or length, or the final count. As with every offset pagination, an
+  // add and a remove that both fall between two reads keep the total unchanged.
+  const count = async () =>
+    pageBody(await client.uploads.rawList({ page: { limit: 1 } })).total;
+  const total = await pages(
+    async (offset) => {
+      const first = offset === 0 ? await count() : undefined;
+      const [data, live] = await Promise.all([
+        client.uploads.list({
+          order_by: 'id_ASC',
+          page: { offset, limit: 500 },
+        }),
+        first ?? count(),
+      ]);
+      return { data, meta: { total_count: live } };
+    },
     500,
-    options.concurrency ?? 4,
+    options.concurrency,
     (uploads) => {
       store.transaction(() => {
         for (const raw of uploads) {
@@ -382,6 +392,11 @@ export async function captureAssets(input: {
     },
     signal,
   );
+  if ((await count()) !== total)
+    throw new ContentError(
+      'CAPTURE_DRIFT',
+      'The collection changed while it was being paginated.',
+    );
   assertNotAborted(signal);
   for (const raw of await client.uploadCollections.list()) {
     assertNotAborted(signal);
@@ -402,7 +417,7 @@ export async function captureAssets(input: {
  * record's fingerprint. A record moving between pages fails the pagination
  * checks, so the listing is complete.
  */
-export async function scanFingerprints(input: {
+async function scanFingerprints(input: {
   client: Client;
   schema: SchemaState;
   store: SnapshotStore;
@@ -412,10 +427,7 @@ export async function scanFingerprints(input: {
   const { client, schema, store, scan, options } = input;
   const signal = options.signal;
   const db = store.database;
-  db.exec(
-    'CREATE TEMP TABLE IF NOT EXISTS scan_rows(scan TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scan,slice,id)) WITHOUT ROWID',
-  );
-  db.prepare('DELETE FROM scan_rows WHERE scan=?').run(scan);
+  clearScan(store, scan);
   const insert = db.prepare('INSERT OR IGNORE INTO scan_rows VALUES(?,?,?,?)');
   for (const model of schema.models) {
     if (model.block) continue;
@@ -431,25 +443,29 @@ export async function scanFingerprints(input: {
             page: { offset, limit: 500 },
           }),
         500,
-        options.concurrency ?? 4,
+        options.concurrency,
         (rows) => {
           store.transaction(() => {
             for (const row of rows) {
               assertNotAborted(signal);
-              if (!object(row) || rawModelId(row) !== model.id)
+              if (
+                !object(row) ||
+                !object(row.attributes) ||
+                recordModelId(row) !== model.id
+              )
                 throw new ContentError(
                   'INVALID_RESPONSE',
                   'A model listing contains a foreign record.',
                 );
               // Only what the fingerprint needs is kept, not the content.
-              const attributes = object(row.attributes) ? row.attributes : row;
               const kept = {
                 id: row.id,
                 meta: row.meta,
                 relationships: row.relationships,
-                item_type: row.item_type,
-                parent_id: attributes.parent_id,
-                position: attributes.position,
+                attributes: {
+                  parent_id: row.attributes.parent_id,
+                  position: row.attributes.position,
+                },
               };
               if (
                 !insert.run(
@@ -473,7 +489,7 @@ export async function scanFingerprints(input: {
 }
 
 /** Each listed record's fingerprint, in ID order. */
-export function* scannedFingerprints(
+function* scannedFingerprints(
   store: SnapshotStore,
   scan: string,
 ): Generator<{ id: string; fingerprint: string }> {
@@ -507,8 +523,8 @@ export function* scannedFingerprints(
   }
 }
 
-/** Removes a version listing's temporary rows. */
-export function clearScan(store: SnapshotStore, scan: string): void {
+/** Creates the version listing table when needed and empties one listing. */
+function clearScan(store: SnapshotStore, scan: string): void {
   store.database.exec(
     'CREATE TEMP TABLE IF NOT EXISTS scan_rows(scan TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scan,slice,id)) WITHOUT ROWID',
   );
@@ -521,7 +537,7 @@ export function clearScan(store: SnapshotStore, scan: string): void {
  * mean new content (renumbering siblings, for example). A record present on
  * only one side is reported as missing or extra.
  */
-export function fingerprintDifferences(
+function fingerprintDifferences(
   store: SnapshotStore,
   side: Side,
   scan: string,
@@ -557,23 +573,19 @@ export function fingerprintDifferences(
 }
 
 /**
- * Reads records in full and returns those whose content, schedules or
- * position differ from the expected states (or that no longer exist).
+ * Reads records in full and returns the first whose content, schedules or
+ * position differ from the stored state of `side` (or that is missing).
  */
-export async function contentDifferences(
-  client: Client,
-  schema: SchemaState,
+async function contentDifferences(
+  { client, schema, store, side, options }: CaptureInput,
   ids: Iterable<string>,
-  expected: (id: string) => RecordState | undefined,
-  options: CaptureOptions,
-  accept?: (state: RecordState) => void,
 ): Promise<string | null> {
   for (const batch of batches(ids)) {
     assertNotAborted(options.signal);
     const states = await readRecordBatch(client, batch, schema);
     for (const id of batch) {
       const state = states.find((candidate) => candidate.id === id);
-      const wanted = expected(id);
+      const wanted = store.getRecord(side, id);
       if (
         !state ||
         !wanted ||
@@ -581,7 +593,6 @@ export async function contentDifferences(
         state.position !== wanted.position
       )
         return id;
-      accept?.(state);
     }
   }
   return null;
@@ -591,19 +602,23 @@ async function captureOnce(input: CaptureInput): Promise<void> {
   const { client, schema, store, side, options } = input;
   const signal = options.signal;
   assertNotAborted(signal);
-  const concurrency = options.concurrency ?? 4;
+  const concurrency = options.concurrency;
   store.clearSide(side);
   const db = store.database;
   db.exec(
     'CREATE TEMP TABLE IF NOT EXISTS capture_raw(side TEXT NOT NULL,slice TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,slice,id)) WITHOUT ROWID',
   );
+  db.exec(
+    'CREATE TEMP TABLE IF NOT EXISTS capture_schedules(side TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,id)) WITHOUT ROWID',
+  );
   db.prepare('DELETE FROM capture_raw WHERE side=?').run(side);
+  db.prepare('DELETE FROM capture_schedules WHERE side=?').run(side);
   const insert = db.prepare(
     'INSERT OR IGNORE INTO capture_raw VALUES(?,?,?,?)',
   );
   try {
     // Capture every regular model. Outside the selected mutation scope these
-    // rows prove reference safety and preservation, including incoming links.
+    // rows provide the retained destination state and incoming links.
     for (const model of schema.models) {
       assertNotAborted(signal);
       if (model.block) continue;
@@ -632,7 +647,7 @@ async function captureOnce(input: CaptureInput): Promise<void> {
                     'Record is malformed.',
                   );
                 // Records are canonicalized once, below, with both versions.
-                if (rawModelId(row) !== model.id)
+                if (recordModelId(row) !== model.id)
                   throw new ContentError(
                     'INVALID_RESPONSE',
                     'A model page contains a foreign record.',
@@ -660,10 +675,6 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     // Schedule details cost one request per scheduled record. Few records are
     // scheduled, so inside the 30-row batches below they would run almost one
     // at a time; read them all up front with the full concurrency instead.
-    db.exec(
-      'CREATE TEMP TABLE IF NOT EXISTS capture_schedules(side TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,id)) WITHOUT ROWID',
-    );
-    db.prepare('DELETE FROM capture_schedules WHERE side=?').run(side);
     const scheduledIds = db
       .prepare(
         "SELECT id FROM capture_raw WHERE side=? AND slice='current' AND (json_extract(data,'$.meta.publication_scheduled_at') IS NOT NULL OR json_extract(data,'$.meta.unpublishing_scheduled_at') IS NOT NULL) ORDER BY id",
@@ -687,7 +698,6 @@ async function captureOnce(input: CaptureInput): Promise<void> {
         const schedules = await readSchedules(client, current);
         saveSchedules.run(side, id, JSON.stringify(schedules));
       },
-      undefined,
       signal,
     );
     const cachedSchedules = db.prepare(
@@ -700,14 +710,12 @@ async function captureOnce(input: CaptureInput): Promise<void> {
       "SELECT id,data FROM capture_raw WHERE side=? AND slice='current' ORDER BY id",
     );
     for (const batch of batches(rows.iterate(side))) {
-      // Most records have no schedules, so their promises resolve immediately.
       // Yield between batches so process signal handlers can interrupt this
       // otherwise synchronous SQLite/codec phase.
       await setImmediate();
       assertNotAborted(signal);
       const states: RecordState[] = [];
-      await boundedWork(batch, concurrency, async (row) => {
-        assertNotAborted(signal);
+      for (const row of batch) {
         const current: unknown = JSON.parse(String(row.data));
         const pubRow = published.get(side, String(row.id));
         const pub: unknown = pubRow ? JSON.parse(String(pubRow.data)) : null;
@@ -720,13 +728,13 @@ async function captureOnce(input: CaptureInput): Promise<void> {
             'CAPTURE_DRIFT',
             `Publication state changed for record ${row.id}.`,
           );
+        // Every record with a schedule was read above.
         const cached = cachedSchedules.get(side, String(row.id));
-        const schedules = cached
-          ? (JSON.parse(String(cached.data)) as Schedules)
-          : await readSchedules(client, current);
-        assertNotAborted(signal);
+        const schedules: Schedules = cached
+          ? JSON.parse(String(cached.data))
+          : { publication: null, unpublishing: null };
         states.push(canonicalRecord(current, pub, schema, schedules));
-      });
+      }
       // Bound memory to one batch and commit it in one transaction. Dependency
       // indexes are not built here: the planner rebuilds them from these
       // records, and apply never reads them.
@@ -750,9 +758,6 @@ async function captureOnce(input: CaptureInput): Promise<void> {
     await captureAssets({ ...input, store });
   } finally {
     db.prepare('DELETE FROM capture_raw WHERE side=?').run(side);
-    db.exec(
-      'CREATE TEMP TABLE IF NOT EXISTS capture_schedules(side TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(side,id)) WITHOUT ROWID',
-    );
     db.prepare('DELETE FROM capture_schedules WHERE side=?').run(side);
   }
 }
@@ -792,13 +797,7 @@ async function verifyByVersions(input: CaptureInput): Promise<void> {
     const changed =
       missing ??
       extra ??
-      (await contentDifferences(
-        input.client,
-        schema,
-        newer,
-        (id) => input.store.getRecord(input.side, id),
-        input.options,
-      ));
+      (await contentDifferences({ ...input, schema }, newer));
     if (changed)
       throw new ContentError(
         'CAPTURE_DRIFT',
@@ -826,15 +825,6 @@ async function verifyByVersions(input: CaptureInput): Promise<void> {
   }
 }
 
-/** A digest of a side's uploads and collections. */
-export function assetDigest(
-  store: SnapshotStore,
-  side: Side,
-  signal?: AbortSignal,
-): Promise<string> {
-  return snapshotDigest(store, side, signal, false);
-}
-
 async function snapshotDigest(
   store: SnapshotStore,
   side: Side,
@@ -850,15 +840,7 @@ async function snapshotDigest(
   for (const record of records ? store.records(side) : []) {
     await checkpoint();
     digest
-      .update(
-        stableStringify([
-          'record',
-          record.id,
-          // Validity is recalculated by asynchronous schema workers. Compare
-          // the expanded content, versions and writable lifecycle instead.
-          { ...recordGuard(record), validity: undefined },
-        ]),
-      )
+      .update(stableStringify(['record', record.id, recordGuard(record)]))
       .update('\n');
   }
   for (const upload of store.uploads(side)) {
@@ -883,7 +865,7 @@ export async function captureSnapshot(input: CaptureInput): Promise<void> {
   await assertFullReadAccess(input.client, input.schema);
   assertNotAborted(signal);
   await captureOnce(input);
-  if (input.verify === false) return;
+  if (input.verify === 'none') return;
   if (input.verify === 'versions') {
     await verifyByVersions(input);
     return;

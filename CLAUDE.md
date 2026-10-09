@@ -103,8 +103,9 @@ The CLI includes a migration system (`packages/cli/src/commands/migrations/`) fo
 - Use `datocms migrations:new` to create migrations; `--autogenerate` captures schema changes only
 - Use `datocms content:diff NAME` to generate editable content migrations containing actual CMA calls
 - Use `datocms migrations:run` for schema migrations and `content:apply SCRIPT.ts` for content migrations. Generated content scripts live in the `content/` subdirectory of the configured migrations directory.
-- Content migrations keep immutable baseline evidence and binaries in a sibling `.content` directory. Generation compiles the dependency plan into directly executable TypeScript; apply checks the destination baseline and executes real CMA calls without local simulation or replanning
-- Generated imports require the content plugin as a resolvable project dependency. Preserve the tracking-model projection, one-shot execution, and owned-fork cleanup contracts documented in the plugin README and `docs/rewrite-design.md`
+- Content migrations keep immutable destination baseline evidence (no binaries) in a sibling `.content` directory; assets are copied from their source URLs with an MD5 check. Generation compiles the dependency plan into directly executable TypeScript; apply checks the destination baseline and executes real CMA calls without local validation or replanning. Content migrations never make temporary schema changes. Invalid source records cannot be diffed: generation fails on any record it would write that the source CMA reports invalid, except invalid drafts in models with draft mode and invalid draft saving
+- Large content migrations split into parts under `.content/parts/`, which the main script runs in-process through `runMigrationPart`
+- Generated imports require the content plugin as a resolvable project dependency. Preserve the tracking-model projection, one-shot execution, and fork cleanup contracts documented in the plugin README and `docs/design.md`
 
 ## Content diff boundary
 

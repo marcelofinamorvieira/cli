@@ -1,65 +1,45 @@
 import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import {
-  link,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
   open,
+  readdir,
   rename,
   rm,
+  stat,
   writeFile,
 } from 'node:fs/promises';
-import type { FileHandle } from 'node:fs/promises';
-import { basename, dirname, extname, join, relative, resolve } from 'node:path';
-import { setImmediate, setTimeout } from 'node:timers/promises';
+import { basename, dirname, join, resolve } from 'node:path';
+import { setImmediate } from 'node:timers/promises';
 import { format, resolveConfig } from 'prettier';
-import { boundedWork } from './apply-work';
-import {
-  jsonlValues,
-  readSmallFile,
-  validateSchedules,
-  validateState,
-  verifyBinary,
-} from './artifact-integrity';
-import { fetchBinary, requiresBinary } from './asset-download';
 import { assertNotAborted } from './cancellation';
-import {
-  assertMetadataIntegerPrecision,
-  hashJson,
-  object,
-  recordGuard,
-} from './codec';
-import { ContentError } from './errors';
-import { emitMigrationCalls, restoreFieldSource } from './migration-emit';
-import {
-  DEFAULT_MIGRATION_CHUNK_BYTES,
-  MAX_MIGRATION_CHUNK_BYTES,
-  MAX_MIGRATION_FILE_BYTES,
-} from './migration-limits';
+import { hashJson, object, recordGuard } from './codec';
+import { ContentError, destinationChanged } from './errors';
+import { emitMigrationCalls } from './migration-emit';
 import type { MigrationTrackingBinding } from './migration-schema';
-import { suppressedDefaultValue } from './planner-validity';
-import { schemaHash } from './schema';
 import type { SnapshotStore } from './store';
 import type {
   ArtifactChunk,
   ArtifactChunkIndex,
-  BinaryFile,
-  CollectionPlan,
-  CollectionState,
   JsonObject,
   Kind,
-  PlanEntry,
   PlanMetadata,
   RecordGuard,
-  RecordPlan,
   RecordState,
   Side,
-  UploadPlan,
-  UploadState,
 } from './types';
 
-const FORMAT = 'datocms-content-migration-baseline/2';
-const MAX_METADATA = 16 * 1024 * 1024;
+/** The size cap of every companion file read when applying. */
+const MAX_MIGRATION_FILE_BYTES = 16 * 1024 * 1024;
+/** The largest chunk target, so every baseline chunk stays within the cap. */
+export const MAX_MIGRATION_CHUNK_BYTES = MAX_MIGRATION_FILE_BYTES - 1024;
+export const DEFAULT_MIGRATION_CHUNK_BYTES = 1024 * 1024;
+
+const FORMAT = 'datocms-content-migration-baseline/1';
+const MAX_METADATA = MAX_MIGRATION_FILE_BYTES;
 const kinds = ['record', 'upload', 'collection'] as const;
 const sha256 = (data: string | Buffer) =>
   createHash('sha256').update(data).digest('hex');
@@ -69,34 +49,22 @@ export interface BaselineManifest extends PlanMetadata {
   createdAt: string;
   sourceTracking: MigrationTrackingBinding;
   destinationTracking: MigrationTrackingBinding;
-  targetCounts: Record<Kind, number>;
   chunks: ArtifactChunkIndex;
 }
 
-export interface MigrationBinary {
-  localPath: string;
-  binary: BinaryFile;
-  filename: string;
-  url: string;
-}
-interface BaselineEntry {
-  type: 'baseline';
+/** One destination record, upload or folder as generation observed it. */
+interface BaselineRow {
   kind: Kind;
   id: string;
   guard: RecordGuard | { hash: string };
-  original?: RecordState | UploadState | CollectionState;
 }
-interface BinaryEntry {
-  type: 'binary';
-  uploadId: string;
-  binary: BinaryFile;
-  filename: string;
-  url: string;
-}
-type Row = BaselineEntry | BinaryEntry;
 
 function invalid(message: string): never {
   throw new ContentError('INVALID_MIGRATION_BASELINE', message);
+}
+/** Generation cannot write a migration for this content. */
+function unwritable(message: string): never {
+  throw new ContentError('INVALID_MIGRATION_OUTPUT', message);
 }
 function count(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -110,50 +78,51 @@ function digest(value: unknown, length = 64): value is string {
   );
 }
 
-/** Real JS literals: __proto__ must remain an own data key, never object syntax. */
-export function migrationLiteral(value: unknown, depth = 0): string {
+/**
+ * Keys that lead an object when present, so a reader sees what a value is
+ * before its contents: block IDs and types, Structured Text node types and
+ * formats, and the upload a file value points to. Other keys keep their
+ * stored order; key order has no meaning to the CMA.
+ */
+const LEADING_KEYS = ['id', 'type', 'schema', 'upload_id'];
+const leadingRank = (key: string) => {
+  const rank = LEADING_KEYS.indexOf(key);
+  return rank < 0 ? LEADING_KEYS.length : rank;
+};
+
+/**
+ * A compact JS literal that Prettier lays out. `__proto__` must remain an own
+ * data key, never object syntax.
+ */
+export function migrationLiteral(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     const encoded = JSON.stringify(value);
     if (encoded === undefined)
-      invalid('Migration payload contains a non-JSON value.');
+      unwritable('Migration payload contains a non-JSON value.');
     return encoded;
   }
-  const indent = '  '.repeat(depth);
-  const child = `${indent}  `;
   if (Array.isArray(value))
-    return value.length
-      ? `[\n${value
-          .map((item) => `${child}${migrationLiteral(item, depth + 1)}`)
-          .join(',\n')}\n${indent}]`
-      : '[]';
-  const entries = Object.entries(value);
+    return `[${value.map(migrationLiteral).join(', ')}]`;
+  const entries = Object.entries(value).sort(
+    ([a], [b]) => leadingRank(a) - leadingRank(b),
+  );
   return entries.length
-    ? `{\n${entries
+    ? `{ ${entries
         .map(
           ([key, item]) =>
-            `${child}${
+            `${
               key === '__proto__' ? '["__proto__"]' : JSON.stringify(key)
-            }: ${migrationLiteral(item, depth + 1)}`,
+            }: ${migrationLiteral(item)}`,
         )
-        .join(',\n')}\n${indent}}`
+        .join(', ')} }`
     : '{}';
 }
 
-async function bytes(
-  handle: FileHandle,
-  value: string | Buffer,
-  signal?: AbortSignal,
-): Promise<void> {
-  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
-  let offset = 0;
-  while (offset < buffer.length) {
-    assertNotAborted(signal);
-    const written = await handle.write(buffer, offset, buffer.length - offset);
-    if (!written.bytesWritten)
-      invalid('Migration output could not be written.');
-    offset += written.bytesWritten;
-  }
-}
+const exists = (path: string) =>
+  new ContentError(
+    'MIGRATION_EXISTS',
+    `Migration output already exists: ${path}`,
+  );
 async function absent(path: string): Promise<void> {
   try {
     await lstat(path);
@@ -161,23 +130,20 @@ async function absent(path: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
-  throw new ContentError(
-    'MIGRATION_EXISTS',
-    `Migration output already exists: ${path}`,
-  );
+  throw exists(path);
 }
 function initTables(store: SnapshotStore): void {
   store.database.exec(`
     CREATE TEMP TABLE IF NOT EXISTS migration_baseline (
-      kind TEXT NOT NULL,id TEXT NOT NULL,hash TEXT NOT NULL,model_id TEXT,parent_id TEXT,
-      position REAL,guard_json TEXT NOT NULL,original_json TEXT,PRIMARY KEY(kind,id)
-    ) WITHOUT ROWID;
-    CREATE TEMP TABLE IF NOT EXISTS migration_baseline_binaries (
-      upload_id TEXT PRIMARY KEY,file TEXT NOT NULL UNIQUE,data TEXT NOT NULL
+      kind TEXT NOT NULL,id TEXT NOT NULL,guard_json TEXT NOT NULL,PRIMARY KEY(kind,id)
     ) WITHOUT ROWID;
   `);
 }
 
+/**
+ * Baseline rows in chunks of at most `maximum` bytes. A chunk is held in
+ * memory and written whole once its descriptor is final.
+ */
 class RowWriter {
   readonly index: ArtifactChunkIndex = {
     file: 'chunks.jsonl',
@@ -185,10 +151,10 @@ class RowWriter {
     bytes: 0,
     count: 0,
   };
-  private indexHandle?: FileHandle;
+  private readonly indexLines: Buffer[] = [];
   private readonly indexHash = createHash('sha256');
   private current?: {
-    handle: FileHandle;
+    lines: Buffer[];
     descriptor: ArtifactChunk;
     hash: ReturnType<typeof createHash>;
   };
@@ -199,16 +165,11 @@ class RowWriter {
   ) {}
   async begin() {
     await mkdir(join(this.directory, 'baseline'));
-    this.indexHandle = await open(
-      join(this.directory, this.index.file),
-      'wx',
-      0o600,
-    );
   }
-  async add(row: Row) {
+  async add(row: BaselineRow) {
     const line = Buffer.from(`${JSON.stringify(row)}\n`);
     if (line.length > MAX_METADATA)
-      invalid('One migration baseline entry exceeds 16 MiB.');
+      unwritable('One migration baseline entry exceeds 16 MiB.');
     if (
       this.current &&
       this.current.descriptor.bytes + line.length > this.maximum
@@ -220,52 +181,49 @@ class RowWriter {
         '0',
       )}.jsonl`;
       this.current = {
-        handle: await open(join(this.directory, file), 'wx', 0o600),
+        lines: [],
         descriptor: { file, bytes: 0, entries: 0, sha256: '' },
         hash: createHash('sha256'),
       };
     }
-    await bytes(this.current.handle, line, this.signal);
+    this.current.lines.push(line);
     this.current.hash.update(line);
     this.current.descriptor.bytes += line.length;
     this.current.descriptor.entries++;
   }
   private async finishChunk() {
     if (!this.current) return;
-    await this.current.handle.close();
-    this.current.descriptor.sha256 = this.current.hash.digest('hex');
-    const line = Buffer.from(`${JSON.stringify(this.current.descriptor)}\n`);
-    await bytes(this.indexHandle!, line, this.signal);
+    const { lines, descriptor, hash } = this.current;
+    this.current = undefined;
+    await writeFile(
+      join(this.directory, descriptor.file),
+      Buffer.concat(lines),
+      {
+        flag: 'wx',
+        signal: this.signal,
+      },
+    );
+    descriptor.sha256 = hash.digest('hex');
+    const line = Buffer.from(`${JSON.stringify(descriptor)}\n`);
+    this.indexLines.push(line);
     this.indexHash.update(line);
     this.index.bytes += line.length;
     this.index.count++;
-    this.current = undefined;
   }
   async finish() {
     await this.finishChunk();
-    await this.indexHandle!.close();
-    this.indexHandle = undefined;
+    await writeFile(
+      join(this.directory, this.index.file),
+      Buffer.concat(this.indexLines),
+      { flag: 'wx', signal: this.signal },
+    );
     this.index.sha256 = this.indexHash.digest('hex');
     return this.index;
   }
-  async close() {
-    await this.current?.handle.close().catch(() => undefined);
-    await this.indexHandle?.close().catch(() => undefined);
-  }
-}
-
-function checkedScript(source: string): string {
-  if (Buffer.byteLength(source) > MAX_MIGRATION_FILE_BYTES)
-    throw new ContentError(
-      'MIGRATION_FILE_TOO_LARGE',
-      `Generated TypeScript exceeds ${MAX_MIGRATION_FILE_BYTES} bytes (16 MiB), including headers. Use a smaller chunk target, shorter output filename, or smaller operation.`,
-    );
-  return source;
 }
 
 /** Match schema generation: project configuration, then Prettier defaults. */
 async function formatScript(source: string, filepath: string): Promise<string> {
-  checkedScript(source);
   try {
     const options = await resolveConfig(filepath);
     return await format(source, { ...options, filepath, parser: 'typescript' });
@@ -276,9 +234,21 @@ async function formatScript(source: string, filepath: string): Promise<string> {
   }
 }
 
+const partName = (index: number) => `${String(index + 1).padStart(6, '0')}.ts`;
+const RUNTIME = '@datocms/cli-plugin-content-diff/migration';
+function runtimeImport(values: Iterable<string>): string {
+  const names = [...new Set(values)].sort();
+  return names.length
+    ? `import { type ContentMigrationClient, ${names.join(
+        ', ',
+      )} } from '${RUNTIME}';`
+    : `import type { ContentMigrationClient } from '${RUNTIME}';`;
+}
+
 interface ScriptStatement {
-  main: string;
-  part: string;
+  code: string;
+  /** Runtime helpers the statement calls, imported only where used. */
+  runtime: string[];
 }
 
 /** Bound code generation and formatting by one part, never the whole project. */
@@ -293,57 +263,34 @@ class ScriptWriter {
     private outputPath: string,
     private maximum: number,
     private signal?: AbortSignal,
-    private temporaryChanges: PlanMetadata['temporarySchemaChanges'] = [],
   ) {}
-  async add(statement: string, partStatement = statement) {
+  async add(code: string, runtime: string[] = []) {
     assertNotAborted(this.signal);
-    const length = Math.max(
-      Buffer.byteLength(statement),
-      Buffer.byteLength(partStatement),
-    );
-    if (length > MAX_MIGRATION_CHUNK_BYTES)
-      throw new ContentError(
-        'MIGRATION_FILE_TOO_LARGE',
-        `One generated operation exceeds ${MAX_MIGRATION_CHUNK_BYTES} bytes. A TypeScript file must fit within 16 MiB including headers.`,
-      );
+    const length = Buffer.byteLength(code);
     if (this.statements.length && this.bodyBytes + length > this.maximum)
       await this.flushPart();
-    this.statements.push({ main: statement, part: partStatement });
+    this.statements.push({ code, runtime });
     this.bodyBytes += length;
     if (++this.calls % 30 === 0) await setImmediate();
   }
   private async writePart(statements: ScriptStatement[]): Promise<void> {
     assertNotAborted(this.signal);
-    const name = `${String(this.parts + 1).padStart(6, '0')}.ts`;
-    const source = `import { join } from 'node:path';
-import { isDeepStrictEqual } from 'node:util';
-import { checkMigration, uploadMigrationFile } from '@datocms/cli-plugin-content-diff/migration';
-import type { ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
+    const name = partName(this.parts);
+    const source = `${runtimeImport(
+      statements.flatMap((statement) => statement.runtime),
+    )}
 
 export default async function(client: ContentMigrationClient): Promise<void> {
-${statements.map((statement) => statement.part).join('')}
+${statements.map((statement) => statement.code).join('')}
 }
 `;
     const formatted = await formatScript(
       source,
       join(dirname(this.outputPath), this.companionName, 'parts', name),
     );
-    // Formatting can expand indentation/line breaks. Split between operations
-    // again after formatting, allowing one indivisible operation per part.
-    if (
-      statements.length > 1 &&
-      Buffer.byteLength(formatted) > this.maximum + 1024
-    ) {
-      const middle = Math.ceil(statements.length / 2);
-      await this.writePart(statements.slice(0, middle));
-      await this.writePart(statements.slice(middle));
-      return;
-    }
-    checkedScript(formatted);
     await mkdir(join(this.directory, 'parts'), { recursive: true });
     await writeFile(join(this.directory, 'parts', name), formatted, {
       flag: 'wx',
-      mode: 0o600,
       signal: this.signal,
     });
     this.parts++;
@@ -354,76 +301,35 @@ ${statements.map((statement) => statement.part).join('')}
     this.statements = [];
     this.bodyBytes = 0;
   }
-  private mainSource(allowTemporarySchemaChanges: boolean): string {
-    const body = this.parts
-      ? `  // Parts execute sequentially and are released before loading the next.
-  for (let part = 1; part <= ${this.parts}; part++) {
+  private mainSource(): string {
+    const parts = Array.from({ length: this.parts }, (_, index) =>
+      partName(index),
+    );
+    const body = parts.length
+      ? `  for (const part of ${JSON.stringify(parts)})
     await runMigrationPart(client, join(__dirname, ${JSON.stringify(
       this.companionName,
-    )}, 'parts', String(part).padStart(6, '0') + '.ts'));
-  }
+    )}, 'parts', part));
 `
-      : this.statements.map((statement) => statement.main).join('');
+      : this.statements.map((statement) => statement.code).join('');
+    const runtime = ['defineContentMigration'];
+    if (parts.length) runtime.push('runMigrationPart');
+    else
+      for (const statement of this.statements)
+        runtime.push(...statement.runtime);
     return `import { join } from 'node:path';
-import { isDeepStrictEqual } from 'node:util';
-import type { ContentMigrationClient } from '@datocms/cli-plugin-content-diff/migration';
-import { defineContentMigration, checkMigration, uploadMigrationFile${
-      this.parts ? ', runMigrationPart' : ''
-    } } from '@datocms/cli-plugin-content-diff/migration';
+${runtimeImport(runtime)}
 
-// Run this file with datocms content:apply.
-// Review and edit these ready-to-execute CMA operations.
 export default defineContentMigration(
-  { baseline: join(__dirname, ${JSON.stringify(
-    this.companionName,
-  )}), allowTemporarySchemaChanges: ${allowTemporarySchemaChanges} },
+  { baseline: join(__dirname, ${JSON.stringify(this.companionName)}) },
   async (client: ContentMigrationClient): Promise<void> => {
-${
-  this.temporaryChanges.length
-    ? `    let migrationError: unknown;\n    try {\n${body}    } catch (error) {\n      migrationError = error;\n      throw error;\n    } finally {\n      const failures: unknown[] = [];\n${this.temporaryChanges
-        .map(
-          (change) =>
-            `      try {\n${restoreFieldSource(
-              change,
-              migrationLiteral,
-            )}      } catch (error) { failures.push(error); }\n`,
-        )
-        .join(
-          '',
-        )}      if (failures.length) throw new AggregateError(migrationError === undefined ? failures : [migrationError, ...failures], 'Some original field settings could not be restored.', { cause: migrationError });\n    }\n`
-    : body || '  // No content changes.\n'
-}  },
+${body || '    // No content changes.\n'}  },
 );
 `;
   }
-  async finish(allowTemporarySchemaChanges: boolean): Promise<string> {
+  async finish(): Promise<string> {
     if (this.parts) await this.flushPart();
-    let source = await formatScript(
-      this.mainSource(allowTemporarySchemaChanges),
-      this.outputPath,
-    );
-    if (
-      !this.parts &&
-      this.statements.length > 1 &&
-      Buffer.byteLength(source) > this.maximum + 1024
-    ) {
-      await this.flushPart();
-      source = await formatScript(
-        this.mainSource(allowTemporarySchemaChanges),
-        this.outputPath,
-      );
-    }
-    return checkedScript(source);
-  }
-  async asset(statement: (path: string) => string, file: string) {
-    await this.add(
-      statement(
-        `join(__dirname, ${JSON.stringify(
-          this.companionName,
-        )}, ${JSON.stringify(file)})`,
-      ),
-      statement(`join(__dirname, '..', ${JSON.stringify(file)})`),
-    );
+    return formatScript(this.mainSource(), this.outputPath);
   }
 }
 
@@ -434,20 +340,12 @@ export async function writeMigration(args: {
   sourceTracking: MigrationTrackingBinding;
   destinationTracking: MigrationTrackingBinding;
   chunkBytes?: number;
-  concurrency?: number;
   signal?: AbortSignal;
-  fetchFn?: typeof fetch;
 }): Promise<string> {
   const { store, metadata, signal } = args;
   assertNotAborted(signal);
   const maximum = args.chunkBytes ?? DEFAULT_MIGRATION_CHUNK_BYTES;
-  if (!count(maximum) || maximum < 1 || maximum > MAX_MIGRATION_CHUNK_BYTES)
-    invalid(
-      'Migration chunk size must be between 1 byte and 16 MiB minus 1 KiB.',
-    );
   const output = resolve(args.outputPath);
-  if (extname(output) !== '.ts')
-    invalid('Content migration output must end in .ts.');
   const companionName = `${basename(output, '.ts')}.content`;
   const companion = join(dirname(output), companionName);
   await mkdir(dirname(output), { recursive: true });
@@ -457,94 +355,30 @@ export async function writeMigration(args: {
   const temporary = await mkdtemp(join(dirname(output), '.content-migration-'));
   const staging = join(temporary, companionName);
   await mkdir(staging);
-  await mkdir(join(staging, 'binaries'));
   const writer = new RowWriter(staging, maximum, signal);
   let ownsCompanion = false;
   let complete = false;
-  initTables(store);
-  store.database.exec('DELETE FROM migration_baseline_binaries');
   try {
-    await boundedWork(
-      (function* () {
-        for (const entry of store.iteratePlan('upload'))
-          if (requiresBinary(entry as UploadPlan)) yield entry as UploadPlan;
-      })(),
-      Math.max(1, Math.min(16, args.concurrency ?? 4)),
-      async (entry) => {
-        const original = await fetchBinary(
-          entry,
-          staging,
-          args.fetchFn ?? fetch,
-          (ms, signal) => setTimeout(ms, undefined, { signal }),
-          60_000,
-          signal,
-        );
-        const file = `binaries/${sha256(entry.id)}-${original.sha256}.bin`;
-        await link(join(staging, original.file), join(staging, file));
-        const binary = { ...original, file };
-        const row: BinaryEntry = {
-          type: 'binary',
-          uploadId: entry.id,
-          binary,
-          filename: entry.desired!.filename,
-          url: entry.desired!.url,
-        };
-        store.database
-          .prepare('INSERT INTO migration_baseline_binaries VALUES(?,?,?)')
-          .run(entry.id, file, JSON.stringify(row));
-      },
-      undefined,
-      signal,
-    );
-    // Every upload has its own verified path/filename binding. The shared
-    // download names are staging details, not additional companion assets.
-    for (const row of store.database
-      .prepare(
-        'SELECT data FROM migration_baseline_binaries ORDER BY upload_id',
-      )
-      .iterate()) {
-      const asset = JSON.parse(String(row.data)) as BinaryEntry;
-      await rm(join(staging, 'binaries', `${asset.binary.sha256}.bin`), {
-        force: true,
-      });
-    }
     await writer.begin();
-    const targetCounts: Record<Kind, number> = {
-      record: 0,
-      upload: 0,
-      collection: 0,
-    };
     for (const kind of kinds) {
       const states =
         kind === 'record'
-          ? store.iterateRecords('target')
+          ? store.records('target')
           : kind === 'upload'
-            ? store.iterateUploads('target')
-            : store.iterateCollections('target');
+            ? store.uploads('target')
+            : store.collections('target');
       for (const state of states) {
         assertNotAborted(signal);
-        const plan = store.getPlan(kind, state.id);
-        const row: BaselineEntry = {
-          type: 'baseline',
+        await writer.add({
           kind,
           id: state.id,
           guard:
             kind === 'record'
               ? recordGuard(state as RecordState)
               : { hash: state.hash },
-        };
-        if (plan && ['update', 'delete'].includes(plan.action))
-          row.original = state;
-        await writer.add(row);
-        targetCounts[kind]++;
+        });
       }
     }
-    for (const row of store.database
-      .prepare(
-        'SELECT data FROM migration_baseline_binaries ORDER BY upload_id',
-      )
-      .iterate())
-      await writer.add(JSON.parse(String(row.data)) as BinaryEntry);
     const chunks = await writer.finish();
     const manifest: BaselineManifest = {
       ...metadata,
@@ -552,21 +386,17 @@ export async function writeMigration(args: {
       createdAt: new Date().toISOString(),
       sourceTracking: args.sourceTracking,
       destinationTracking: args.destinationTracking,
-      targetCounts,
       chunks,
     };
-    validateManifest(manifest);
     const raw = Buffer.from(`${JSON.stringify(manifest)}\n`);
     if (raw.length > MAX_METADATA)
-      invalid('Migration metadata exceeds 16 MiB.');
+      unwritable('Migration metadata exceeds 16 MiB.');
     await writeFile(join(staging, 'manifest.json'), raw, {
       flag: 'wx',
-      mode: 0o600,
       signal,
     });
     await writeFile(join(staging, 'manifest.sha256'), `${sha256(raw)}\n`, {
       flag: 'wx',
-      mode: 0o600,
       signal,
     });
     const scriptWriter = new ScriptWriter(
@@ -575,27 +405,44 @@ export async function writeMigration(args: {
       output,
       maximum,
       signal,
-      metadata.temporarySchemaChanges,
     );
     await emitMigrationCalls(store, metadata, scriptWriter, migrationLiteral);
-    const script = await scriptWriter.finish(
-      metadata.options.allowTemporarySchemaChanges,
-    );
+    const script = await scriptWriter.finish();
     await writeFile(join(temporary, 'migration.ts'), script, {
       flag: 'wx',
-      mode: 0o600,
       signal,
     });
     await absent(output);
-    await mkdir(companion);
+    // Creating the directory claims the companion name exclusively; the staged
+    // files then move into it under names nothing else can hold, which needs
+    // no directory replacement and works the same on every platform.
+    try {
+      await mkdir(companion);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST')
+        throw exists(companion);
+      throw error;
+    }
     ownsCompanion = true;
     assertNotAborted(signal);
-    await rename(staging, companion);
-    await link(join(temporary, 'migration.ts'), output);
+    for (const entry of await readdir(staging))
+      await rename(join(staging, entry), join(companion, entry));
+    // The script is published last and never replaces an existing file.
+    try {
+      await copyFile(
+        join(temporary, 'migration.ts'),
+        output,
+        constants.COPYFILE_EXCL,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST')
+        throw exists(output);
+      await rm(output, { force: true });
+      throw error;
+    }
     complete = true;
     return output;
   } finally {
-    await writer.close();
     if (!complete && ownsCompanion)
       await rm(companion, { recursive: true, force: true });
     await rm(temporary, { recursive: true, force: true });
@@ -606,116 +453,26 @@ function validateTracking(value: unknown): value is MigrationTrackingBinding {
   return (
     object(value) &&
     text(value.apiKey) &&
-    (value.model === null ||
-      (object(value.model) &&
-        text(value.model.id) &&
-        text(value.model.nameFieldId)))
+    (value.model === null || (object(value.model) && text(value.model.id)))
   );
 }
+/**
+ * The checksums already detect corruption, so only the fields apply reads are
+ * checked for shape. The rest of the manifest is information for readers.
+ */
 function validateManifest(value: unknown): asserts value is BaselineManifest {
-  if (
-    !object(value) ||
-    value.format !== FORMAT ||
-    !text(value.createdAt) ||
-    !Number.isFinite(Date.parse(value.createdAt))
-  )
+  if (!object(value) || value.format !== FORMAT)
     invalid('Unsupported content migration baseline.');
-  for (const name of ['source', 'destination']) {
-    const binding = value[name];
-    if (
-      !object(binding) ||
-      !text(binding.siteId) ||
-      !text(binding.environmentId)
-    )
-      invalid(`Invalid ${name} binding.`);
-  }
   if (
-    !validateTracking(value.sourceTracking) ||
-    !validateTracking(value.destinationTracking)
+    !object(value.destination) ||
+    !text(value.destination.siteId) ||
+    !text(value.destination.environmentId)
   )
+    invalid('Invalid destination binding.');
+  if (!validateTracking(value.destinationTracking))
     invalid('Invalid migration tracking identity.');
-  if (
-    !object(value.schema) ||
-    !Array.isArray(value.schema.models) ||
-    !Array.isArray(value.schema.locales) ||
-    !Array.isArray(value.schema.workflows) ||
-    !object(value.schema.semantics) ||
-    !digest(value.schema.hash)
-  )
+  if (!object(value.schema) || !digest(value.schema.hash))
     invalid('Invalid baseline schema.');
-  if (
-    schemaHash(value.schema as unknown as BaselineManifest['schema']) !==
-    value.schema.hash
-  )
-    invalid('Baseline schema hash differs.');
-  if (
-    !object(value.options) ||
-    !Array.isArray(value.options.modelIds) ||
-    !value.options.modelIds.every(text) ||
-    !['all', 'referenced'].includes(String(value.options.uploads)) ||
-    ['includeDeletions', 'allowPartial', 'allowTemporarySchemaChanges'].some(
-      (key) => typeof (value.options as JsonObject)[key] !== 'boolean',
-    )
-  )
-    invalid('Invalid generation options.');
-  if (!Array.isArray(value.temporarySchemaChanges))
-    invalid('Missing temporary field settings.');
-  const changed = new Set<string>();
-  const schema = value.schema as unknown as PlanMetadata['schema'];
-  for (const change of value.temporarySchemaChanges) {
-    if (
-      !object(change) ||
-      !text(change.fieldId) ||
-      !text(change.modelId) ||
-      changed.has(change.fieldId) ||
-      !object(change.original) ||
-      !object(change.temporary) ||
-      !object(change.original.validators) ||
-      !object(change.temporary.validators) ||
-      !Array.isArray(change.reasons) ||
-      !change.reasons.every(text)
-    )
-      invalid('Invalid temporary field settings.');
-    changed.add(change.fieldId);
-    const field = schema.models
-      .find((model) => model.id === change.modelId)
-      ?.fields.find((field) => field.id === change.fieldId);
-    if (
-      !field ||
-      hashJson(field.validators) !== hashJson(change.original.validators) ||
-      hashJson(field.defaultValue) !== hashJson(change.original.defaultValue)
-    )
-      invalid(
-        'Temporary field original settings differ from the captured schema.',
-      );
-    assertMetadataIntegerPrecision(
-      change.temporary.validators,
-      `Temporary validators for ${change.fieldId}`,
-    );
-    for (const [key, validator] of Object.entries(change.temporary.validators))
-      if (
-        !Object.hasOwn(change.original.validators, key) ||
-        hashJson(validator) !== hashJson(change.original.validators[key])
-      )
-        invalid('Temporary settings may only remove existing validators.');
-    if (
-      hashJson(change.temporary.defaultValue) !==
-        hashJson(change.original.defaultValue) &&
-      hashJson(change.temporary.defaultValue) !==
-        hashJson(suppressedDefaultValue(field, schema.locales))
-    )
-      invalid('Temporary settings may only suppress defaults.');
-  }
-  if (
-    changed.size &&
-    !(value.options as JsonObject).allowTemporarySchemaChanges
-  )
-    invalid('Temporary schema changes were not authorized at generation.');
-  if (
-    !object(value.targetCounts) ||
-    kinds.some((kind) => !count((value.targetCounts as JsonObject)[kind]))
-  )
-    invalid('Invalid baseline namespace counts.');
   if (
     !object(value.counts) ||
     kinds.some(
@@ -737,71 +494,75 @@ function validateManifest(value: unknown): asserts value is BaselineManifest {
   )
     invalid('Invalid baseline chunk index.');
 }
-function validateRow(value: unknown): asserts value is Row {
-  if (!object(value)) invalid('Invalid baseline entry.');
-  if (value.type === 'binary') {
-    if (
-      !text(value.uploadId) ||
-      !text(value.filename) ||
-      basename(value.filename) !== value.filename ||
-      !text(value.url) ||
-      !object(value.binary) ||
-      !text(value.binary.file) ||
-      !/^binaries\/[a-f0-9]{64}-[a-f0-9]{64}\.bin$/.test(value.binary.file) ||
-      !digest(value.binary.sha256) ||
-      !digest(value.binary.md5, 32) ||
-      !count(value.binary.bytes)
-    )
-      invalid('Invalid migration binary.');
-    return;
-  }
+/** A guard is compared as a whole, so only the row's identity is checked. */
+function validateRow(value: unknown): asserts value is BaselineRow {
   if (
-    value.type !== 'baseline' ||
+    !object(value) ||
     !kinds.includes(value.kind as Kind) ||
     !text(value.id) ||
-    !object(value.guard) ||
-    !digest(value.guard.hash)
+    !object(value.guard)
   )
     invalid('Invalid baseline guard.');
-  if (value.kind === 'record') {
-    const guard = value.guard;
-    if (
-      !text(guard.modelId) ||
-      !(guard.currentVersion === null || text(guard.currentVersion)) ||
-      !(
-        guard.publishedUpdatedAt === null ||
-        (text(guard.publishedUpdatedAt) &&
-          Number.isFinite(Date.parse(guard.publishedUpdatedAt)))
-      ) ||
-      !(guard.parentId === null || text(guard.parentId)) ||
-      !(guard.position === null || count(guard.position)) ||
-      !validateSchedules(guard.schedules) ||
-      !object(guard.validity) ||
-      typeof guard.validity.current !== 'boolean' ||
-      !(
-        guard.validity.published === null ||
-        typeof guard.validity.published === 'boolean'
-      )
-    )
-      invalid('Invalid record baseline guard.');
+}
+
+async function readSmallFile(
+  directory: string,
+  file: string,
+  maximum: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  assertNotAborted(signal);
+  const handle = await open(join(directory, file));
+  try {
+    if ((await handle.stat()).size > maximum)
+      invalid(`Migration companion file is too large: ${file}`);
+    const bytes = await handle.readFile();
+    assertNotAborted(signal);
+    return bytes;
+  } finally {
+    await handle.close();
   }
-  if (value.original !== undefined) {
-    if (
-      !validateState(value.original, {
-        kind: value.kind,
-        id: value.id,
-        modelId: value.guard.modelId,
-      } as PlanEntry) ||
-      (value.original as { hash: string }).hash !== value.guard.hash
-    )
-      invalid('Invalid original record state.');
-    if (
-      value.kind === 'record' &&
-      hashJson(recordGuard(value.original as RecordState)) !==
-        hashJson(value.guard)
-    )
-      invalid('Original record state differs from its guard.');
-  }
+}
+
+/**
+ * The JSON lines of a companion file whose size, checksum and line count the
+ * manifest or the chunk index records. Every such file is capped, so it is
+ * read whole and checked before any line is parsed.
+ */
+async function jsonLines(
+  directory: string,
+  descriptor: Pick<ArtifactChunk, 'file' | 'bytes' | 'sha256'>,
+  lines: number,
+  label: string,
+  signal?: AbortSignal,
+): Promise<unknown[]> {
+  if (descriptor.bytes > MAX_METADATA)
+    invalid(`Migration companion file is too large: ${descriptor.file}`);
+  const bytes = await readSmallFile(
+    directory,
+    descriptor.file,
+    descriptor.bytes,
+    signal,
+  );
+  if (bytes.length !== descriptor.bytes)
+    invalid(`${label} size differs: ${descriptor.file}`);
+  if (sha256(bytes) !== descriptor.sha256)
+    invalid(`${label} checksum differs: ${descriptor.file}`);
+  const values = bytes.length
+    ? new TextDecoder('utf-8', { fatal: true })
+        .decode(bytes)
+        .replace(/\n$/, '')
+        .split('\n')
+    : [];
+  if (values.length !== lines)
+    invalid(`${label} entry count differs: ${descriptor.file}`);
+  return values.map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      invalid(`Invalid JSON ${label.toLowerCase()} entry: ${descriptor.file}`);
+    }
+  });
 }
 
 export async function loadBaseline(
@@ -810,9 +571,8 @@ export async function loadBaseline(
   signal?: AbortSignal,
 ): Promise<BaselineManifest> {
   const root = resolve(directory);
-  const info = await lstat(root);
-  if (!info.isDirectory() || info.isSymbolicLink())
-    invalid('Baseline must be a real directory.');
+  if (!(await stat(root)).isDirectory())
+    invalid('Baseline must be a directory.');
   const raw = await readSmallFile(root, 'manifest.json', MAX_METADATA, signal);
   const checksum = await readSmallFile(root, 'manifest.sha256', 65, signal);
   if (checksum.toString('utf8') !== `${sha256(raw)}\n`)
@@ -821,122 +581,47 @@ export async function loadBaseline(
     new TextDecoder('utf-8', { fatal: true }).decode(raw),
   );
   validateManifest(manifest);
+  // The store is new and is disposed by the caller after a failure.
   initTables(store);
-  for (const table of ['migration_baseline', 'migration_baseline_binaries'])
-    if (store.database.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get())
-      invalid('Baseline loading requires empty baseline tables.');
   const insert = store.database.prepare(
-    'INSERT INTO migration_baseline VALUES(?,?,?,?,?,?,?,?)',
+    'INSERT INTO migration_baseline VALUES(?,?,?)',
   );
-  const binary = store.database.prepare(
-    'INSERT INTO migration_baseline_binaries VALUES(?,?,?)',
+  const descriptors = await jsonLines(
+    root,
+    manifest.chunks,
+    manifest.chunks.count,
+    'Baseline chunk index',
+    signal,
   );
-  const counts: Record<Kind, number> = { record: 0, upload: 0, collection: 0 };
-  store.database.exec('SAVEPOINT migration_baseline_load');
-  try {
-    let chunkNumber = 0;
-    for await (const candidate of jsonlValues(
+  for (const [index, candidate] of descriptors.entries()) {
+    if (
+      !object(candidate) ||
+      candidate.file !==
+        `baseline/${String(index + 1).padStart(6, '0')}.jsonl` ||
+      !count(candidate.bytes) ||
+      candidate.bytes === 0 ||
+      !count(candidate.entries) ||
+      candidate.entries === 0 ||
+      !digest(candidate.sha256)
+    )
+      invalid('Invalid or unordered baseline chunk descriptor.');
+    const chunk = candidate as unknown as ArtifactChunk;
+    const rows = await jsonLines(
       root,
-      manifest.chunks,
-      manifest.chunks.count,
-      'Baseline chunk index',
-      1024,
+      chunk,
+      chunk.entries,
+      'Baseline',
       signal,
-    )) {
-      chunkNumber++;
-      if (
-        !object(candidate) ||
-        candidate.file !==
-          `baseline/${String(chunkNumber).padStart(6, '0')}.jsonl` ||
-        !count(candidate.bytes) ||
-        candidate.bytes === 0 ||
-        !count(candidate.entries) ||
-        candidate.entries === 0 ||
-        !digest(candidate.sha256)
-      )
-        invalid('Invalid or unordered baseline chunk descriptor.');
-      const chunk = candidate as unknown as ArtifactChunk;
-      for await (const row of jsonlValues(
-        root,
-        chunk,
-        chunk.entries,
-        'Baseline',
-        MAX_METADATA,
-        signal,
-      )) {
+    );
+    store.transaction(() => {
+      for (const row of rows) {
         validateRow(row);
-        if (row.type === 'baseline') {
-          const guard = row.guard as RecordGuard;
-          insert.run(
-            row.kind,
-            row.id,
-            guard.hash,
-            row.kind === 'record' ? guard.modelId : null,
-            row.kind === 'record' ? guard.parentId : null,
-            row.kind === 'record' ? guard.position : null,
-            JSON.stringify(row.guard),
-            row.original ? JSON.stringify(row.original) : null,
-          );
-          counts[row.kind]++;
-        } else {
-          await verifyBinary(root, row.binary, signal);
-          binary.run(row.uploadId, row.binary.file, JSON.stringify(row));
-        }
+        insert.run(row.kind, row.id, JSON.stringify(row.guard));
       }
-    }
-    if (hashJson(counts) !== hashJson(manifest.targetCounts))
-      invalid('Baseline namespace counts differ from the manifest.');
-    assertNotAborted(signal);
-    store.database.exec('RELEASE migration_baseline_load');
-  } catch (error) {
-    // SQLite can roll back the entire transaction on SQLITE_FULL. Keep that
-    // original error rather than replacing it with a missing-savepoint error.
-    try {
-      store.database.exec(
-        'ROLLBACK TO migration_baseline_load; RELEASE migration_baseline_load',
-      );
-    } catch {
-      // The owning snapshot is disposed by the caller after this failure.
-    }
-    throw error;
+    });
   }
+  assertNotAborted(signal);
   return manifest;
-}
-
-export function* baselineBinaries(
-  store: SnapshotStore,
-  directory: string,
-): Generator<MigrationBinary> {
-  for (const row of store.database
-    .prepare('SELECT data FROM migration_baseline_binaries ORDER BY upload_id')
-    .iterate()) {
-    const entry = JSON.parse(String(row.data)) as BinaryEntry;
-    yield {
-      localPath: resolve(directory, entry.binary.file),
-      binary: entry.binary,
-      filename: entry.filename,
-      url: entry.url,
-    };
-  }
-}
-export function baselineBinaryLookup(
-  store: SnapshotStore,
-  directory: string,
-  localPath: string,
-): MigrationBinary | undefined {
-  if (resolve(localPath) !== localPath) return undefined;
-  const file = relative(resolve(directory), localPath).split('\\').join('/');
-  const row = store.database
-    .prepare('SELECT data FROM migration_baseline_binaries WHERE file=?')
-    .get(file);
-  if (!row) return undefined;
-  const entry = JSON.parse(String(row.data)) as BinaryEntry;
-  return {
-    localPath,
-    binary: entry.binary,
-    filename: entry.filename,
-    url: entry.url,
-  };
 }
 
 /** Compare every recorded identity and detect new identities before any writes. */
@@ -951,44 +636,45 @@ export function compareBaseline(
   ] as const) {
     const unexpected = store.database
       .prepare(
-        `SELECT s.id FROM ${table} s LEFT JOIN migration_baseline b ON b.kind=? AND b.id=s.id WHERE s.side=? AND b.id IS NULL LIMIT 1`,
+        `SELECT s.id FROM ${table} s LEFT JOIN migration_baseline b ON b.kind=? AND b.id=s.id WHERE s.side=? AND b.id IS NULL ORDER BY s.id LIMIT 1`,
       )
       .get(kind, side);
     if (unexpected)
-      throw new ContentError(
-        'APPLY_CONFLICT',
-        `Destination gained ${kind} ${unexpected.id} after migration generation.`,
-      );
+      throw destinationChanged({
+        kind,
+        id: String(unexpected.id),
+        reason: 'added',
+      });
     const missing = store.database
       .prepare(
-        `SELECT b.id FROM migration_baseline b LEFT JOIN ${table} s ON s.side=? AND s.id=b.id WHERE b.kind=? AND s.id IS NULL LIMIT 1`,
+        `SELECT b.id FROM migration_baseline b LEFT JOIN ${table} s ON s.side=? AND s.id=b.id WHERE b.kind=? AND s.id IS NULL ORDER BY b.id LIMIT 1`,
       )
       .get(side, kind);
     if (missing)
-      throw new ContentError(
-        'APPLY_CONFLICT',
-        `Destination lost ${kind} ${missing.id} after migration generation.`,
-      );
+      throw destinationChanged({
+        kind,
+        id: String(missing.id),
+        reason: 'removed',
+      });
     for (const row of store.database
       .prepare(
         `SELECT b.id,b.guard_json,s.state_json,s.hash FROM migration_baseline b JOIN ${table} s ON s.side=? AND s.id=b.id WHERE b.kind=? ORDER BY b.id`,
       )
       .iterate(side, kind)) {
       const expected = JSON.parse(String(row.guard_json)) as RecordGuard;
-      let equal = expected.hash === row.hash;
-      if (kind === 'record') {
-        const actual = recordGuard(
-          JSON.parse(String(row.state_json)) as RecordState,
-        );
-        const { validity: _expectedValidity, ...left } = expected;
-        const { validity: _actualValidity, ...right } = actual;
-        equal = hashJson(left) === hashJson(right);
-      }
+      const equal =
+        kind === 'record'
+          ? hashJson(expected) ===
+            hashJson(
+              recordGuard(JSON.parse(String(row.state_json)) as RecordState),
+            )
+          : expected.hash === row.hash;
       if (!equal)
-        throw new ContentError(
-          'APPLY_CONFLICT',
-          `Destination ${kind} ${row.id} differs from the migration baseline.`,
-        );
+        throw destinationChanged({
+          kind,
+          id: String(row.id),
+          reason: 'changed',
+        });
     }
   }
 }

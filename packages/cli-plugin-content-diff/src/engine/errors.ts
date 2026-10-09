@@ -1,21 +1,26 @@
+import type { Kind } from './types';
+
 /** Context that callers need when an operation cannot finish safely. */
 export interface ContentFailureContext {
+  /** A fork this run created, or may have created, that still exists. */
   keptForkEnvironmentId?: string;
-  unconfirmedForkEnvironmentId?: string;
+  /** The message already says what happened to that fork. */
+  forkOutcomeStated?: boolean;
 }
 
 /** The only error fields exposed by the plugin's JSON command contract. */
-export interface ContentErrorReport extends ContentFailureContext {
+interface ContentErrorReport {
   name: string;
   message: string;
   code?: string;
   details?: Record<string, unknown>;
   suggestions?: string[];
+  keptForkEnvironmentId?: string;
 }
 
 export class ContentError extends Error implements ContentFailureContext {
   keptForkEnvironmentId?: string;
-  unconfirmedForkEnvironmentId?: string;
+  forkOutcomeStated?: boolean;
 
   constructor(
     readonly code: string,
@@ -66,9 +71,49 @@ export function contentErrorReport(error: Error): ContentErrorReport {
       typeof failure.keptForkEnvironmentId === 'string'
         ? failure.keptForkEnvironmentId
         : undefined,
-    unconfirmedForkEnvironmentId:
-      typeof failure.unconfirmedForkEnvironmentId === 'string'
-        ? failure.unconfirmedForkEnvironmentId
-        : undefined,
   };
+}
+
+/** The first observed difference between the destination and its baseline. */
+type DestinationDifference =
+  | {
+      kind: Kind;
+      id: string;
+      reason: 'added' | 'removed' | 'changed';
+    }
+  | { reason: 'schema' }
+  | { reason: 'drift'; description: string };
+
+export const DESTINATION_CHANGED_MESSAGE =
+  'The destination environment has changed since the diff generation. Please re-generate a diff to apply.';
+
+/** Every apply-time baseline failure reports the same instruction. */
+export function destinationChanged(
+  difference: DestinationDifference,
+): ContentError {
+  return new ContentError(
+    'DESTINATION_CHANGED',
+    DESTINATION_CHANGED_MESSAGE,
+    difference,
+  );
+}
+
+/** One human-readable line naming the first difference. */
+export function describeDestinationDifference(
+  details: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!details) return undefined;
+  if (details.reason === 'schema')
+    return 'First difference: the schema changed.';
+  if (details.reason === 'drift' && typeof details.description === 'string')
+    return `First difference: ${details.description}`;
+  if (typeof details.kind === 'string' && typeof details.id === 'string')
+    return `First difference: ${details.kind} ${details.id} was ${
+      details.reason === 'added'
+        ? 'added'
+        : details.reason === 'removed'
+          ? 'removed'
+          : 'changed'
+    }.`;
+  return undefined;
 }

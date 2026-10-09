@@ -1,23 +1,23 @@
 # DatoCMS content migrations
 
-Generate editable TypeScript migrations from content differences between DatoCMS environments or projects. Generation plans dependency order and emits actual CMA calls. Apply checks the destination and executes the script as written against the real CMA client.
+Generate editable TypeScript migrations from the content differences between two DatoCMS environments or projects. `content:diff` compares the content, plans the dependency order and writes the result as ordinary CMA calls. `content:apply` checks that the destination still matches what generation saw, then runs the script against the real CMA client, in a new fork by default.
 
 The plugin adds `content:diff` and `content:apply` to the unmodified DatoCMS CLI. It does not change native schema migrations or write their migration receipts.
 
 ## Setup
 
-Requires Node.js 22.13+ on the 22.x line, or Node.js 24+. Node 22 may print an experimental SQLite warning to stderr. SQLite is local temporary storage; it requires no separate server or account.
+Requires Node.js 22.23.1+ on the 22.x line, or Node.js 24.18+, for the built-in `node:sqlite` module. Node 22 may print an experimental SQLite warning to stderr. SQLite is only local temporary storage; it needs no server or account.
 
-Install both packages in the project containing your migrations and register the local plugin:
+Install both packages in the project that holds your migrations and register the plugin:
 
 ```sh
 npm install --save-dev datocms @datocms/cli-plugin-content-diff
 npx datocms plugins:link ./node_modules/@datocms/cli-plugin-content-diff
 ```
 
-For an unreleased plugin, install its local package or tarball instead of the registry version. Generated scripts import `@datocms/cli-plugin-content-diff/migration`, so the package must resolve from the migration directory. Installing only with `plugins:install` in a separate CLI data directory is insufficient for those imports.
+Generated scripts import `@datocms/cli-plugin-content-diff/migration`, so the package must resolve from the migration directory. Installing it only with `plugins:install`, in the CLI's own data directory, does not make those imports resolve.
 
-Use native profiles, linked-project OAuth, token environment variables, or `--api-token`. Authentication uses public CLI utilities and SDK APIs.
+Authentication follows the native CLI: `--api-token`, then the OAuth token of a project linked with `datocms link`, then the profile's token environment variable (`DATOCMS_API_TOKEN` for the default profile, `DATOCMS_<PROFILE>_PROFILE_API_TOKEN` otherwise, or the profile's `apiTokenEnvName`). The token must be able to read every model and every upload of the environments involved without restrictions; generation and the apply-time checks refuse with `UNPROVEN_FULL_ACCESS` otherwise. An API token's role must also be allowed to manage upload collections; account, organization and full-access admin tokens are exempt.
 
 ## Generate
 
@@ -25,22 +25,26 @@ Use native profiles, linked-project OAuth, token environment variables, or `--ap
 npx datocms content:diff syncContent --source=staging --destination=primary
 ```
 
-Generation checks schema compatibility before capturing content. It reads complete managed namespaces once into temporary SQLite, including current and published values, expanded blocks, schedules, assets and folders. It performs no post-capture verification pass. Keep both environments' content and schemas unchanged during generation using external write controls; the plugin does not acquire an environment lock.
+Generation resolves both environments, reads their schemas and refuses incompatible schemas before reading any content (see [Schema compatibility](#schema-compatibility)). It then reads both complete content namespaces once into temporary SQLite (current and published values, nested blocks, schedules, uploads and upload folders), plans the changes and writes the script. The plugin takes no lock on either environment: keep content and schemas unchanged while generation runs.
 
-The planner determines required changes, dependencies, publication cycles, ordering and any explicitly authorized temporary field settings. It then writes those execution steps into TypeScript. Assets are created before records; record operations follow the generated dependency order. Model selection limits changes, while other captured content supplies dependency and preservation evidence.
+The configured schema-migration tracking model (the profile's `migrations.modelApiKey`, `schema_migration` by default) is left out of the comparison, and its exact ID is recorded so that apply can tell if it was replaced.
 
-Output is a timestamped file such as `migrations/content/1791200000_syncContent.ts` and its sibling `1791200000_syncContent.content/` directory. The default directory is the `content/` subdirectory of the destination profile's migration directory, or `./migrations/content`. Existing output is never overwritten.
+The output is a timestamped file such as `migrations/content/1791200000_syncContent.ts` next to its `1791200000_syncContent.content/` companion directory. The default directory is the `content/` subdirectory of the destination profile's migrations directory, or `./migrations/content`, so the native schema runner never picks the scripts up. Existing output is never overwritten.
 
-| Flag | Default | Behavior |
+| Argument or flag | Default | Behavior |
 | --- | --- | --- |
-| `--output` | Timestamped file | Choose an exact `.ts` path or an output directory. |
-| `--item-types=article,page` | `all` | Select regular model API keys for changes. |
-| `--uploads=referenced` | `referenced` | Include referenced assets, or use `all`. |
-| `--include-deletions` | Off | Include safe destination-only deletions within scope. |
-| `--allow-partial` | Off | Permit only proven isolated skips and dependent skips. |
-| `--allow-temporary-schema-changes` | Off | Permit supported temporary validator/default changes. |
-| `--concurrency=8` | `8` | Maximum concurrent generation requests, from 1 to 16. |
-| `--chunk-bytes=1048576` | `1048576` | Target TypeScript part size; individual operations are never split. |
+| `NAME` | `contentMigration` | Migration name, camel-cased into the timestamped filename. |
+| `--source` | Required | Source environment ID, or `primary`. |
+| `--destination` | `primary` | Destination environment ID, or `primary`. |
+| `--output` | Timestamped file in the default directory | A path ending in `.ts` names the exact file; a path without an extension, or an existing directory, is a directory for a timestamped file. Any other path is refused. |
+| `--item-types=article,page` | `all` | Regular model API keys whose records the script may change. |
+| `--uploads` | `referenced` | `referenced` manages the uploads that managed records reference in either environment, and the folders containing them (with their ancestors); `all` manages every upload and folder. |
+| `--include-deletions` | Off | Delete destination-only records, uploads and folders within the scope, after the writes that drop references to them. |
+| `--allow-partial` | Off | Skip content the script cannot reproduce, and the writes that need it, instead of failing. |
+| `--concurrency` | `8` | Maximum concurrent independent requests, from 1 to 16. |
+| `--chunk-bytes` | `1048576` | Target size of each TypeScript part and each baseline chunk file, up to 16 MiB minus 1 KiB (the cap of a companion file); a single operation is never split. |
+
+The model selection limits which records the script changes. Unselected records are still read, because selected records may reference them and deletions must know what still points at a record.
 
 For separate projects, select both profiles:
 
@@ -50,11 +54,38 @@ npx datocms content:diff syncContent \
   --source-profile=source-project --destination-profile=target-project
 ```
 
-The projects must have compatible managed schemas and public IDs. Captures run concurrently for separate projects. `--source-api-token` and `--destination-api-token` override their respective authentication; paired profiles cannot be combined with `--profile` or `--api-token`.
+`--source-profile` and `--destination-profile` go together. `--source-api-token` and `--destination-api-token` override the token of their profile. Paired profiles cannot be combined with `--profile` or `--api-token`. The two projects are read concurrently, since they have separate rate limits.
+
+### Schema compatibility
+
+Generation compares structure only. Locales, the environment's timezone and its `improved_*`, `milliseconds_in_datetime` and `non_localized_focal_points` settings, and workflows (IDs and stage IDs) must match. Every selected model and every block model must exist in the destination with the same ID, API key, `block`, `singleton`, `sortable`, `tree`, draft mode and workflow, and the same fields compared by ID, API key, type and localization. Names, validators, default values, appearance and hints are ignored: the CMA validates every write when the script runs. Apply still checks a hash of the destination schema that includes some of these settings (see [Apply](#apply)).
+
+Run schema migrations first, with native `migrations:run`, then generate the content diff.
+
+### What the planner refuses
+
+The plugin never predicts whether the CMA will accept a write. It refuses only what the generated script could not reproduce faithfully:
+
+- values the SDK would corrupt when sending them back: an own `__proto__` key, `__itemTypeId`, or a metadata object with `type: "item"` in file or gallery values (`UNSUPPORTED_PAYLOAD_KEY`);
+- publication cycles that leaving top-level `link`/`links` values out of a first publication cannot break (`PUBLICATION_CYCLE`);
+- references to records created by the script whose containing field cannot be identified (`UNSUPPORTED_CREATION_REFERENCE`).
+
+Without `--allow-partial` the first refusal fails generation (`UNSAFE_REQUESTED_CHANGE`). With it, the refused entry is skipped, along with the writes that reference a skipped new record and the deletions of anything a skipped entry still references. A skipped update keeps its record's destination state, so nothing that state references is deleted, but writes to other records that reference it go ahead. Each skipped entry is reported with its reason.
+
+### Invalid source records
+
+Invalid records cannot be diffed. The CMA only accepts an invalid record as a draft in a model with draft mode and "Save invalid drafts" enabled, so the script could not reproduce any other invalid record. After planning, and before writing any file, generation checks every source record the script would create or update against the source CMA's own verdict (`is_current_version_valid` and `is_published_version_valid`):
+
+- an invalid published version always stops generation;
+- an invalid current version stops it, unless the model has draft mode with "Save invalid drafts" enabled.
+
+Generation then fails with `INVALID_SOURCE_RECORDS`, listing the records (the first 20 in the message, all of them in the JSON `details.records`). Fix them in the source environment and run `content:diff` again. Records the script does not write are not checked, and `--allow-partial` does not skip them. The plugin evaluates no validators itself: it reads the source CMA's verdict, which the CMA updates in the background after a schema change, so a check right after a validation change can still see the previous verdict.
+
+Integers outside JavaScript's safe range (±9,007,199,254,740,991) in record values are refused earlier, during capture, with `UNSUPPORTED_INTEGER_PRECISION`. They always fail generation, even with `--allow-partial`.
 
 ## Review and edit the script
 
-A small migration contains ordinary awaited CMA calls:
+A small migration holds ordinary awaited CMA calls:
 
 ```ts
 import { join } from 'node:path';
@@ -66,30 +97,60 @@ import {
 export default defineContentMigration(
   { baseline: join(__dirname, '1791200000_syncContent.content') },
   async (client: ContentMigrationClient): Promise<void> => {
+    // Update Article "Hello world" (AbCdEfGhIjKlMnOpQrStUv)
     await client.items.update('AbCdEfGhIjKlMnOpQrStUv', {
-      summary: { en: 'Updated procurement guidance.' },
+      title: 'Hello world',
+      meta: { current_version: '1234567' },
     });
   },
 );
 ```
 
-Each call executes immediately against the selected environment and returns the real CMA result. The plugin does not simulate the script, record intended content, or rebuild a plan during apply. `defineContentMigration` attaches the baseline declaration and manages outstanding requests; it returns a callable migration function. `ContentMigrationClient` uses public SDK method and response types for the methods supported by generated scripts and their parts.
+`ContentMigrationClient` is the `@datocms/cma-client-node` `Client` (the client the DatoCMS CLI builds) bound to the environment being migrated. Every call runs immediately against the CMA and returns its real response. `defineContentMigration` attaches the baseline declaration to the callback. The script imports only the runtime helpers it uses: `defineContentMigration`, plus `runMigrationPart` and `reorderRecords` when needed.
 
-Edits change what is sent to the CMA. Authors must keep edited operations in a valid order and update any related publication, schedule, or temporary-schema steps. The CMA validates actual writes. There is no automatic reordering or promise that an arbitrary edited script reproduces the originally generated result. Await every call.
+Calls are emitted in this order, each with one comment naming the action, the model, the record title when there is one, and the ID:
 
-Large migrations contain sequential TypeScript parts in the companion directory. Parts run in disposable Node processes to release compiled code and compiler subprocesses. Calls from a part are forwarded immediately to the real CMA client; this is execution, not a local simulation. The bridge supports the declared client methods and returns their real server responses.
+1. folder creates (parents first) and updates;
+2. upload creates, file replacements and metadata updates;
+3. record creates. A create sends empty (`[]` for Modular Content and multiple-links fields, `null` otherwise) every field that references a record not created yet or, for models without draft mode (which publish on create), a record not published yet; the whole field is emptied, blocks and Structured Text included, and the publication or update phase writes the full value. Records that reference each other are created in an order that tries to leave out few such fields, and only fields referencing a record created later are emptied;
+4. publications and unpublications, including the update that writes the published values before each publish, provisional first publications and the republications that break publication cycles, and tree moves (`parent_id`), so a record moves under its new parent before it is published there and leaves a parent before that parent is unpublished (a moved record that this run does not publish gets its draft changes in the same update, unless the update phase publishes them again);
+5. updates of current drafts, workflow stages, `created_at` and `first_published_at`, each followed by a publish when it changes the fields of a published draft-mode record that has no unpublished changes in the source;
+6. record, upload and folder deletions (folders deepest first);
+7. one `client.uploadCollections.reorder([...])` when any folder changes, listing every final folder at its desired position;
+8. one `reorderRecords(client, { model, parent, order })` per sortable or tree sibling group that gains records or whose order changes (a group that only loses records keeps its order and gets no call);
+9. schedule changes, only for records whose schedules differ.
 
-TypeScript loads through public `tsx` APIs. Run from the project directory so its tsconfig/path aliases apply, or set `TSX_TSCONFIG_PATH`. Generated comments identify models, records and phases. Each part uses project Prettier settings and must fit within 16 MiB, including headers.
+**Optimistic locking.** The first `items.update` of a record that already exists in the destination carries `meta: { current_version }` with the version recorded at generation, unless another write to that record comes first or an earlier tree move out of its sibling group renumbers it. If someone edits the record while the migration runs, the CMA rejects the update and apply reports `RECORD_CHANGED_DURING_APPLY` instead of overwriting the edit.
 
-Scripts, imports and formatter configuration are trusted executable Node code, not a sandbox. Independently constructed clients and other side effects are outside the supplied client's request lifecycle.
+**Blocks.** Updates send only the fields that change. Inside a changed Modular Content, single block or Structured Text field, a block that keeps its ID in the same field and locale is sent as its bare ID when unchanged, or as `{ id, type: 'item', attributes }` with only its changed attributes; new blocks are sent in full with their block model.
 
-## Companion files
+**Uploads.** The companion stores no files. New uploads use `client.uploads.createFromUrl` and replaced files `client.uploads.updateFromUrl`, both fetching the original file from the source upload URL captured at generation, followed by an MD5 check that fails with `Asset <id> changed in the source since the diff generation. Please re-generate a diff to apply.` when the source file changed. The source uploads must therefore still exist when the script runs. Metadata-only changes use `client.uploads.update` with the changed attributes.
 
-Keep the `.ts` file and its same-named `.content` directory together. Apply, preflight and repair all bind to that sibling directory. The companion holds checksummed schema/project bindings, original destination guards, original values for changed identities, repair settings, and required original asset binaries. It is not an executable mutation plan or saved run progress. The TypeScript contains the operations to execute.
+**Ordering.** Record creates send no `position`, and tree creates and moves send only `parent_id`. `reorderRecords` then lists the sibling group, refuses with `ORDERING_MEMBERS_DIFFER` when its members differ from `order` (naming the extra and missing IDs), moves only the out-of-place records to the positions the group already uses, reads the result back and fails with `ORDERING_NOT_APPLIED` if the order still differs after three passes. A group already in order costs one listing and no writes. Unchanged groups get no call.
 
-Edit TypeScript, including parts when present. Preserve baseline metadata and binary files. Checksums detect corruption and incomplete copies, not deliberate tampering by someone who can replace the checksums too. Artifacts contain project content, not authentication credentials.
+**Editing.** Edits change what is sent to the CMA, and the CMA validates every write. Keep edited operations in a valid order (a unique value must be released before another record takes it; a referenced record must exist, and be published, before a published record links to it) and update any related publication, ordering and schedule calls. When you add or remove records of a sibling group, update its `order` list. Await every call.
 
-This format is incompatible with the earlier simulated-migration format. Regenerate old scripts and companions before applying them.
+**Large migrations.** When the script exceeds `--chunk-bytes`, its operations move into sequential parts in the companion's `parts/` directory and the main file runs them in order:
+
+```ts
+for (const part of ['000001.ts', '000002.ts'])
+  await runMigrationPart(client, join(__dirname, '1791200000_syncContent.content', 'parts', part));
+```
+
+`runMigrationPart` loads each part in the same process through the same public `tsx` API as the main script, awaits its default export with the same client, and drops it from the module cache before the next part loads. `tsx` keeps each compiled part in memory until the process ends, so memory grows with the total size of the parts.
+
+TypeScript loads through `tsx`: run from the project directory so its tsconfig and path aliases apply, or set `TSX_TSCONFIG_PATH`. Generated files are formatted with the project's Prettier configuration. Scripts, their imports and the formatter configuration are trusted Node code, not a sandbox; requests made by clients the script builds itself are outside apply's request tracking.
+
+## Companion directory
+
+Keep the `.ts` file and its same-named `.content` directory together; apply only accepts a script whose `baseline` points at that sibling directory. The companion holds:
+
+- `manifest.json` and its `manifest.sha256`: the format (`datocms-content-migration-baseline/1`), the creation time, source and destination project and environment IDs, the projected destination schema (its hash covers the whole projection, model names, validators and defaults included), the tracking-model bindings, the generation options, the planned counts and the chunk index descriptor;
+- `chunks.jsonl`: the SHA-256, byte count and entry count of every baseline chunk;
+- `baseline/NNNNNN.jsonl`: one guard row per destination record, upload and folder as generation observed them;
+- `parts/NNNNNN.ts`, when the script is split.
+
+The companion is evidence about the destination, not a plan: the TypeScript holds the operations. Edit the script and its parts freely; leave the manifest and baseline files untouched. Checksums detect corruption and incomplete copies, not deliberate tampering by someone who can replace the checksums too. Artifacts contain project content, never credentials.
 
 ## Apply
 
@@ -97,65 +158,74 @@ This format is incompatible with the earlier simulated-migration format. Regener
 npx datocms content:apply ./migrations/content/1791200000_syncContent.ts
 ```
 
-Apply validates companion integrity, destination project/schema, permissions and the complete original destination baseline. By default it creates an isolated destination fork, verifies its baseline, and executes the script against that fork. It reports the resulting environment ID and never promotes it automatically.
+Apply loads the script and checks the companion's checksums, sizes and entry counts. It then checks that the destination belongs to the recorded project (`DESTINATION_MISMATCH` otherwise), is ready and writable when applying in place, and still matches the generation baseline: the destination schema hash, then every record, upload and folder of the complete namespace, with no identity added or removed. The schema hash covers the locales, the environment settings listed under [Schema compatibility](#schema-compatibility), workflows (IDs, API keys, stage IDs, names and initial stages), and every model's ID, API key, name, `block`, `singleton`, `sortable`, `tree`, draft mode, draft-saving and all-locales-required settings, workflow and fields (ID, API key, type, localization, validators and default value). Changing any of these in the destination, a model rename or a field API key change included, needs a new diff; field labels, hints, appearance, fieldsets, field order and other presentation settings are not part of it. Any difference fails with `DESTINATION_CHANGED`:
 
-| Flag | Behavior |
-| --- | --- |
-| `--preflight-only` | Check artifacts, destination baseline, permissions and options without executing the migration or creating a fork. |
-| `--fork-name=content-review` | Choose the new fork's name; existing names are refused. |
-| `--destination=ENVIRONMENT_ID` | Select a destination satisfying the recorded project/schema/baseline binding. |
-| `--in-place` | Execute directly in the destination. |
-| `--allow-primary` | Additionally authorize primary writes; required for primary in-place execution or repair. |
-| `--keep-failed-fork` | Retain a confirmed owned fork after failure. |
-| `--allow-temporary-schema-changes` | Authorize generated temporary validator/default changes. |
-| `--schedule-window=120` | Refuse existing schedules due within this many minutes; `0` disables the check. |
-| `--fast-fork` | Use DatoCMS's fast fork, which blocks destination writes while copying. |
-| `--verification=versions` | Choose version-based or full destination capture checks. |
-| `--concurrency=8` | Bound preflight capture requests; execution follows the script's written order. |
-| `--repair` | Conservatively restore original field settings and eligible original schedules after interrupted in-place execution. |
-
-`--preflight-only` replaces `--dry-run`. It does not execute migration callbacks, preview edited operations, validate arbitrary new payloads, or promise they will succeed. Preflight checks the script file without evaluating its imports or top-level code. Any displayed generated counts describe the original generation, not later edits. A later apply repeats destination checks.
-
-The destination baseline protects against content changes made after generation. Execution does not compare its result with an obsolete desired-state copy or perform apply-time replanning. Script authors own edited logic and any additional assertions they need. Stop competing writes during execution; there is no atomic transaction around the entire migration.
-
-## Interruptions and repair
-
-Generation and execution are one-shot operations, with no pause, resume, checkpoints, or saved execution progress. Temporary SQLite/staging state is removed on completion or failure. Keep completed scripts and companions.
-
-Cooperative interruption stops new supported requests and drains submitted requests before cleanup. A confirmed owned fork is removed after failure unless explicitly retained. A failed fork request with an unconfirmed identity never grants cleanup ownership. SIGKILL and machine shutdown cannot run cleanup.
-
-Generated temporary field settings are restored through guarded cleanup. Conservative repair reads the sibling companion directly, never evaluates the TypeScript module, and never reconstructs edited intent. It restores a field only when its settings match the recorded temporary state, and an original missing future schedule only when the record still matches the original content. It cannot infer desired schedules from edited code or resume content writes. Ambiguous states require manual review.
-
-```sh
-npx datocms content:apply ./migrations/content/1791200000_syncContent.ts \
-  --repair --destination=main --allow-primary
 ```
+The destination environment has changed since the diff generation. Please re-generate a diff to apply.
+First difference: record AbCdEfGhIjKlMnOpQrStUv was changed.
+```
+
+It also refuses to start when a destination schedule falls due within the schedule window. By default it then creates a new fork of the destination, waits for it with progress output, checks the same baseline in the fork, and runs the script there. It reports the environment it ran in and never promotes a fork.
+
+| Argument or flag | Default | Behavior |
+| --- | --- | --- |
+| `SCRIPT` | Required | The generated `.ts` entrypoint. |
+| `--preflight-only` | Off | Check the artifact, read access, the destination baseline and the schedule window without evaluating the script or creating a fork. |
+| `--fork-name=content-review` | `content-apply-<UUID>` | ID of the new fork; an existing environment ID is refused. Cannot be combined with `--in-place`. |
+| `--destination=ENVIRONMENT_ID` | The recorded destination | Apply against another environment of the same project that matches the baseline. |
+| `--in-place` | Off | Run the script directly in the destination instead of a fork. |
+| `--allow-primary` | Off | Permit in-place writes to the primary environment; requires `--in-place`. |
+| `--keep-failed-fork` | Off | Keep the fork after a failure instead of deleting it. Cannot be combined with `--preflight-only`. |
+| `--schedule-window` | `120` | Refuse to start when a destination schedule falls due within this many minutes; `0` disables the check. |
+| `--fast-fork` | Off | Create the fork with DatoCMS's fast fork, which blocks writes to the destination while it copies. |
+| `--verification` | `versions` | How a baseline capture is confirmed: `versions` lists record versions once more (uploads and folders are reread in full); `full` rereads everything. In fork mode only the fork's capture is confirmed, since a change during the destination capture is carried into the fork. |
+| `--concurrency` | `8` | Maximum concurrent baseline read requests, from 1 to 16; script calls run as written. |
+
+`--preflight-only` only checks that the script is a regular file, without reading or evaluating it, so it does not run, preview or validate the script's calls, and the generation counts it reports describe the generated script, not later edits. A later apply repeats every check.
+
+### Failures
+
+CMA errors raised by the script are reported once, with the request and the CMA's error codes:
+
+- `CMA_VALIDATION_FAILED` for a 422, such as `The CMA rejected PUT /items/AbCdEfGhIjKlMnOpQrStUv: INVALID_FIELD (title: VALIDATION_REQUIRED).`, with a hint when a unique value is still held by another record or a reference is missing or unpublished;
+- `RECORD_CHANGED_DURING_APPLY` when a locked update finds a newer version;
+- `CMA_REQUEST_FAILED` for any other CMA error, and for a request that timed out (a timed-out write may still have been applied).
+
+In fork mode the fork is deleted after a failure, unless `--keep-failed-fork` is set, and the message says whether it was deleted or kept and that the destination was not changed. In place, the message says that writes made before the failure remain. There is no transaction around the migration: stop competing writes while it runs.
+
+A script that returns while CMA writes are still running, or that leaves a call unawaited which is then refused or fails, fails with `UNAWAITED_MIGRATION_CALL` once every request settles. Reads still in flight are only drained. Detection only sees requests: an unawaited `uploads.createFromUrl` or `uploads.updateFromUrl` (or a `runMigrationPart` whose part starts with one) does local file work and a download before its first write, so a script that returns during that time is reported as a success and the upload is refused afterwards. Always `await` every call.
+
+## Interruptions
+
+Generation and apply are one-shot operations, with no pause, resume or saved progress. On `SIGINT`, `SIGTERM` or `SIGHUP` the command stops starting new work. During apply, new writes are refused while requests already sent finish (reads keep flowing so SDK jobs already submitted can be observed); cleanup then deletes a fork created by the run unless `--keep-failed-fork` is set. A second signal does not skip cleanup. Temporary SQLite and staging files are removed on completion and on failure. `SIGKILL` and machine shutdown cannot run cleanup.
 
 ## Native schema migrations
 
-Keep content scripts under `migrations/content/` and execute them with `content:apply`. Use native `migrations:run` for schema migrations. Run schema changes before generating the content diff. The plugin preserves validated schema-migration tracking records and does not participate in the native pending-migration queue.
+Keep content scripts under `migrations/content/` and run them with `content:apply`; run schema migrations with native `migrations:run`. Content scripts do not take part in the native pending-migration queue, and the schema-migration tracking model is never part of a content migration.
 
-## Supported behavior and limits
+## Behavior and limits
 
-- Current and published content, nested blocks, structured text, typed references, ordering, workflows, assets, folders, and schedules are planned together. Folder sibling positions and unique names are checked before writes.
-- Supported publication cycles use provisional direct links followed by republication. In-place execution can briefly expose a record without those links and add an extra published version. Cycles that cannot be broken safely, including some cycles entirely inside blocks or structured text, are rejected or isolated by partial mode. Required-link relaxation needs temporary-schema authorization.
-- Unsafe block ownership changes or recreation that silently substitutes defaults are refused. Writes cannot reproduce unsafe SDK file/gallery metadata, including reserved `__proto__`, `__itemTypeId`, and metadata objects with `type: "item"`; such values can remain unchanged. Opaque JSON field text retains its ordinary meaning.
-- Integer fields, integer defaults, and integer-valued validator settings must stay within JavaScript's safe range, ±9,007,199,254,740,991. Floating-point fields retain normal number semantics.
-- Ordered destination records retain their positions unless intentionally changed. Conflicting final positions in the same sortable/tree sibling group are fatal; partial mode does not bypass an ordering conflict.
-- IDs or asset URLs embedded in arbitrary JSON/text are not typed dependencies. Referenced-asset selection and deletion protection cannot infer those relationships.
-- New records/uploads belong to the account or token running the migration. Version history, original creators, and read-only timestamps are not copied. Writable `created_at` and `first_published_at` are preserved where supported.
-- Content writes can trigger configured webhooks. Forks carry schedules that may run even before promotion. Fast forks temporarily block writes and may interfere with schedules due during the copy; plan an appropriate quiet window.
-- The complete destination namespace is checked even for a small edit. Unpaginated schema, folder, and reference endpoints remain API-side limits. SQLite working data and staged assets can require substantial temporary disk space.
+- Current and published content, nested blocks, structured text, typed references, workflow stages, sortable and tree ordering, uploads, upload folders and schedules are planned together.
+- Publication cycles between records are broken by publishing first without the top-level links to records published later, then publishing again with them. Running in place can briefly expose a record without those links and adds an extra published version. Cycles made only of links inside blocks or structured text cannot be broken this way.
+- IDs or upload URLs embedded in arbitrary JSON or text fields are not typed references; referenced-upload selection and deletion ordering cannot see them.
+- New records and uploads belong to the account or token running the migration. Version history, original creators and read-only timestamps are not copied; writable `created_at` and `first_published_at` are.
+- Content writes trigger configured webhooks. Forks carry schedules that may run before promotion. Fast forks block destination writes while copying and may interfere with schedules due during the copy.
+- The complete destination namespace is checked even for a small change. Schema, workflow and folder endpoints are read unpaginated, as the API serves them. SQLite working data can need substantial temporary disk space.
 
-Both commands support `--json` and standard CLI logging flags. Authentication credentials are redacted from request logs and surfaced errors. The diff JSON result contains `scriptPath`, source/destination environment IDs, and change counts. JSON failures preserve `keptForkEnvironmentId` for an intentionally retained owned fork and `unconfirmedForkEnvironmentId` when creation could not be acknowledged. Unconfirmed environments are never automatically deleted.
+## Output and errors
+
+Both commands support `--json` and the standard CLI logging flags (`--log-level`, `--log-mode`). With `--json`, `content:diff` returns `scriptPath`, `sourceEnvironmentId`, `destinationEnvironmentId`, `counts` (`record`, `upload` and `collection` objects, each with `create`, `update`, `delete`, `noop` and `skip` counts; `collection` means upload folders, here and wherever the output names a `kind`) and `skipped` (`{ kind, id, code, message }` for each reason an entry was skipped; without `--json` these are printed to stderr). `content:apply` returns `environmentId`, `scriptExecuted` and `partial` (whether generation skipped content), plus `preflightOnly` and `generatedCounts` for a preflight. Failures print `{ "error": { name, message, code, details, suggestions, keptForkEnvironmentId? } }`, where `keptForkEnvironmentId` appears when a fork created by the run still exists.
+
+Request logs and API errors never contain the API token: the SDK masks the `Authorization` header (this relies on `@datocms/rest-client-utils` 6.1.1 or later, which the plugin depends on).
 
 ## Development
 
 ```sh
 npm run build
 npm run typecheck
+npm run typecheck:test
 npm test
 npm run package:check
 ```
 
-Tests cover generated execution order, real CMA results, edited scripts, baseline integrity, plugin boundaries, interruption, repair and cleanup. Synthetic scale measurements and previous live runs of the retired execution architecture do not establish full-transfer throughput for this direct execution version.
+The tests are synthetic and need no network or credentials. They generate scripts from captured states, typecheck them against the SDK types and run them against an in-memory CMA, and cover baseline integrity, the apply checks, fork cleanup, request tracking, interruption and the command contracts. See `docs/design.md` for the design.

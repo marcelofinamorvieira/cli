@@ -4,7 +4,7 @@
   "description": "Generate and execute guarded TypeScript content migrations",
   "keywords": ["datocms", "cli", "content", "diff", "migration", "typescript"],
   "engines": {
-    "node": "^22.13.0 || >=24.0.0"
+    "node": "^22.23.1 || >=24.18.0"
   },
   "author": "DatoCMS <support@datocms.com>",
   "homepage": "https://github.com/datocms/cli#readme",
@@ -24,7 +24,7 @@
     "build": "node -e \"require('node:fs').rmSync('lib', { recursive: true, force: true })\" && tsc -b",
     "postpack": "rm -f oclif.manifest.json",
     "prepack": "npm run build && oclif manifest",
-    "test": "mocha --timeout 200000 --require ts-node/register --forbid-only \"test/rewrite/**/*.test.ts\"",
+    "test": "mocha --timeout 30000 --require ts-node/register --forbid-only \"test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:test": "tsc -p test/tsconfig.json --noEmit",
     "package:check": "node scripts/package-check.mjs"
@@ -39,12 +39,12 @@
     "lodash": "^4.17.21",
     "prettier": "^3.4.2",
     "@datocms/dashboard-client": "^6.1.0",
+    "@datocms/rest-client-utils": "^6.1.1",
     "tsx": "^4.19.2"
   },
   "devDependencies": {
     "@datocms/cma-client": "^6.1.0",
     "@datocms/cma-client-node": "^6.1.0",
-    "@datocms/rest-client-utils": "^6.1.0",
     "mocha": "^12.0.2",
     "oclif": "^4",
     "ts-node": "^10.2.1",

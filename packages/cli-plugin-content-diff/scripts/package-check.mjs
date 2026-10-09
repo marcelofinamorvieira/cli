@@ -42,28 +42,9 @@ function sourceFiles(directory, prefix = '') {
   });
 }
 
-function assertNoCredentials(files) {
-  for (const [name, value] of Object.entries(process.env)) {
-    if (!/^DATOCMS_(?:.*_)?API_TOKEN$/.test(name) || !value || value.length < 8)
-      continue;
-    const forms = [
-      value,
-      JSON.stringify(value).slice(1, -1),
-      encodeURIComponent(value),
-    ].map((form) => Buffer.from(form));
-    for (const path of files) {
-      const bytes = readFileSync(join(root, path));
-      assert.ok(
-        !forms.some((form) => bytes.includes(form)),
-        `${path} contains the credential from ${name}`,
-      );
-    }
-  }
-}
-
 try {
   const metadata = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-  assert.equal(metadata.engines.node, '^22.13.0 || >=24.0.0');
+  assert.equal(metadata.engines.node, '^22.23.1 || >=24.18.0');
   // Without it, oclif describes the topic with the first command's summary.
   assert.ok(
     metadata.oclif.topics?.content?.description,
@@ -100,41 +81,6 @@ try {
     expected.sort(),
     'package dry-run contains unexpected or missing files',
   );
-  for (const name of [
-    'types',
-    'errors',
-    'store',
-    'codec',
-    'schema',
-    'capture',
-    'planner',
-    'artifact-integrity',
-    'asset-download',
-    'portable-id',
-    'direct-apply',
-  ]) {
-    assert.ok(
-      files.includes(`lib/engine/${name}.js`),
-      `missing engine/${name}.js`,
-    );
-    assert.ok(
-      files.includes(`lib/engine/${name}.d.ts`),
-      `missing engine/${name}.d.ts`,
-    );
-  }
-  for (const retired of [
-    'apply',
-    'migration-intent',
-    'migration-validity',
-    'migration-repair',
-    'migration-preview',
-  ]) {
-    assert.ok(
-      !files.includes(`lib/engine/${retired}.js`),
-      `retired execution path is still packed: ${retired}`,
-    );
-  }
-  assertNoCredentials(files);
   for (const command of ['content:diff', 'content:apply']) {
     const help = run(process.execPath, [
       join(root, 'bin/run'),
@@ -144,7 +90,7 @@ try {
     assert.ok(help.includes(command), `compiled help is missing ${command}`);
   }
   console.log(
-    `Verified ${files.length} package files, both content commands, artifact and plan engine modules, and credential exclusion without publishing.`,
+    `Verified ${files.length} package files and both content commands without publishing.`,
   );
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

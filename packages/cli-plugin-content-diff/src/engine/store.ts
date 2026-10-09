@@ -5,87 +5,47 @@ import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { ContentError } from './errors';
 import type {
   Action,
-  BlockOwner,
   CollectionState,
   Kind,
   PlanEntry,
   RecordState,
   Reference,
   Side,
-  UniqueValue,
   UploadState,
 } from './types';
 
-export interface PlanEdge {
-  fromKind: Kind;
-  fromId: string;
-  toKind: Kind;
-  toId: string;
-  reason: string;
-  phase?: string;
-  ordering?: number;
-}
-
 type Sqlite = typeof import('node:sqlite');
 
+function supportedNode(version: string): boolean {
+  const [major = 0, minor = 0, patch = 0] = version.split('.').map(Number);
+  if (major === 22) return minor > 23 || (minor === 23 && patch >= 1);
+  if (major === 24) return minor >= 18;
+  return major > 24;
+}
+
 /**
- * The host CLI also runs on Node versions without node:sqlite. Loading it on
- * first use lets command modules load and report the runtime requirement.
+ * The host CLI also runs on Node versions without node:sqlite, or whose
+ * node:sqlite is older than the supported floor. Checking on first use lets
+ * command modules load and report the runtime requirement.
  */
-export function loadSqlite(load: (id: string) => unknown = require): Sqlite {
+export function loadSqlite(
+  load: (id: string) => unknown = require,
+  version: string = process.versions.node,
+): Sqlite {
+  const unsupported = () =>
+    new ContentError(
+      'UNSUPPORTED_NODE_VERSION',
+      `content:diff and content:apply require Node.js 22.23.1+ on the 22.x line, or Node.js 24.18+, for the built-in node:sqlite module. Current Node.js: v${version}.`,
+    );
+  if (!supportedNode(version)) throw unsupported();
   try {
     return load('node:sqlite') as Sqlite;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ERR_UNKNOWN_BUILTIN_MODULE')
       throw error;
-    throw new ContentError(
-      'UNSUPPORTED_NODE_VERSION',
-      `content:diff and content:apply require Node.js 22.13+ on the 22.x line, or Node.js 24+, for the built-in node:sqlite module. Current Node.js: ${process.version}.`,
-    );
+    throw unsupported();
   }
 }
-
-/** Native iterators on Node 22.13 do not keep their statement alive through GC. */
-const workingDatabase = ({ DatabaseSync }: Sqlite) =>
-  class WorkingDatabase extends DatabaseSync {
-    override prepare(sql: string): StatementSync {
-      const statement = super.prepare(sql);
-      const nativeIterate = statement.iterate;
-      Object.defineProperty(statement, 'iterate', {
-        value: (...parameters: Parameters<StatementSync['iterate']>) => {
-          const cursor = Reflect.apply(
-            nativeIterate,
-            statement,
-            parameters,
-          ) as ReturnType<StatementSync['iterate']>;
-          // The iterator itself owns the statement, rather than retaining every
-          // prepared query in a database-wide set. Concurrent prepare calls also
-          // retain independent native cursors and parameter bindings.
-          const iterator = Object.create(
-            Object.getPrototypeOf(cursor),
-          ) as ReturnType<StatementSync['iterate']>;
-          Object.defineProperties(iterator, {
-            owner: { value: statement },
-            next: { value: cursor.next.bind(cursor) },
-            [Symbol.iterator]: {
-              value() {
-                return this;
-              },
-            },
-            ...(cursor.return
-              ? { return: { value: cursor.return.bind(cursor) } }
-              : {}),
-            ...(cursor.throw
-              ? { throw: { value: cursor.throw.bind(cursor) } }
-              : {}),
-          });
-          return iterator;
-        },
-      });
-      return statement;
-    }
-  };
-let WorkingDatabase: ReturnType<typeof workingDatabase> | undefined;
 
 /** A one-run working database. Its directory is never a supported run input. */
 export class SnapshotStore {
@@ -96,14 +56,14 @@ export class SnapshotStore {
   private closed = false;
 
   constructor(directory?: string) {
-    WorkingDatabase ??= workingDatabase(loadSqlite());
+    const sqlite = loadSqlite();
     const parent = directory ?? tmpdir();
     mkdirSync(parent, { recursive: true });
     this.directory = mkdtempSync(join(parent, 'content-diff-'));
     this.filename = join(this.directory, 'working.sqlite');
     let database: DatabaseSync | undefined;
     try {
-      database = new WorkingDatabase(this.filename);
+      database = new sqlite.DatabaseSync(this.filename);
       this.database = database;
       // Bound SQLite's own page cache and put sorting/spill state on disk.
       this.database.exec(`
@@ -132,35 +92,15 @@ export class SnapshotStore {
         CREATE TABLE refs (
           side TEXT NOT NULL, owner_id TEXT NOT NULL, target_id TEXT NOT NULL,
           kind TEXT NOT NULL, path TEXT NOT NULL, field_id TEXT NOT NULL,
-          required INTEGER NOT NULL,
           PRIMARY KEY(side, owner_id, target_id, kind, path, field_id)
         ) WITHOUT ROWID;
         CREATE INDEX refs_target ON refs(side, target_id, kind, owner_id);
-        CREATE TABLE block_owners (
-          side TEXT NOT NULL, block_id TEXT NOT NULL, record_id TEXT NOT NULL,
-          model_id TEXT NOT NULL, path TEXT NOT NULL, slice TEXT NOT NULL,
-          PRIMARY KEY(side, block_id, record_id, path, slice)
-        ) WITHOUT ROWID;
-        CREATE INDEX block_owners_record ON block_owners(side, record_id, slice, block_id);
-        CREATE TABLE unique_values (
-          side TEXT NOT NULL, model_id TEXT NOT NULL, field_id TEXT NOT NULL,
-          locale TEXT NOT NULL, slice TEXT NOT NULL, value TEXT NOT NULL, record_id TEXT NOT NULL,
-          PRIMARY KEY(side, model_id, field_id, locale, slice, value, record_id)
-        ) WITHOUT ROWID;
-        CREATE INDEX unique_values_record ON unique_values(side, record_id, field_id, slice);
         CREATE TABLE plan (
           kind TEXT NOT NULL, id TEXT NOT NULL, model_id TEXT NOT NULL,
           action TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind, id)
         ) WITHOUT ROWID;
         CREATE INDEX plan_order ON plan(kind, model_id, id);
         CREATE INDEX plan_action ON plan(action, kind, model_id, id);
-        CREATE TABLE edges (
-          phase TEXT NOT NULL DEFAULT 'content', from_kind TEXT NOT NULL,
-          from_id TEXT NOT NULL, to_kind TEXT NOT NULL, to_id TEXT NOT NULL,
-          reason TEXT NOT NULL, ordering INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY(phase, from_kind, from_id, to_kind, to_id, reason)
-        ) WITHOUT ROWID;
-        CREATE INDEX edges_target ON edges(phase, to_kind, to_id, from_kind, from_id);
       `);
     } catch (error) {
       try {
@@ -173,7 +113,12 @@ export class SnapshotStore {
     }
   }
 
-  private statement(sql: string): StatementSync {
+  /**
+   * A statement prepared once per store for SQL that runs per entry or per
+   * row: preparing one per call can retain substantial native SQLite memory
+   * until GC. Streaming cursors need their own statement instead.
+   */
+  prepared(sql: string): StatementSync {
     let result = this.statements.get(sql);
     if (!result) {
       result = this.database.prepare(sql);
@@ -183,7 +128,7 @@ export class SnapshotStore {
   }
 
   private read<T>(sql: string, ...parameters: string[]): T | undefined {
-    const row = this.statement(sql).get(...parameters);
+    const row = this.prepared(sql).get(...parameters);
     return row
       ? (JSON.parse((row.state_json ?? row.data) as string) as T)
       : undefined;
@@ -214,21 +159,7 @@ export class SnapshotStore {
   }
 
   putRecord(side: Side, state: RecordState): void {
-    // A replacement capture must not retain references or uniqueness claims
-    // from the previous state. Capture repopulates these indexes afterwards.
-    this.statement('DELETE FROM refs WHERE side = ? AND owner_id = ?').run(
-      side,
-      state.id,
-    );
-    // Without statistics SQLite can choose the side-only primary-key prefix,
-    // rescanning every accumulated block for every record in a large capture.
-    this.statement(
-      'DELETE FROM block_owners INDEXED BY block_owners_record WHERE side = ? AND record_id = ?',
-    ).run(side, state.id);
-    this.statement(
-      'DELETE FROM unique_values WHERE side = ? AND record_id = ?',
-    ).run(side, state.id);
-    this.statement(
+    this.prepared(
       'INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?, ?, ?, ?)',
     ).run(
       side,
@@ -249,25 +180,15 @@ export class SnapshotStore {
     );
   }
 
-  records(side: Side, modelId?: string): Generator<RecordState> {
-    return modelId === undefined
-      ? this.iterate(
-          'SELECT state_json FROM records WHERE side = ? ORDER BY model_id, id',
-          side,
-        )
-      : this.iterate(
-          'SELECT state_json FROM records WHERE side = ? AND model_id = ? ORDER BY id',
-          side,
-          modelId,
-        );
-  }
-
-  iterateRecords(side: Side, modelId?: string): Generator<RecordState> {
-    return this.records(side, modelId);
+  records(side: Side): Generator<RecordState> {
+    return this.iterate(
+      'SELECT state_json FROM records WHERE side = ? ORDER BY model_id, id',
+      side,
+    );
   }
 
   putUpload(side: Side, state: UploadState): void {
-    this.statement('INSERT OR REPLACE INTO uploads VALUES (?, ?, ?, ?, ?)').run(
+    this.prepared('INSERT OR REPLACE INTO uploads VALUES (?, ?, ?, ?, ?)').run(
       side,
       state.id,
       state.collectionId,
@@ -290,12 +211,9 @@ export class SnapshotStore {
       side,
     );
   }
-  iterateUploads(side: Side): Generator<UploadState> {
-    return this.uploads(side);
-  }
 
   putCollection(side: Side, state: CollectionState): void {
-    this.statement(
+    this.prepared(
       'INSERT OR REPLACE INTO collections VALUES (?, ?, ?, ?, ?, ?)',
     ).run(
       side,
@@ -321,112 +239,20 @@ export class SnapshotStore {
       side,
     );
   }
-  iterateCollections(side: Side): Generator<CollectionState> {
-    return this.collections(side);
-  }
 
   putReference(side: Side, reference: Reference): void {
-    this.statement(
-      'INSERT OR REPLACE INTO refs VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).run(
+    this.prepared('INSERT OR REPLACE INTO refs VALUES (?, ?, ?, ?, ?, ?)').run(
       side,
       reference.ownerId,
       reference.targetId,
       reference.kind,
       reference.path,
       reference.fieldId,
-      Number(reference.required),
     );
-  }
-
-  *references(side: Side, ownerId?: string): Generator<Reference> {
-    const sql =
-      ownerId === undefined
-        ? 'SELECT * FROM refs WHERE side = ? ORDER BY owner_id, target_id, kind, path, field_id'
-        : 'SELECT * FROM refs WHERE side = ? AND owner_id = ? ORDER BY target_id, kind, path, field_id';
-    for (const row of this.database
-      .prepare(sql)
-      .iterate(...(ownerId === undefined ? [side] : [side, ownerId]))) {
-      yield {
-        ownerId: row.owner_id as string,
-        targetId: row.target_id as string,
-        kind: row.kind as Reference['kind'],
-        path: row.path as string,
-        fieldId: row.field_id as string,
-        required: Boolean(row.required),
-      };
-    }
-  }
-
-  putBlockOwner(side: Side, owner: BlockOwner): void {
-    this.statement(
-      'INSERT OR REPLACE INTO block_owners VALUES (?, ?, ?, ?, ?, ?)',
-    ).run(
-      side,
-      owner.blockId,
-      owner.recordId,
-      owner.modelId,
-      owner.path,
-      owner.slice,
-    );
-  }
-
-  *blockOwners(side: Side, recordId?: string): Generator<BlockOwner> {
-    const sql =
-      recordId === undefined
-        ? 'SELECT * FROM block_owners WHERE side = ? ORDER BY block_id, record_id, slice, path'
-        : 'SELECT * FROM block_owners INDEXED BY block_owners_record WHERE side = ? AND record_id = ? ORDER BY block_id, slice, path';
-    for (const row of this.database
-      .prepare(sql)
-      .iterate(...(recordId === undefined ? [side] : [side, recordId]))) {
-      yield {
-        blockId: row.block_id as string,
-        recordId: row.record_id as string,
-        modelId: row.model_id as string,
-        path: row.path as string,
-        slice: row.slice as BlockOwner['slice'],
-      };
-    }
-  }
-
-  putUniqueValue(side: Side, value: UniqueValue): void {
-    this.statement(
-      'INSERT OR IGNORE INTO unique_values VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).run(
-      side,
-      value.modelId,
-      value.fieldId,
-      value.locale,
-      value.slice,
-      value.valueKey,
-      value.recordId,
-    );
-  }
-
-  *uniqueValues(side: Side, recordId?: string): Generator<UniqueValue> {
-    // The primary key matches output order but not record_id. Restrict to the
-    // requested record first, then sort only that record's uniqueness claims.
-    const sql = `SELECT * FROM unique_values${
-      recordId === undefined ? '' : ' INDEXED BY unique_values_record'
-    } WHERE side = ?${
-      recordId === undefined ? '' : ' AND record_id = ?'
-    } ORDER BY model_id, field_id, locale, slice, value, record_id`;
-    for (const row of this.database
-      .prepare(sql)
-      .iterate(...(recordId === undefined ? [side] : [side, recordId]))) {
-      yield {
-        modelId: row.model_id as string,
-        fieldId: row.field_id as string,
-        locale: row.locale as string,
-        slice: row.slice as UniqueValue['slice'],
-        valueKey: row.value as string,
-        recordId: row.record_id as string,
-      };
-    }
   }
 
   putPlan(entry: PlanEntry): void {
-    this.statement('INSERT OR REPLACE INTO plan VALUES (?, ?, ?, ?, ?)').run(
+    this.prepared('INSERT OR REPLACE INTO plan VALUES (?, ?, ?, ?, ?)').run(
       entry.kind,
       entry.id,
       entry.kind === 'record' ? entry.modelId : '',
@@ -462,54 +288,11 @@ export class SnapshotStore {
     );
   }
 
-  iteratePlan(kind?: Kind, action?: Action): Generator<PlanEntry> {
-    return this.planEntries(kind, action);
-  }
-
-  putEdge(edge: PlanEdge): void {
-    this.statement(
-      'INSERT OR REPLACE INTO edges VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).run(
-      edge.phase ?? 'content',
-      edge.fromKind,
-      edge.fromId,
-      edge.toKind,
-      edge.toId,
-      edge.reason,
-      edge.ordering ?? 0,
-    );
-  }
-
-  *edges(phase?: string): Generator<PlanEdge> {
-    const sql = `SELECT * FROM edges${
-      phase === undefined ? '' : ' WHERE phase = ?'
-    } ORDER BY phase, ordering, from_kind, from_id, to_kind, to_id, reason`;
-    for (const row of this.database
-      .prepare(sql)
-      .iterate(...(phase === undefined ? [] : [phase]))) {
-      yield {
-        phase: row.phase as string,
-        fromKind: row.from_kind as Kind,
-        fromId: row.from_id as string,
-        toKind: row.to_kind as Kind,
-        toId: row.to_id as string,
-        reason: row.reason as string,
-        ordering: row.ordering as number,
-      };
-    }
-  }
-
+  /** Captures fill these tables; the planner indexes references afterwards. */
   clearSide(side: Side): void {
     this.transaction(() => {
-      for (const table of [
-        'records',
-        'uploads',
-        'collections',
-        'refs',
-        'block_owners',
-        'unique_values',
-      ]) {
-        this.statement(`DELETE FROM ${table} WHERE side = ?`).run(side);
+      for (const table of ['records', 'uploads', 'collections']) {
+        this.prepared(`DELETE FROM ${table} WHERE side = ?`).run(side);
       }
     });
   }
@@ -524,14 +307,7 @@ export class SnapshotStore {
     this.database.prepare('ATTACH DATABASE ? AS imported').run(other.filename);
     try {
       this.transaction(() => {
-        for (const table of [
-          'records',
-          'uploads',
-          'collections',
-          'refs',
-          'block_owners',
-          'unique_values',
-        ])
+        for (const table of ['records', 'uploads', 'collections'])
           this.database
             .prepare(
               `INSERT INTO main.${table} SELECT * FROM imported.${table} WHERE side=?`,

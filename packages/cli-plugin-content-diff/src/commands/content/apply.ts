@@ -1,18 +1,25 @@
-import { oclif } from '@datocms/cli-utils';
-import { validateForkName } from '../../engine/direct-apply';
-import { ContentError } from '../../engine/errors';
-import type { DirectApplyOutcome, RepairResult } from '../../engine/types';
-import { applyContentMigration, repairContentMigration } from '../../migration';
-import { ContentCommand, concurrency } from '../../utils/content-command';
+import { CmaClient, CmaClientCommand, oclif } from '@datocms/cli-utils';
+import { applyContentMigration } from '../../engine/apply';
+import {
+  ContentError,
+  type ContentFailureContext,
+  contentErrorReport,
+  describeDestinationDifference,
+} from '../../engine/errors';
+import type { ApplyOutcome } from '../../engine/types';
+import { jsonFailure } from '../../utils/command-helpers';
 import { withInterruptHandling } from '../../utils/interruption';
 
-export default class ContentApplyCommand extends ContentCommand {
+type ClientOptions = Awaited<
+  ReturnType<CmaClientCommand['buildBaseClientInitializationOptions']>
+>;
+
+export default class ContentApplyCommand extends CmaClientCommand {
   static description =
     'Run a TypeScript content migration in a new isolated destination fork';
   static examples = [
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --in-place',
-    '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --repair',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --preflight-only',
     '<%= config.bin %> <%= command.id %> ./migrations/content/sync.ts --fork-name=content-review',
   ];
@@ -29,45 +36,31 @@ export default class ContentApplyCommand extends ContentCommand {
     }),
     'preflight-only': oclif.Flags.boolean({
       description:
-        'Check artifacts, permissions and the original destination baseline without executing the script or creating a fork',
-      exclusive: ['repair', 'keep-failed-fork'],
+        'Check artifacts, read access and the original destination baseline without executing the script or creating a fork',
+      exclusive: ['keep-failed-fork'],
       default: false,
     }),
     'fork-name': oclif.Flags.string({
       description:
         'Name of the new fork to create (defaults to a unique generated name)',
-      exclusive: ['in-place', 'repair'],
+      exclusive: ['in-place'],
     }),
+    // No defaults: oclif only enforces `dependsOn` for a flag left unset.
     'in-place': oclif.Flags.boolean({
       description: 'Write directly into the destination environment',
-      default: false,
     }),
     'allow-primary': oclif.Flags.boolean({
-      description: 'Permit in-place or repair writes to primary',
-      default: false,
-    }),
-    repair: oclif.Flags.boolean({
-      description:
-        'Restore schedules and field settings left behind by an interrupted in-place apply',
-      exclusive: [
-        'in-place',
-        'keep-failed-fork',
-        'allow-temporary-schema-changes',
-      ],
-      default: false,
+      description: 'Permit in-place writes to primary',
+      dependsOn: ['in-place'],
     }),
     'schedule-window': oclif.Flags.integer({
       description:
         'Refuse to start when a schedule falls due within this many minutes',
       default: 120,
+      min: 0,
     }),
     'keep-failed-fork': oclif.Flags.boolean({
       description: 'Keep a fork created by this run after failure',
-      default: false,
-    }),
-    'allow-temporary-schema-changes': oclif.Flags.boolean({
-      description:
-        'Permit supported temporary validator and default changes required by this migration',
       default: false,
     }),
     'fast-fork': oclif.Flags.boolean({
@@ -85,81 +78,66 @@ export default class ContentApplyCommand extends ContentCommand {
       description:
         'Maximum concurrent baseline read requests (1–16); script calls execute as written',
       default: 8,
+      min: 1,
+      max: 16,
     }),
   };
 
-  async run(): Promise<DirectApplyOutcome | RepairResult> {
-    return withInterruptHandling(
-      (signal) => this.runOperation(signal),
-      () =>
-        this.progress(
-          'Interrupted. Waiting for active requests before restoration and cleanup.',
-        ),
-    );
-  }
+  private clientOptions?: Promise<ClientOptions>;
 
-  private async runOperation(
-    signal: AbortSignal,
-  ): Promise<DirectApplyOutcome | RepairResult> {
-    const { flags, args } = await this.parse(ContentApplyCommand);
-    const maximum = concurrency(flags.concurrency);
-    validateForkName({
-      forkName: flags['fork-name'],
-      inPlace: flags['in-place'],
-    });
-    if (flags['allow-primary'] && !flags['in-place'] && !flags.repair)
-      throw new ContentError(
-        'INVALID_PRIMARY_AUTHORIZATION',
-        '--allow-primary requires --in-place or --repair.',
-      );
-    if (
-      !Number.isSafeInteger(flags['schedule-window']) ||
-      flags['schedule-window'] < 0
-    )
-      throw new ContentError(
-        'INVALID_SCHEDULE_WINDOW',
-        '--schedule-window must be a whole number of minutes, 0 or more.',
-      );
+  // CmaClientCommand.init resolves the API token and builds the client, so the
+  // command's own option checks run first: a bad flag fails without
+  // authentication or network access.
+  protected async init(): Promise<void> {
+    const { args } = await this.parse(ContentApplyCommand);
     if (!args.SCRIPT.endsWith('.ts'))
       throw new ContentError(
         'INVALID_MIGRATION_PATH',
         'Pass the generated .ts migration entrypoint to content:apply.',
       );
-    const endpoint = await this.endpoint();
-    if (flags.repair) {
-      const repaired = await repairContentMigration({
-        rootClient: endpoint.rootClient,
-        buildEnvironmentClient: endpoint.buildEnvironmentClient,
-        scriptPath: args.SCRIPT,
-        options: {
-          signal,
-          allowPrimary: flags['allow-primary'],
-          destinationEnvironmentId: flags.destination,
-          log: (message) => this.progress(message),
-        },
-      });
-      if (!this.jsonEnabled())
-        this.log(
-          `Repaired environment "${repaired.environmentId}": restored ${repaired.restoredSchedules} schedules and ${repaired.restoredFields} field settings.`,
-        );
-      return repaired;
-    }
+    await super.init();
+  }
+
+  // Environment clients reuse the options `init` resolved for `this.client`;
+  // resolving them again would repeat a linked project's Dashboard request.
+  protected buildBaseClientInitializationOptions(): Promise<ClientOptions> {
+    this.clientOptions ??= super.buildBaseClientInitializationOptions();
+    return this.clientOptions;
+  }
+
+  async run(): Promise<ApplyOutcome> {
+    return withInterruptHandling(
+      (signal) => this.runOperation(signal),
+      () =>
+        this.progress(
+          'Interrupted. Waiting for active requests before cleanup.',
+        ),
+    );
+  }
+
+  private async runOperation(signal: AbortSignal): Promise<ApplyOutcome> {
+    const { flags, args } = await this.parse(ContentApplyCommand);
+    const options = await this.buildBaseClientInitializationOptions();
     const result = await applyContentMigration({
-      rootClient: endpoint.rootClient,
-      buildEnvironmentClient: endpoint.buildEnvironmentClient,
+      rootClient: this.client,
+      buildEnvironmentClient: (environment, fetchFn) =>
+        CmaClient.buildClient({
+          ...options,
+          environment,
+          ...(fetchFn ? { fetchFn } : {}),
+        }),
       scriptPath: args.SCRIPT,
       options: {
         signal,
-        inPlace: flags['in-place'],
-        allowPrimary: flags['allow-primary'],
+        inPlace: flags['in-place'] ?? false,
+        allowPrimary: flags['allow-primary'] ?? false,
         keepFailedFork: flags['keep-failed-fork'],
-        allowTemporarySchemaChanges: flags['allow-temporary-schema-changes'],
         destinationEnvironmentId: flags.destination,
         ...(flags['fork-name'] !== undefined
           ? { forkName: flags['fork-name'] }
           : {}),
         ...(flags['preflight-only'] ? { preflightOnly: true } : {}),
-        concurrency: maximum,
+        concurrency: flags.concurrency,
         scheduleWindowMinutes: flags['schedule-window'],
         fastFork: flags['fast-fork'],
         verification: flags.verification,
@@ -185,5 +163,58 @@ export default class ContentApplyCommand extends ContentCommand {
       );
     }
     return result;
+  }
+
+  protected async catch(
+    error: Error & { exitCode?: number | undefined },
+  ): Promise<void> {
+    if (this.jsonEnabled()) return this.logJson(jsonFailure(error));
+    const report = contentErrorReport(error);
+    // The baseline message is fixed; the first difference follows it, also
+    // when removing the fork failed afterwards.
+    const cause = report.details?.cause as
+      | { code?: unknown; details?: Record<string, unknown> }
+      | undefined;
+    const changed =
+      report.code === 'DESTINATION_CHANGED'
+        ? report.details
+        : cause?.code === 'DESTINATION_CHANGED'
+          ? cause.details
+          : undefined;
+    const fork = report.keptForkEnvironmentId;
+    const notes = [
+      changed && describeDestinationDifference(changed),
+      fork && !(error as ContentFailureContext).forkOutcomeStated
+        ? `The fork "${fork}" was kept.`
+        : undefined,
+    ].filter((note): note is string => Boolean(note));
+    if (!notes.length) return super.catch(error);
+    let { message } = error;
+    let { suggestions } = report;
+    let exit =
+      error.exitCode ??
+      (error as Error & { oclif?: { exit?: number } }).oclif?.exit ??
+      1;
+    if (error instanceof CmaClient.ApiError) {
+      // Authorization and permission failures keep the native message,
+      // suggestions and exit status; the notes follow the message.
+      const raised: unknown = await super
+        .catch(error)
+        .catch((native) => native);
+      if (raised !== error && raised instanceof Error) {
+        message = raised.message;
+        suggestions = (raised as { suggestions?: string[] }).suggestions;
+        exit = (raised as { oclif?: { exit?: number } }).oclif?.exit ?? exit;
+      }
+    }
+    this.error([message, ...notes].join('\n'), {
+      code: report.code,
+      exit,
+      suggestions,
+    });
+  }
+
+  private progress(message: string): void {
+    if (!this.jsonEnabled()) this.logToStderr(message);
   }
 }

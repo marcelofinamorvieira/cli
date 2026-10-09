@@ -1,10 +1,10 @@
 import type { CmaClient } from '@datocms/cli-utils';
 
 export type Client = CmaClient.Client;
-export type JsonPrimitive = string | number | boolean | null;
+type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
 export type JsonObject = { [key: string]: JsonValue };
-export type Side = 'source' | 'target' | 'live';
+export type Side = 'source' | 'target';
 export type Action = 'create' | 'update' | 'delete' | 'noop' | 'skip';
 export type Kind = 'record' | 'upload' | 'collection';
 
@@ -13,6 +13,10 @@ export interface FieldSchema {
   apiKey: string;
   type: string;
   localized: boolean;
+  /**
+   * Validators and default value are hashed into the destination binding and
+   * never interpreted: the CMA validates every write.
+   */
   validators: JsonObject;
   defaultValue: JsonValue;
 }
@@ -25,10 +29,20 @@ export interface ModelSchema {
   sortable: boolean;
   tree: boolean;
   draftMode: boolean;
+  /**
+   * Hashed into the destination binding. Generation also reads it to accept
+   * source records whose draft the CMA reports invalid; required locales are
+   * never interpreted.
+   */
   saveInvalidDrafts: boolean;
   allLocalesRequired: boolean;
   workflowId: string | null;
   fields: FieldSchema[];
+}
+export interface WorkflowSchema {
+  id: string;
+  apiKey: string;
+  stages: { id: string; name: string; initial: boolean }[];
 }
 export interface SchemaState {
   siteId: string;
@@ -36,14 +50,14 @@ export interface SchemaState {
   locales: string[];
   semantics: JsonObject;
   models: ModelSchema[];
-  workflows: JsonObject[];
+  workflows: WorkflowSchema[];
   hash: string;
 }
-export interface PublicationSchedule {
+interface PublicationSchedule {
   at: string;
   selective: { locales: string[]; nonLocalized: boolean } | null;
 }
-export interface UnpublishingSchedule {
+interface UnpublishingSchedule {
   at: string;
   locales: string[] | null;
 }
@@ -64,18 +78,23 @@ export interface RecordState {
   position: number | null;
   stage: string | null;
   schedules: Schedules;
-  validity: { current: boolean; published: boolean | null };
+  /**
+   * Versions the CMA itself reports as invalid (`is_current_version_valid` or
+   * `is_published_version_valid` set to false). Absent when neither is. Not
+   * part of the hash: it describes the content, it is not content.
+   */
+  invalid?: { current: boolean; published: boolean };
   hash: string;
 }
+/**
+ * What apply compares for a destination record: its content hash, plus the
+ * version metadata and position the hash leaves out.
+ */
 export interface RecordGuard {
   hash: string;
-  modelId: string;
   currentVersion: string | null;
   publishedUpdatedAt: string | null;
-  parentId: string | null;
   position: number | null;
-  schedules: Schedules;
-  validity: { current: boolean; published: boolean | null };
 }
 export interface UploadState {
   id: string;
@@ -100,54 +119,23 @@ export interface Reference {
   kind: 'current' | 'published' | 'upload';
   path: string;
   fieldId: string;
-  required: boolean;
-}
-export interface BlockOwner {
-  blockId: string;
-  recordId: string;
-  modelId: string;
-  path: string;
-  slice: 'current' | 'published';
-}
-export interface UniqueValue {
-  recordId: string;
-  modelId: string;
-  fieldId: string;
-  locale: string;
-  slice: 'current' | 'published';
-  valueKey: string;
 }
 export interface Diagnostic {
   code: string;
   message: string;
-  dependencyId?: string;
-}
-export interface BinaryFile {
-  file: string;
-  sha256: string;
-  md5: string;
-  bytes: number;
 }
 export interface RecordPlan {
   kind: 'record';
   id: string;
   modelId: string;
   action: Action;
-  guard: RecordGuard | null;
+  /** Whether the record exists in the destination baseline. */
+  inDestination: boolean;
   baseline?: RecordState | null;
   desired?: RecordState | null;
-  safety: {
-    currentReferences: string[];
-    publishedReferences: string[];
-    uploadReferences: string[];
-    blockIds: string[];
-    desiredParentId: string | null;
-    desiredPosition: number | null;
-  };
   diagnostics: Diagnostic[];
   execution?: {
     createOrder?: number;
-    updateOrder?: number;
     publishOrder?: number;
     deleteOrder?: number;
     creationFields?: JsonObject;
@@ -157,24 +145,22 @@ export interface RecordPlan {
      * published again once those records are published.
      */
     provisionalPublished?: JsonObject;
-    preclearFieldIds?: string[];
   };
 }
 export interface UploadPlan {
   kind: 'upload';
   id: string;
   action: Action;
-  guard: { hash: string } | null;
+  inDestination: boolean;
   baseline?: UploadState | null;
   desired?: UploadState | null;
-  binary?: BinaryFile;
   diagnostics: Diagnostic[];
 }
 export interface CollectionPlan {
   kind: 'collection';
   id: string;
   action: Action;
-  guard: { hash: string } | null;
+  inDestination: boolean;
   baseline?: CollectionState | null;
   desired?: CollectionState | null;
   diagnostics: Diagnostic[];
@@ -185,14 +171,6 @@ export interface PlanOptions {
   uploads: 'referenced' | 'all';
   includeDeletions: boolean;
   allowPartial: boolean;
-  allowTemporarySchemaChanges: boolean;
-}
-export interface TemporarySchemaChange {
-  fieldId: string;
-  modelId: string;
-  original: { validators: JsonObject; defaultValue: JsonValue };
-  temporary: { validators: JsonObject; defaultValue: JsonValue };
-  reasons: string[];
 }
 export type PlanCounts = Record<Kind, Record<Action, number>>;
 export interface PlanMetadata {
@@ -201,7 +179,6 @@ export interface PlanMetadata {
   schema: SchemaState;
   options: PlanOptions;
   counts: PlanCounts;
-  temporarySchemaChanges: TemporarySchemaChange[];
 }
 export interface ArtifactChunk {
   file: string;
@@ -216,30 +193,26 @@ export interface ArtifactChunkIndex {
   count: number;
 }
 export interface CaptureOptions {
-  /** Exclude only explicitly verified migration-tracking metadata. */
+  /** Excludes the configured migration tracking model, bound by ID at generation. */
   schemaProjection?: (schema: SchemaState) => SchemaState;
   signal?: AbortSignal;
-  modelIds: string[];
-  uploads: 'referenced' | 'all';
-  concurrency?: number;
+  concurrency: number;
   progress?: (message: string) => void;
 }
-export interface DirectApplyOptions {
-  /** Exclude only explicitly verified migration-tracking metadata. */
-  schemaProjection?: (schema: SchemaState) => SchemaState;
+/** Options of content:apply, already validated by the command. */
+export interface ApplyOptions {
   signal?: AbortSignal;
   inPlace: boolean;
   allowPrimary: boolean;
   keepFailedFork: boolean;
-  allowTemporarySchemaChanges: boolean;
   destinationEnvironmentId?: string;
   /** Requested ID of a newly created fork; never an existing environment. */
   forkName?: string;
   /** Check original artifacts and destination state without executing the script. */
   preflightOnly?: boolean;
-  concurrency?: number;
+  concurrency: number;
   /** Refuse to start when a schedule falls due within this many minutes. */
-  scheduleWindowMinutes?: number;
+  scheduleWindowMinutes: number;
   /** Use DatoCMS's fast fork, which blocks destination writes while it copies. */
   fastFork?: boolean;
   /**
@@ -249,24 +222,12 @@ export interface DirectApplyOptions {
   verification?: 'versions' | 'full';
   log?: (message: string) => void;
 }
-export interface RepairOptions {
-  schemaProjection?: (schema: SchemaState) => SchemaState;
-  signal?: AbortSignal;
-  allowPrimary: boolean;
-  destinationEnvironmentId?: string;
-  log?: (message: string) => void;
-}
-export interface RepairResult {
-  environmentId: string;
-  restoredSchedules: number;
-  restoredFields: number;
-}
-export interface DirectApplyResult {
+interface ApplyResult {
   environmentId: string;
   scriptExecuted: true;
   partial: boolean;
 }
-export interface DirectPreflightResult {
+export interface PreflightResult {
   environmentId: string;
   preflightOnly: true;
   scriptExecuted: false;
@@ -274,4 +235,4 @@ export interface DirectPreflightResult {
   /** Original generation summary, not a prediction of edited TypeScript effects. */
   generatedCounts: PlanCounts;
 }
-export type DirectApplyOutcome = DirectApplyResult | DirectPreflightResult;
+export type ApplyOutcome = ApplyResult | PreflightResult;

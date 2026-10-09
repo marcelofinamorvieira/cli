@@ -1,9 +1,8 @@
 import { type ProfileConfig, readCredentials } from '@datocms/cli-utils';
 import * as DashboardClient from '@datocms/dashboard-client';
 import { ContentError } from '../engine/errors';
-import type { CredentialRedactor } from './credential-redaction';
 
-export type ResolveLinkedSiteToken = (
+type ResolveLinkedSiteToken = (
   siteId: string,
   organizationId?: string,
 ) => Promise<string>;
@@ -59,16 +58,17 @@ export async function resolveProfileApiToken({
   };
 }
 
-/** Public SDK adapter shared by single-project and paired-profile commands. */
+/**
+ * The CMA token of a project linked with `datocms link`, read through the
+ * saved OAuth credentials (`CmaClientCommand` keeps its own resolver private).
+ */
 export async function resolveLinkedSiteToken(
   {
     siteId,
     organizationId,
-    redactor,
   }: {
     siteId: string;
     organizationId?: string;
-    redactor: CredentialRedactor;
   },
   dependencies: {
     readCredentials: typeof readCredentials;
@@ -82,18 +82,16 @@ export async function resolveLinkedSiteToken(
       'Project is linked but no OAuth credentials found.',
       [
         'Run "datocms login" to authenticate',
-        'Provide an explicit endpoint API token to override the linked project',
+        'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
       ],
     );
-  const client = dependencies.buildClient(
-    redactor.protectClientOptions({
-      apiToken: credentials.apiToken,
-      ...(credentials.dashboardBaseUrl
-        ? { baseUrl: credentials.dashboardBaseUrl }
-        : {}),
-      ...(organizationId ? { organization: organizationId } : {}),
-    }),
-  );
+  const client = dependencies.buildClient({
+    apiToken: credentials.apiToken,
+    ...(credentials.dashboardBaseUrl
+      ? { baseUrl: credentials.dashboardBaseUrl }
+      : {}),
+    ...(organizationId ? { organization: organizationId } : {}),
+  });
   let site: Awaited<ReturnType<typeof client.sites.find>>;
   try {
     site = await client.sites.find(siteId);
@@ -107,16 +105,16 @@ export async function resolveLinkedSiteToken(
         'Your OAuth token is invalid or has been revoked.',
         [
           'Run "datocms login" to re-authenticate',
-          'Provide an explicit endpoint API token to override the linked project',
+          'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
         ],
       );
     throw authenticationError(
       'LINKED_PROJECT_UNAVAILABLE',
-      `Could not access linked project (ID: ${siteId}). It may have been deleted, moved, or no longer be accessible with your OAuth permissions.`,
+      `Could not access linked project (ID: ${siteId}). It may have been deleted or moved, or your OAuth permissions may not allow access to it.`,
       [
         'Run "datocms login" to re-authenticate with updated permissions',
         'Run "datocms link" to re-link to a project',
-        'Provide an explicit endpoint API token to override the linked project',
+        'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
       ],
     );
   }
@@ -126,10 +124,9 @@ export async function resolveLinkedSiteToken(
       `Could not retrieve an API token for project "${site.name}" (ID: ${siteId}). You may not have access to this project.`,
       [
         'Run "datocms link" to re-link to a project',
-        'Provide an explicit endpoint API token to override the linked project',
+        'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
       ],
     );
-  redactor.register(site.access_token);
   return site.access_token;
 }
 

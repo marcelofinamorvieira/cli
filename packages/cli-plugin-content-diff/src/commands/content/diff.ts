@@ -1,40 +1,22 @@
-import { lstat } from 'node:fs/promises';
+import { lstat, stat } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { oclif } from '@datocms/cli-utils';
 import { camelCase } from 'lodash';
-import { assertNotAborted } from '../../engine/cancellation';
-import { captureSnapshot } from '../../engine/capture';
 import { ContentError } from '../../engine/errors';
-import { writeMigration } from '../../engine/migration-artifact';
+import {
+  type ContentGenerationResult,
+  generateContentMigration,
+} from '../../engine/generation';
 import {
   DEFAULT_MIGRATION_CHUNK_BYTES,
   MAX_MIGRATION_CHUNK_BYTES,
-} from '../../engine/migration-limits';
-import { prepareMigrationSchema } from '../../engine/migration-schema';
-import { assertSchemaCompatible, createPlan } from '../../engine/planner';
-import {
-  assertApplyAccess,
-  assertSchemaEditAccess,
-  fetchSchema,
-} from '../../engine/schema';
-import { SnapshotStore } from '../../engine/store';
-import type { PlanCounts, SchemaState, Side } from '../../engine/types';
-import {
-  ContentCommand,
-  concurrency,
-  environmentId,
-  selectedModels,
-} from '../../utils/content-command';
+} from '../../engine/migration-artifact';
 import { withInterruptHandling } from '../../utils/interruption';
+import { PairedProfileCommand } from '../../utils/paired-profile-command';
 
-export type ContentDiffCommandResult = {
-  scriptPath: string;
-  sourceEnvironmentId: string;
-  destinationEnvironmentId: string;
-  counts: PlanCounts;
-};
+type ContentDiffCommandResult = ContentGenerationResult;
 
-export default class ContentDiffCommand extends ContentCommand {
+export default class ContentDiffCommand extends PairedProfileCommand {
   static description =
     'Compare DatoCMS environments and generate an editable TypeScript content migration';
   static examples = [
@@ -86,26 +68,26 @@ export default class ContentDiffCommand extends ContentCommand {
       default: 'referenced',
     })(),
     'include-deletions': oclif.Flags.boolean({
-      description: 'Include safe destination-only content deletions',
+      description: 'Delete destination-only content within the scope',
       default: false,
     }),
     'allow-partial': oclif.Flags.boolean({
       description:
-        'Permit only proven isolated skips and their dependency closure',
-      default: false,
-    }),
-    'allow-temporary-schema-changes': oclif.Flags.boolean({
-      description: 'Plan supported temporary validator and default changes',
+        'Skip content the generated script cannot reproduce, and the writes that need it, instead of failing',
       default: false,
     }),
     concurrency: oclif.Flags.integer({
       description: 'Maximum concurrent independent requests (1–16)',
       default: 8,
+      min: 1,
+      max: 16,
     }),
     'chunk-bytes': oclif.Flags.integer({
       description:
-        'Target TypeScript part size; a single operation is never split',
+        'Target size of each TypeScript part and baseline chunk file; a single operation is never split',
       default: DEFAULT_MIGRATION_CHUNK_BYTES,
+      min: 1,
+      max: MAX_MIGRATION_CHUNK_BYTES,
     }),
   };
 
@@ -123,16 +105,6 @@ export default class ContentDiffCommand extends ContentCommand {
     signal: AbortSignal,
   ): Promise<ContentDiffCommandResult> {
     const { flags, args } = await this.parse(ContentDiffCommand);
-    const maximum = concurrency(flags.concurrency);
-    if (
-      !Number.isSafeInteger(flags['chunk-bytes']) ||
-      flags['chunk-bytes'] < 1 ||
-      flags['chunk-bytes'] > MAX_MIGRATION_CHUNK_BYTES
-    )
-      throw new ContentError(
-        'INVALID_CHUNK_SIZE',
-        `--chunk-bytes must be an integer from 1 to ${MAX_MIGRATION_CHUNK_BYTES} bytes (16 MiB minus 1 KiB).`,
-      );
     const sourceProfile = flags['source-profile']
       ? this.datoConfig?.profiles[flags['source-profile']]
       : this.datoProfileConfig;
@@ -157,15 +129,22 @@ export default class ContentDiffCommand extends ContentCommand {
     const requestedOutput = flags.output
       ? resolve(flags.output)
       : defaultDirectory;
+    // A path with another extension is refused rather than created as a
+    // directory, unless it already is one.
+    const outputIsFile = extname(requestedOutput) === '.ts';
     if (
-      flags.output &&
-      ['.js', '.mjs', '.cjs', '.mts', '.cts'].includes(extname(flags.output))
+      !outputIsFile &&
+      extname(requestedOutput) &&
+      !(await stat(requestedOutput).then(
+        (entry) => entry.isDirectory(),
+        () => false,
+      ))
     )
       throw new ContentError(
         'INVALID_MIGRATION_PATH',
         'Content migration output must be a .ts file or a directory.',
       );
-    const outputPath = flags.output?.endsWith('.ts')
+    const outputPath = outputIsFile
       ? requestedOutput
       : join(
           requestedOutput,
@@ -190,188 +169,39 @@ export default class ContentDiffCommand extends ContentCommand {
           flags['destination-api-token'],
         )
       : source;
-    const [sourceEnvironments, destinationEnvironments] = await Promise.all([
-      source.rootClient.environments.list(),
-      destination === source
-        ? Promise.resolve(undefined)
-        : destination.rootClient.environments.list(),
-    ]);
-    const sourceEnvironmentId = environmentId(flags.source, sourceEnvironments);
-    const destinationEnvironmentId = environmentId(
-      flags.destination,
-      destinationEnvironments ?? sourceEnvironments,
-    );
-    const sourceClient = source.buildEnvironmentClient(sourceEnvironmentId);
-    const destinationClient = destination.buildEnvironmentClient(
-      destinationEnvironmentId,
-    );
-    const [sourceRawSchema, destinationRawSchema] = await Promise.all([
-      fetchSchema(sourceClient, sourceEnvironmentId),
-      fetchSchema(destinationClient, destinationEnvironmentId),
-    ]);
-    const { schema: sourceSchema, tracking: sourceTracking } =
-      prepareMigrationSchema(
-        sourceRawSchema,
-        sourceProfile?.migrations?.modelApiKey,
-      );
-    const { schema: destinationSchema, tracking: destinationTracking } =
-      prepareMigrationSchema(
-        destinationRawSchema,
+    const result = await generateContentMigration({
+      source,
+      destination,
+      sourceEnvironment: flags.source,
+      destinationEnvironment: flags.destination,
+      sourceMigrationModelApiKey: sourceProfile?.migrations?.modelApiKey,
+      destinationMigrationModelApiKey:
         destinationProfile?.migrations?.modelApiKey,
-      );
-    if (
-      sourceSchema.siteId === destinationSchema.siteId &&
-      sourceEnvironmentId === destinationEnvironmentId
-    )
-      throw new ContentError(
-        'SAME_ENVIRONMENT',
-        'Source and destination must be different environments or projects.',
-      );
-    const modelIds = selectedModels(sourceSchema, flags['item-types']);
-    assertNotAborted(signal);
-    // Reject incompatible schemas before reading either content namespace.
-    assertSchemaCompatible(sourceSchema, destinationSchema, new Set(modelIds));
-    const store = new SnapshotStore();
-    try {
-      // Full namespaces prove inbound dependencies and preservation. The model
-      // selection below limits planned mutations, rather than capture authority.
-      const capture = (
-        side: Side,
-        target: SnapshotStore,
-        captureSignal: AbortSignal,
-      ) => {
-        const [client, environment, schema, label]: [
-          typeof sourceClient,
-          string,
-          SchemaState,
-          string,
-        ] =
-          side === 'source'
-            ? [sourceClient, sourceEnvironmentId, sourceSchema, 'Source']
-            : [
-                destinationClient,
-                destinationEnvironmentId,
-                destinationSchema,
-                'Destination',
-              ];
-        this.progress(`Capturing ${label.toLowerCase()} "${environment}".`);
-        return captureSnapshot({
-          client,
-          environmentId: environment,
-          schema,
-          store: target,
-          side,
-          // Generation assumes writes are prevented externally during capture.
-          verify: false,
-          options: {
-            signal: captureSignal,
-            modelIds: schema.models
-              .filter((model) => !model.block)
-              .map((model) => model.id),
-            uploads: 'all',
-            concurrency: maximum,
-            progress: (message) => this.progress(`${label}: ${message}`),
-          },
-        });
-      };
-      if (destination === source) {
-        // One project shares one API rate limit, so reading both environments
-        // at once would only trade time for retries.
-        await capture('source', store, signal);
-        await capture('target', store, signal);
-      } else {
-        // Two projects have separate rate limits. Read both at once, each into
-        // its own store so neither writes tables the other is reading, and
-        // stop the other read as soon as one fails.
-        const destinationStore = new SnapshotStore();
-        const shared = new AbortController();
-        const forward = () => shared.abort();
-        signal.addEventListener('abort', forward, { once: true });
-        try {
-          const results = await Promise.allSettled(
-            (
-              [
-                ['source', store],
-                ['target', destinationStore],
-              ] as const
-            ).map(([side, target]) =>
-              capture(side, target, shared.signal).catch((error) => {
-                shared.abort();
-                throw error;
-              }),
-            ),
-          );
-          const failures = results.flatMap((result) =>
-            result.status === 'rejected' ? [result.reason] : [],
-          );
-          if (failures.length)
-            throw (
-              failures.find(
-                (failure) =>
-                  !(
-                    failure instanceof ContentError &&
-                    failure.code === 'INTERRUPTED'
-                  ),
-              ) ?? failures[0]
-            );
-          store.importSide(destinationStore, 'target');
-        } finally {
-          signal.removeEventListener('abort', forward);
-          destinationStore.dispose();
-        }
-      }
-      const metadata = await createPlan(
-        store,
-        sourceSchema,
-        destinationSchema,
-        {
-          modelIds,
-          uploads: flags.uploads,
-          includeDeletions: flags['include-deletions'],
-          allowPartial: flags['allow-partial'],
-          allowTemporarySchemaChanges: flags['allow-temporary-schema-changes'],
-        },
-      );
-      await assertApplyAccess(
-        destinationClient,
-        destinationSchema,
-        store,
-        true,
-        modelIds,
-      );
-      if (metadata.temporarySchemaChanges.length)
-        await assertSchemaEditAccess(destinationClient);
-      this.progress(
-        'Writing TypeScript content migration and required asset binaries.',
-      );
-      const scriptPath = await writeMigration({
-        signal,
-        store,
-        metadata,
-        outputPath,
-        sourceTracking,
-        destinationTracking,
+      outputPath,
+      options: {
+        itemTypes: flags['item-types'],
+        uploads: flags.uploads,
+        includeDeletions: flags['include-deletions'],
+        allowPartial: flags['allow-partial'],
+        concurrency: flags.concurrency,
         chunkBytes: flags['chunk-bytes'],
-        concurrency: maximum,
-      });
-      const result = {
-        scriptPath,
-        sourceEnvironmentId,
-        destinationEnvironmentId,
-        counts: metadata.counts,
-      };
-      if (!this.jsonEnabled()) {
-        this.log(`TypeScript content migration: ${scriptPath}`);
-        for (const kind of ['record', 'upload', 'collection'] as const)
-          this.log(
-            `${kind}: ${Object.entries(metadata.counts[kind])
-              .map(([action, count]) => `${count} ${action}`)
-              .join(', ')}`,
-          );
-      }
-      return result;
-    } finally {
-      store.dispose();
+      },
+      signal,
+      progress: (message) => this.progress(message),
+    });
+    if (!this.jsonEnabled()) {
+      this.log(`TypeScript content migration: ${result.scriptPath}`);
+      for (const kind of ['record', 'upload', 'collection'] as const)
+        this.log(
+          `${kind}: ${Object.entries(result.counts[kind])
+            .map(([action, count]) => `${count} ${action}`)
+            .join(', ')}`,
+        );
+      for (const skip of result.skipped)
+        this.logToStderr(
+          `Skipped ${skip.kind} ${skip.id} (${skip.code}): ${skip.message}`,
+        );
     }
+    return result;
   }
 }
