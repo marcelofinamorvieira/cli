@@ -1,6 +1,5 @@
 import { object } from './codec';
 import { ContentError } from './errors';
-import type { MigrationTrackingBinding } from './migration-schema';
 import { type Operation, assertOperation } from './operations';
 import type { PlanCounts, PlanOptions } from './types';
 import { ZipReader, ZipWriter } from './zip';
@@ -28,8 +27,8 @@ export interface DiffManifest {
   destination: { siteId: string; environmentId: string };
   /** The destination schema hash, without the migration tracking model. */
   schemaHash: string;
-  sourceTracking: MigrationTrackingBinding;
-  destinationTracking: MigrationTrackingBinding;
+  /** The API key of the migration tracking model left out of the hash. */
+  trackingModelApiKey: string;
   options: PlanOptions;
   counts: PlanCounts;
   operations: number;
@@ -103,7 +102,7 @@ export class DiffFile {
       typeof fields.destination.siteId !== 'string' ||
       typeof fields.destination.environmentId !== 'string' ||
       typeof fields.schemaHash !== 'string' ||
-      !object(fields.destinationTracking) ||
+      typeof fields.trackingModelApiKey !== 'string' ||
       !object(fields.counts)
     ) {
       zip.close();

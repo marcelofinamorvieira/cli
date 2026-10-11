@@ -1,9 +1,5 @@
 import { join } from 'node:path';
-import {
-  recordReferences,
-  recordTitle,
-  unsupportedRecordPayloadKey,
-} from './codec';
+import { recordReferences, recordTitle } from './codec';
 import { SpillFiles, bucketOf, byBucket } from './spill';
 import type {
   CollectionState,
@@ -14,13 +10,6 @@ import type {
   UploadFacts,
   UploadState,
 } from './types';
-
-/** Where captured content goes, one entry at a time. */
-export interface SideSink {
-  record(state: RecordState): Promise<void>;
-  upload(state: UploadState): Promise<void>;
-  collection(state: CollectionState): Promise<void>;
-}
 
 /** The top-level field a captured reference path belongs to. */
 function rootField(path: string): string {
@@ -38,8 +27,6 @@ function lineId(line: string): string {
 export interface SideOptions {
   /** Models whose records the diff may change. */
   models?: Set<string>;
-  /** The schema writes are checked against for values the SDK would corrupt. */
-  payloadSchema?: SchemaState;
 }
 
 /**
@@ -48,7 +35,7 @@ export interface SideOptions {
  * A record's references are read only for the records the plan changes
  * (`loadDetails`); every record contributes the uploads it references.
  */
-export class SideIndex implements SideSink {
+export class SideIndex {
   readonly records = new Map<string, RecordFacts>();
   readonly uploads = new Map<string, UploadFacts>();
   readonly collections = new Map<string, CollectionState>();
@@ -56,7 +43,6 @@ export class SideIndex implements SideSink {
   readonly referencedUploads = new Set<string>();
   private readonly recordFiles: SpillFiles;
   private readonly uploadFiles: SpillFiles;
-  private readonly roots = new Map<string, string>();
 
   constructor(
     directory: string,
@@ -66,15 +52,6 @@ export class SideIndex implements SideSink {
   ) {
     this.recordFiles = new SpillFiles(join(directory, 'records'));
     this.uploadFiles = new SpillFiles(join(directory, 'uploads'));
-  }
-
-  /** One string per field, however many references sit in it. */
-  private root(path: string): string {
-    const root = rootField(path);
-    const known = this.roots.get(root);
-    if (known) return known;
-    this.roots.set(root, root);
-    return root;
   }
 
   async record(state: RecordState): Promise<void> {
@@ -118,12 +95,8 @@ export class SideIndex implements SideSink {
     await this.uploadFiles.flush();
   }
 
-  /**
-   * Reads the references of `ids`, and the values the SDK would corrupt in
-   * the selected models, into their facts.
-   */
+  /** Reads the references of `ids` into their facts. */
   async loadDetails(ids: Iterable<string>): Promise<void> {
-    const { models, payloadSchema } = this.options;
     for (const [bucket, wanted] of byBucket(ids, this.buckets))
       for (const state of (await this.recordBucket(bucket, wanted)).values()) {
         const facts = this.records.get(state.id)!;
@@ -132,7 +105,7 @@ export class SideIndex implements SideSink {
           state,
           this.schema,
         )) {
-          const root = this.root(path);
+          const root = rootField(path);
           references.set(`${targetId}\0${kind}\0${root}\0${fieldId}`, {
             targetId,
             kind,
@@ -141,20 +114,6 @@ export class SideIndex implements SideSink {
           });
         }
         facts.references = [...references.values()];
-        const unsupported =
-          payloadSchema && models?.has(state.modelId)
-            ? [state.current, state.published].flatMap((slice) => {
-                const key =
-                  slice &&
-                  unsupportedRecordPayloadKey(
-                    slice,
-                    state.modelId,
-                    payloadSchema,
-                  );
-                return key ? [key] : [];
-              })
-            : [];
-        if (unsupported.length) facts.unsupportedKeys = unsupported;
       }
   }
 

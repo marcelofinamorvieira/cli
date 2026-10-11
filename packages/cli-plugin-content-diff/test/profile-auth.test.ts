@@ -3,17 +3,13 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import {
-  CmaClient,
-  CmaClientCommand,
-  DatoConfigCommand,
-} from '@datocms/cli-utils';
+import { CmaClient, CmaClientCommand, oclif } from '@datocms/cli-utils';
 import * as DashboardClient from '@datocms/dashboard-client';
 import { describe, it } from 'mocha';
 import ContentApplyCommand from '../src/commands/content/apply';
 import ContentDiffCommand from '../src/commands/content/diff';
 import ContentExportCommand from '../src/commands/content/export';
-import { ContentError, contentErrorReport } from '../src/engine/errors';
+import { contentErrorReport } from '../src/engine/errors';
 import * as profileAuth from '../src/utils/profile-auth';
 import {
   profileApiTokenEnvironmentName,
@@ -22,6 +18,12 @@ import {
 } from '../src/utils/profile-auth';
 
 const root = resolve(__dirname, '..');
+
+type NativeError = Error & {
+  code?: string;
+  suggestions?: string[];
+  oclif?: { exit?: number };
+};
 
 describe('public profile authentication adapter', () => {
   it('uses saved Dashboard credentials and organization scope', async () => {
@@ -40,10 +42,11 @@ describe('public profile authentication adapter', () => {
           return DashboardClient.buildClient({
             ...config,
             fetchFn: async (url, init) => {
-              requests.push({
-                url: String(url),
-                headers: Object.fromEntries(new Headers(init?.headers)),
+              const headers: Record<string, string> = {};
+              new Headers(init?.headers).forEach((value, key) => {
+                headers[key] = value;
               });
+              requests.push({ url: String(url), headers });
               return new Response(
                 JSON.stringify({
                   data: {
@@ -75,7 +78,7 @@ describe('public profile authentication adapter', () => {
     assert.equal(requests[0].headers.authorization, 'Bearer oauth-fixture');
   });
 
-  it('reports missing credentials, revoked OAuth, unavailable projects and missing access tokens without exposing SDK request data', async () => {
+  it('reports missing credentials, revoked OAuth, unavailable projects and missing access tokens as native CLI errors without exposing SDK request data', async () => {
     for (const scenario of [
       { kind: 'missing', code: 'OAUTH_CREDENTIALS_MISSING' },
       { kind: 'revoked', code: 'OAUTH_CREDENTIALS_INVALID' },
@@ -138,11 +141,17 @@ describe('public profile authentication adapter', () => {
               }),
           },
         ),
-        (error) => {
-          assert.ok(error instanceof ContentError);
+        (error: NativeError) => {
+          assert.ok(error instanceof oclif.Errors.CLIError, String(error));
           assert.equal(error.code, scenario.code);
+          assert.equal(error.oclif?.exit, 2);
           const report = contentErrorReport(error);
+          assert.equal(report.code, scenario.code);
           assert.ok(report.suggestions?.length);
+          assert.match(
+            report.suggestions.join('\n'),
+            /--source-api-token for the source project/,
+          );
           assert.doesNotMatch(
             JSON.stringify(report),
             /oauth-fixture|headers|echoed/,
@@ -154,10 +163,10 @@ describe('public profile authentication adapter', () => {
     }
   });
 
-  it('initializes single and paired profiles through the public command lifecycle', async () => {
+  it('selects the destination natively and the source project through --source-profile in the public command lifecycle', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'content-profile-init-'));
     const configFile = join(directory, 'datocms.config.json');
-    const preload = join(directory, 'inspect-endpoints.cjs');
+    const preload = join(directory, 'inspect-projects.cjs');
     try {
       await writeFile(
         configFile,
@@ -171,6 +180,10 @@ describe('public profile authentication adapter', () => {
               apiTokenEnvName: 'FIXTURE_DESTINATION_TOKEN',
               baseUrl: 'http://destination.invalid',
             },
+            empty: {
+              apiTokenEnvName: 'FIXTURE_EMPTY_TOKEN',
+              baseUrl: 'http://empty.invalid',
+            },
           },
         }),
       );
@@ -182,62 +195,65 @@ describe('public profile authentication adapter', () => {
         )}).default;
         Command.prototype.run = async function () {
           const { flags } = await this.parse(this.ctor);
-          const source = await this.endpoint(flags['source-profile'], flags['source-api-token']);
-          const destination = flags['destination-profile'] && await this.endpoint(flags['destination-profile'], flags['destination-api-token']);
+          const source = flags['source-profile']
+            ? (await this.sourceProject(flags['source-profile'], flags['source-api-token'])).endpoint.rootClient
+            : null;
+          const token = (client) => client.config.apiToken;
           return {
-            source: source.rootClient.config.baseUrl,
-            destination: destination ? destination.rootClient.config.baseUrl : null,
-            explicit: source.rootClient.config.apiToken === 'override-fixture',
-            sourceTokenMatched: ['source-fixture', 'override-fixture'].includes(source.rootClient.config.apiToken),
-            destinationTokenMatched: !destination || destination.rootClient.config.apiToken === 'destination-fixture',
+            destination: this.client.config.baseUrl,
+            source: source ? source.config.baseUrl : null,
+            destinationExplicit: token(this.client) === 'override-fixture',
+            destinationTokenMatched: ['destination-fixture', 'override-fixture'].includes(token(this.client)),
+            sourceExplicit: !!source && token(source) === 'override-fixture',
+            sourceTokenMatched: !source || ['source-fixture', 'override-fixture'].includes(token(source)),
           };
         };
       `,
       );
       const cases = [
-        { args: ['--profile=source'], status: 0 },
-        { args: [], envProfile: 'source', status: 0 },
+        { args: ['--profile=destination'], status: 0 },
+        { args: [], envProfile: 'destination', status: 0 },
         {
-          args: ['--profile=source', '--api-token=override-fixture'],
+          args: ['--profile=destination', '--api-token=override-fixture'],
           status: 0,
-          explicit: true,
+          destinationExplicit: true,
         },
         {
-          args: [
-            '--source-profile=source',
-            '--destination-profile=destination',
-          ],
+          args: ['--profile=destination', '--source-profile=source'],
           status: 0,
           paired: true,
-        },
-        {
-          args: [
-            '--source-profile=source',
-            '--destination-profile=destination',
-          ],
-          envProfile: 'missing',
-          status: 0,
-          paired: true,
-        },
-        { args: [], status: 2, failure: /Multiple profiles/ },
-        {
-          args: ['--profile=missing'],
-          status: 2,
-          failure: /not defined in config file/,
-        },
-        {
-          args: [
-            '--source-profile=source',
-            '--destination-profile=destination',
-            '--profile=source',
-          ],
-          status: 2,
-          failure: /paired source\/destination profiles/,
         },
         {
           args: ['--source-profile=source'],
+          envProfile: 'destination',
+          status: 0,
+          paired: true,
+        },
+        {
+          args: [
+            '--profile=destination',
+            '--source-profile=source',
+            '--source-api-token=override-fixture',
+          ],
+          status: 0,
+          paired: true,
+          sourceExplicit: true,
+        },
+        { args: [], status: 2, failure: /Multiple profiles detected/ },
+        {
+          args: ['--profile=missing'],
           status: 2,
-          failure: /must be provided|Both source/,
+          failure: /Requested profile "missing" is not defined in config file/,
+        },
+        {
+          args: ['--profile=destination', '--source-profile=missing'],
+          status: 2,
+          failure: /Requested profile "missing" is not defined in config file/,
+        },
+        {
+          args: ['--profile=destination', '--source-profile=empty'],
+          status: 2,
+          failure: /Cannot find an API token for the source profile "empty"!/,
         },
       ];
       for (const scenario of cases) {
@@ -249,6 +265,7 @@ describe('public profile authentication adapter', () => {
           FIXTURE_DESTINATION_TOKEN: 'destination-fixture',
         };
         Reflect.deleteProperty(env, 'DATOCMS_PROFILE');
+        Reflect.deleteProperty(env, 'FIXTURE_EMPTY_TOKEN');
         if (scenario.envProfile)
           Reflect.set(env, 'DATOCMS_PROFILE', scenario.envProfile);
         const result = spawnSync(
@@ -269,29 +286,28 @@ describe('public profile authentication adapter', () => {
         const label = JSON.stringify(scenario);
         assert.equal(result.error, undefined, label);
         const parsed = JSON.parse(result.stdout);
+        assert.equal(
+          result.status,
+          scenario.status,
+          `${label}\n${result.stderr}\n${result.stdout}`,
+        );
         if (scenario.failure) {
-          assert.notEqual(result.status, 0, label);
           assert.match(
             parsed.error.message,
             scenario.failure,
             `${label}: ${parsed.error.message}`,
           );
+          assert.ok(parsed.error.suggestions?.length, label);
         } else {
-          assert.equal(
-            result.status,
-            0,
-            `${label}\n${result.stderr}\n${result.stdout}`,
-          );
           assert.deepEqual(
             parsed,
             {
-              source: 'http://source.invalid',
-              destination: scenario.paired
-                ? 'http://destination.invalid'
-                : null,
-              explicit: scenario.explicit ?? false,
-              sourceTokenMatched: true,
+              destination: 'http://destination.invalid',
+              source: scenario.paired ? 'http://source.invalid' : null,
+              destinationExplicit: scenario.destinationExplicit ?? false,
               destinationTokenMatched: true,
+              sourceExplicit: scenario.sourceExplicit ?? false,
+              sourceTokenMatched: true,
             },
             label,
           );
@@ -305,7 +321,7 @@ describe('public profile authentication adapter', () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  }).timeout(120_000);
+  }).timeout(180_000);
 });
 
 function withEnvironment<T>(
@@ -339,6 +355,11 @@ async function withLinkedSiteToken<T>(
   } finally {
     Reflect.set(profileAuth, 'resolveLinkedSiteToken', original);
   }
+}
+
+/** The native options a client was built with. */
+function clientOptions({ config }: CmaClient.Client) {
+  return [config.apiToken, config.baseUrl, config.logLevel, config.environment];
 }
 
 describe('command authentication', () => {
@@ -427,128 +448,135 @@ describe('command authentication', () => {
     );
   });
 
-  it('builds content:apply and content:export on the native client command and content:diff on the configuration command', () => {
-    assert.equal(Object.getPrototypeOf(ContentApplyCommand), CmaClientCommand);
-    assert.equal(Object.getPrototypeOf(ContentExportCommand), CmaClientCommand);
-    assert.equal(
-      Object.getPrototypeOf(Object.getPrototypeOf(ContentDiffCommand)),
-      DatoConfigCommand,
-    );
+  it('builds every command on the native client command', () => {
+    for (const Command of [
+      ContentApplyCommand,
+      ContentDiffCommand,
+      ContentExportCommand,
+    ])
+      assert.equal(Object.getPrototypeOf(Command), CmaClientCommand);
   });
 
-  it('builds paired-profile endpoints with their own tokens and log settings', async () => {
+  it('builds the source project clients from its profile with its own token and the native log settings', async () => {
     await withEnvironment(
       { CONTENT_DIFF_SOURCE_TOKEN: 'source-environment-token' },
       async () => {
         const logged: string[] = [];
         const linked: unknown[] = [];
-        let json = false;
         const command = Object.assign(
           Object.create(ContentDiffCommand.prototype),
           {
+            config: { bin: 'datocms' },
             datoConfig: {
               profiles: {
                 source: {
                   apiTokenEnvName: 'CONTENT_DIFF_SOURCE_TOKEN',
                   baseUrl: 'http://127.0.0.1:9',
                 },
-                destination: {
-                  siteId: 'destination-site',
-                  organizationId: 'destination-organization',
+                linked: {
+                  siteId: 'linked-site',
+                  organizationId: 'linked-organization',
                   logLevel: 'BASIC',
                 },
                 empty: { apiTokenEnvName: 'CONTENT_DIFF_MISSING_TOKEN' },
               },
             },
             datoConfigRelativePath: 'datocms.config.json',
+            // The destination, as the native init selects it.
+            profileId: 'default',
+            datoProfileConfig: { baseUrl: 'http://destination.invalid' },
             parse: async () => ({
-              flags: { 'log-level': json ? undefined : 'BODY', json },
+              flags: { 'api-token': 'destination-token', 'log-level': 'BODY' },
             }),
             log: (message: string) => logged.push(message),
           },
         );
-        const linkedToken = await withLinkedSiteToken(
+        await withLinkedSiteToken(
           async (siteId, organizationId) => {
             linked.push([siteId, organizationId]);
-            return 'destination-linked-token';
+            return 'linked-token';
           },
           async () => {
-            const source = await command.endpoint('source');
-            const destination = await command.endpoint('destination');
-            const overridden = await command.endpoint(
-              'destination',
-              'destination-flag-token',
+            const source = await command.sourceProject('source');
+            const linkedProject = await command.sourceProject('linked');
+            const overridden = await command.sourceProject(
+              'linked',
+              'linked-flag-token',
             );
-            const sandbox = source.buildEnvironmentClient('sandbox');
+            assert.equal(source.profile, command.datoConfig.profiles.source);
+            // A source profile without a base URL uses the API's default,
+            // never the destination's; log settings stay native.
             assert.deepEqual(
               [
-                source.rootClient,
-                destination.rootClient,
-                overridden.rootClient,
-              ].map(({ config }) => [
-                config.apiToken,
-                config.logLevel,
-                config.baseUrl,
-              ]),
+                source.endpoint.rootClient,
+                await source.endpoint.buildEnvironmentClient('sandbox'),
+                linkedProject.endpoint.rootClient,
+                overridden.endpoint.rootClient,
+              ].map(clientOptions),
               [
                 [
                   'source-environment-token',
-                  CmaClient.LogLevel.BODY,
                   'http://127.0.0.1:9',
-                ],
-                [
-                  'destination-linked-token',
                   CmaClient.LogLevel.BODY,
                   undefined,
                 ],
-                ['destination-flag-token', CmaClient.LogLevel.BODY, undefined],
+                [
+                  'source-environment-token',
+                  'http://127.0.0.1:9',
+                  CmaClient.LogLevel.BODY,
+                  'sandbox',
+                ],
+                ['linked-token', undefined, CmaClient.LogLevel.BODY, undefined],
+                [
+                  'linked-flag-token',
+                  undefined,
+                  CmaClient.LogLevel.BODY,
+                  undefined,
+                ],
               ],
             );
-            assert.deepEqual(
-              [sandbox.config.apiToken, sandbox.config.environment],
-              ['source-environment-token', 'sandbox'],
-            );
-            source.rootClient.config.logFn?.('[1] GET /site');
+            source.endpoint.rootClient.config.logFn?.('[1] GET /site');
             assert.deepEqual(logged, ['[1] GET /site']);
-            json = true;
-            assert.equal(
-              (await command.endpoint('destination')).rootClient.config
-                .logLevel,
-              CmaClient.LogLevel.NONE,
-            );
-            json = false;
-            return (await command.endpoint('destination')).rootClient.config
-              .apiToken;
           },
         );
-        assert.equal(linkedToken, 'destination-linked-token');
-        assert.deepEqual(linked, [
-          ['destination-site', 'destination-organization'],
-          ['destination-site', 'destination-organization'],
-          ['destination-site', 'destination-organization'],
-        ]);
+        // An explicit token never consults the linked project.
+        assert.deepEqual(linked, [['linked-site', 'linked-organization']]);
         await assert.rejects(
-          command.endpoint('missing'),
-          /Profile "missing" is not defined in "datocms.config.json"/,
+          command.sourceProject('missing'),
+          (error: NativeError) => {
+            assert.ok(error instanceof oclif.Errors.CLIError, String(error));
+            assert.equal(
+              error.message,
+              'Requested profile "missing" is not defined in config file "datocms.config.json"',
+            );
+            assert.deepEqual(error.suggestions, [
+              'Configure it with "datocms profile:set missing"',
+            ]);
+            assert.equal(error.oclif?.exit, 2);
+            return true;
+          },
         );
         await assert.rejects(
-          command.endpoint('empty'),
-          /No API token is available for profile "empty".*CONTENT_DIFF_MISSING_TOKEN/,
+          command.sourceProject('empty'),
+          (error: NativeError) => {
+            assert.ok(error instanceof oclif.Errors.CLIError, String(error));
+            assert.equal(
+              error.message,
+              'Cannot find an API token for the source profile "empty"!',
+            );
+            assert.match(
+              String(error.suggestions),
+              /--source-api-token flag[\s\S]*CONTENT_DIFF_MISSING_TOKEN environment variable[\s\S]*datocms link/,
+            );
+            assert.equal(error.oclif?.exit, 2);
+            return true;
+          },
         );
-        command.datoProfileConfig = {
-          apiTokenEnvName: 'CONTENT_DIFF_MISSING_TOKEN',
-        };
-        await assert.rejects(command.endpoint(), (error: Error) => {
-          assert.equal(
-            error.message,
-            'Cannot find an API token to use to call DatoCMS!',
-          );
-          assert.match(
-            String(Reflect.get(error, 'suggestions')),
-            /--api-token flag[\s\S]*CONTENT_DIFF_MISSING_TOKEN environment variable[\s\S]*datocms link/,
-          );
-          return true;
-        });
+        command.datoConfig = undefined;
+        await assert.rejects(
+          command.sourceProject('source'),
+          /No config file found in "datocms.config.json"/,
+        );
       },
     );
   });

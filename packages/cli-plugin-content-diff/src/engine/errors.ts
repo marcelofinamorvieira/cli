@@ -18,12 +18,55 @@ interface ContentErrorReport {
   keptForkEnvironmentId?: string;
 }
 
+/** Every `code` a command can report, in human output and under --json. */
+export type ContentErrorCode =
+  | 'APPLY_FAILED_CLEANUP_INCOMPLETE'
+  | 'ASSET_CHANGED'
+  | 'ASSET_DOWNLOAD_FAILED'
+  | 'CAPTURE_DRIFT'
+  | 'CMA_REQUEST_FAILED'
+  | 'CMA_VALIDATION_FAILED'
+  | 'DESTINATION_CHANGED'
+  | 'DESTINATION_MISMATCH'
+  | 'DESTINATION_UNAVAILABLE'
+  | 'ENVIRONMENT_NOT_FOUND'
+  | 'FAST_FORK_BLOCKED'
+  | 'FORK_FAILED'
+  | 'FORK_ID_COLLISION'
+  | 'INTERRUPTED'
+  | 'INVALID_BLOCK'
+  | 'INVALID_DIFF'
+  | 'INVALID_DIFF_PATH'
+  | 'INVALID_DUMP'
+  | 'INVALID_FORK_NAME'
+  | 'INVALID_JSON'
+  | 'INVALID_MODEL'
+  | 'INVALID_MODEL_SELECTION'
+  | 'INVALID_NAME'
+  | 'INVALID_OUTPUT_PATH'
+  | 'INVALID_RESPONSE'
+  | 'INVALID_SOURCE_RECORDS'
+  | 'INVALID_ZIP'
+  | 'LINKED_PROJECT_TOKEN_MISSING'
+  | 'LINKED_PROJECT_UNAVAILABLE'
+  | 'OAUTH_CREDENTIALS_INVALID'
+  | 'OAUTH_CREDENTIALS_MISSING'
+  | 'ORDERING_MEMBERS_DIFFER'
+  | 'ORDERING_NOT_APPLIED'
+  | 'OUTPUT_EXISTS'
+  | 'PRIMARY_REQUIRES_APPROVAL'
+  | 'PUBLICATION_CYCLE'
+  | 'RECORD_CHANGED_DURING_APPLY'
+  | 'SAME_ENVIRONMENT'
+  | 'SCHEMA_INCOMPATIBLE'
+  | 'UNPROVEN_FULL_ACCESS';
+
 export class ContentError extends Error implements ContentFailureContext {
   keptForkEnvironmentId?: string;
   outcome?: string;
 
   constructor(
-    readonly code: string,
+    readonly code: ContentErrorCode,
     message: string,
     readonly details?: Record<string, unknown>,
   ) {

@@ -436,6 +436,16 @@ export function cmaFixture(
       ) {
         assert.equal(options.recursive, false);
         const record = get(id);
+        // The CMA refuses to unpublish a record that a published record
+        // still links to (the default strategy), or whose child is still
+        // published when `recursive` is off.
+        for (const peer of records.values())
+          if (peer.id !== id)
+            for (const ref of recordReferences(peer, definition))
+              assert(
+                ref.kind !== 'published' || ref.targetId !== id,
+                `unpublish record ${id} referenced by published ${peer.id}`,
+              );
         record.published = null;
         record.publishedUpdatedAt = null;
         events.push(`unpublish:${id}`);
@@ -506,28 +516,10 @@ export function cmaFixture(
         events.push(`unschedule-publication:${id}`);
         return { id };
       },
-      async create(
-        id: string,
-        body: {
-          publication_scheduled_at: string;
-          selective_publication: {
-            content_in_locales: string[];
-            non_localized_content: boolean;
-          } | null;
-        },
-      ) {
+      async create(id: string, body: { publication_scheduled_at: string }) {
         const record = get(id);
-        if (!body.selective_publication)
-          assert(valid(record), 'scheduling invalid content');
-        record.schedules.publication = {
-          at: body.publication_scheduled_at,
-          selective: body.selective_publication
-            ? {
-                locales: body.selective_publication.content_in_locales,
-                nonLocalized: body.selective_publication.non_localized_content,
-              }
-            : null,
-        };
+        assert(valid(record), 'scheduling invalid content');
+        record.schedules.publication = { at: body.publication_scheduled_at };
         events.push(`schedule-publication:${id}`);
         return { id, ...body };
       },
@@ -538,17 +530,8 @@ export function cmaFixture(
         events.push(`unschedule-unpublishing:${id}`);
         return { id };
       },
-      async create(
-        id: string,
-        body: {
-          unpublishing_scheduled_at: string;
-          content_in_locales: string[] | null;
-        },
-      ) {
-        get(id).schedules.unpublishing = {
-          at: body.unpublishing_scheduled_at,
-          locales: body.content_in_locales,
-        };
+      async create(id: string, body: { unpublishing_scheduled_at: string }) {
+        get(id).schedules.unpublishing = { at: body.unpublishing_scheduled_at };
         events.push(`schedule-unpublishing:${id}`);
         return { id, ...body };
       },
@@ -566,25 +549,30 @@ export function cmaFixture(
         parent: { id: string } | null;
         position?: number;
       }) {
-        assert.equal(
-          body.position,
-          undefined,
-          'native folder creation appends',
-        );
         assert(!folders.has(body.id));
         const parentId = body.parent?.id ?? null;
         if (parentId) folderGet(parentId);
         const peers = [...folders.values()].filter(
           (folder) => folder.parentId === parentId,
         );
+        // A folder created at a position shifts the siblings at or after it;
+        // one created without a position is appended.
+        const position =
+          body.position ??
+          (peers.length
+            ? Math.max(...peers.map((folder) => folder.position))
+            : 0) + 1;
+        if (body.position !== undefined)
+          for (const sibling of peers)
+            if (sibling.position >= position) {
+              sibling.position++;
+              sibling.hash = collectionHash(sibling);
+            }
         const state = {
           id: body.id,
           label: body.label,
           parentId,
-          position:
-            (peers.length
-              ? Math.max(...peers.map((folder) => folder.position))
-              : 0) + 1,
+          position,
           hash: '',
         };
         state.hash = collectionHash(state);
@@ -639,31 +627,6 @@ export function cmaFixture(
         folders.set(id, state);
         events.push(`update-folder:${id}`);
         return folderResponse(state);
-      },
-      async reorder(
-        list: Array<{
-          id: string;
-          type: string;
-          position: number;
-          parent: { id: string } | null;
-        }>,
-      ) {
-        for (const entry of list) {
-          assert.equal(entry.type, 'upload_collection');
-          const folder = folderGet(entry.id);
-          folder.parentId = entry.parent?.id ?? null;
-          folder.position = entry.position;
-          folder.hash = collectionHash(folder);
-        }
-        for (const folder of folders.values()) {
-          let ancestor = folder.parentId;
-          while (ancestor) {
-            assert.notEqual(ancestor, folder.id, 'folder parent cycle');
-            ancestor = folderGet(ancestor).parentId;
-          }
-        }
-        events.push('reorder-folders');
-        return list.map((entry) => folderResponse(folderGet(entry.id)));
       },
       async destroy(id: string) {
         const old = folderGet(id);

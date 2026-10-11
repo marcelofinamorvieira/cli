@@ -154,24 +154,6 @@ function project() {
       { updated_at: PUBLISHED_AT, published_at: PUBLISHED_AT },
     ),
   ];
-  const schedules = {
-    publication: {
-      id: 'scheduled-publication',
-      type: 'scheduled_publication',
-      attributes: {
-        publication_scheduled_at: at(1),
-        selective_publication: null,
-      },
-    },
-    unpublishing: {
-      id: 'scheduled-unpublishing',
-      type: 'scheduled_unpublishing',
-      attributes: {
-        unpublishing_scheduled_at: at(2),
-        content_in_locales: null,
-      },
-    },
-  };
   const bytes = new Map([
     ['logo', '<svg>logo</svg>'],
     ['photo', '<svg>photo</svg>'],
@@ -251,24 +233,6 @@ function project() {
         meta: { total_count: rows.length },
       };
     },
-    items: {
-      async rawCurrentVsPublishedState(recordId: string) {
-        assert.equal(recordId, id('scheduled'));
-        return {
-          data: {
-            relationships: {
-              scheduled_publication: {
-                data: { id: schedules.publication.id },
-              },
-              scheduled_unpublishing: {
-                data: { id: schedules.unpublishing.id },
-              },
-            },
-          },
-          included: [schedules.publication, schedules.unpublishing],
-        };
-      },
-    },
     uploads: {
       rawList: async () => ({
         data: uploads.slice(0, 1),
@@ -279,7 +243,7 @@ function project() {
     },
     uploadCollections: { list: async () => folders },
   } as unknown as Client);
-  return { client, current, published, schedules, uploads, folders, bytes };
+  return { client, current, published, uploads, folders, bytes };
 }
 
 describe('content formats', () => {
@@ -545,7 +509,6 @@ describe('content formats', () => {
     it('keeps the facts planning needs in memory and full states in bucket files', async () => {
       const index = new SideIndex(join(directory, 'side'), schema, 4, {
         models: new Set([MODEL]),
-        payloadSchema: schema,
       });
       const linked = canonicalRecord(
         rawRecord(
@@ -561,10 +524,7 @@ describe('content formats', () => {
         schema,
       );
       const untitled = canonicalRecord(
-        rawRecord('untitled', {
-          title: null,
-          image: file('picture', { __itemTypeId: 'kept as data' }),
-        }),
+        rawRecord('untitled', { title: null, image: file('picture') }),
         null,
         schema,
       );
@@ -593,7 +553,6 @@ describe('content formats', () => {
       // a selected model names the uploads it references.
       assert.deepEqual(index.records.get(linked.id), facts);
       assert.deepEqual([...index.referencedUploads], [id('picture')]);
-      assert.equal(index.records.get(untitled.id)!.unsupportedKeys, undefined);
       await index.loadDetails([linked.id, untitled.id]);
       assert.deepEqual(index.records.get(linked.id), {
         ...facts,
@@ -622,7 +581,6 @@ describe('content formats', () => {
       const untitledFacts = index.records.get(untitled.id)!;
       assert.equal(untitledFacts.title, undefined);
       assert.equal(untitledFacts.published, false);
-      assert.deepEqual(untitledFacts.unsupportedKeys, ['__itemTypeId']);
       assert.deepEqual(index.uploads.get(upload.id), {
         id: upload.id,
         hash: upload.hash,
@@ -655,19 +613,15 @@ describe('content formats', () => {
       assert.deepEqual(uploads, new Map([[upload.id, upload]]));
     });
 
-    it('checks payloads only of the selected models', async () => {
+    it('names referenced uploads only for records of the selected models', async () => {
       const index = new SideIndex(join(directory, 'side'), schema, 4);
       const state = canonicalRecord(
-        rawRecord('unchecked', {
-          image: file('picture', { __itemTypeId: 'kept as data' }),
-        }),
+        rawRecord('unselected', { image: file('picture') }),
         null,
         schema,
       );
       await index.record(state);
       await index.flush();
-      await index.loadDetails([state.id]);
-      assert.equal(index.records.get(state.id)!.unsupportedKeys, undefined);
       assert.deepEqual([...index.referencedUploads], []);
     });
 
@@ -713,8 +667,7 @@ describe('content formats', () => {
   });
 
   describe('diff files', () => {
-    const zero = { create: 0, update: 0, delete: 0, noop: 0, skip: 0 };
-    const tracking = { apiKey: 'schema_migration', model: null };
+    const zero = { create: 0, update: 0, delete: 0, noop: 0 };
     const manifest = {
       includesAssets: false,
       source: {
@@ -724,13 +677,11 @@ describe('content formats', () => {
       },
       destination: { siteId: 'site', environmentId: 'target' },
       schemaHash: 'schema-hash',
-      sourceTracking: tracking,
-      destinationTracking: tracking,
+      trackingModelApiKey: 'schema_migration',
       options: {
         modelIds: [MODEL],
         uploads: 'all' as const,
         includeDeletions: true,
-        allowPartial: false,
       },
       counts: {
         record: { ...zero, update: 1 },
@@ -767,7 +718,11 @@ describe('content formats', () => {
           expect: { hash: 'folder-hash' },
           data: JSON.parse('{"__proto__":{"safe":true},"label":"Media"}'),
         },
-        { op: 'folders.reorder', label: 'Reorder folders', data: [] },
+        {
+          op: 'records.reorder',
+          label: 'Reorder records',
+          data: { model: MODEL, parent: null, order: [id('record')] },
+        },
       ];
       assert.equal(await write(path, operations), 4);
       assert.deepEqual(await entries(path), [
@@ -848,7 +803,7 @@ describe('content formats', () => {
       for (const key of [
         'destination',
         'schemaHash',
-        'destinationTracking',
+        'trackingModelApiKey',
         'counts',
       ]) {
         const { [key]: _removed, ...rest } = raw;
@@ -896,7 +851,11 @@ describe('content formats', () => {
         },
         { op: 'schedule.publication.delete', ...record, expect: recordExpect },
         { op: 'record.unpublish', ...record, expect: recordExpect },
-        { op: 'records.reorder', label: 'Reorder', data: { order: [] } },
+        {
+          op: 'records.reorder',
+          label: 'Reorder',
+          data: { model: id('model'), parent: null, order: [] },
+        },
       ];
       const refused: Array<[unknown, string]> = [
         [[], 'expected an operation object.'],
@@ -929,10 +888,6 @@ describe('content formats', () => {
         [
           { op: 'record.create', ...record, data: [] },
           '"data" must be an object.',
-        ],
-        [
-          { op: 'folders.reorder', label: 'x', data: {} },
-          '"data" must be an array.',
         ],
         [
           { op: 'upload.create', ...upload, md5: undefined, url: 'https://x' },
@@ -975,6 +930,10 @@ describe('content formats', () => {
             expect: { hash: 'h' },
           },
           '"expect" does not fit the operation.',
+        ],
+        [
+          { op: 'records.reorder', label: 'x', data: { order: [] } },
+          '"data" must be a record order: model, parent and order.',
         ],
       ];
       const lines = (values: unknown[]) =>
@@ -1182,35 +1141,14 @@ describe('content formats', () => {
         });
         const [draft, live, scheduled] = fixture.current;
         assert.deepEqual(read, [
+          ['record', { id: draft!.id, current: draft, published: null }],
           [
             'record',
-            {
-              id: draft!.id,
-              current: draft,
-              published: null,
-              scheduledPublication: null,
-              scheduledUnpublishing: null,
-            },
+            { id: live!.id, current: live, published: fixture.published[0] },
           ],
           [
             'record',
-            {
-              id: live!.id,
-              current: live,
-              published: fixture.published[0],
-              scheduledPublication: null,
-              scheduledUnpublishing: null,
-            },
-          ],
-          [
-            'record',
-            {
-              id: scheduled!.id,
-              current: scheduled,
-              published: null,
-              scheduledPublication: fixture.schedules.publication,
-              scheduledUnpublishing: fixture.schedules.unpublishing,
-            },
+            { id: scheduled!.id, current: scheduled, published: null },
           ],
           ...fixture.uploads.map((upload) => ['upload', upload]),
           ...fixture.folders.map((folder) => ['collection', folder]),

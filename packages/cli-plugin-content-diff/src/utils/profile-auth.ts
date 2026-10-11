@@ -1,6 +1,6 @@
-import { type ProfileConfig, readCredentials } from '@datocms/cli-utils';
+import { type ProfileConfig, oclif, readCredentials } from '@datocms/cli-utils';
 import * as DashboardClient from '@datocms/dashboard-client';
-import { ContentError } from '../engine/errors';
+import type { ContentErrorCode } from '../engine/errors';
 
 type ResolveLinkedSiteToken = (
   siteId: string,
@@ -60,7 +60,9 @@ export async function resolveProfileApiToken({
 
 /**
  * The CMA token of a project linked with `datocms link`, read through the
- * saved OAuth credentials (`CmaClientCommand` keeps its own resolver private).
+ * saved OAuth credentials. This mirrors the private resolver of
+ * `CmaClientCommand` in `@datocms/cli-utils` 4.2, messages included, for the
+ * source project of a cross-project diff; the destination uses the native one.
  */
 export async function resolveLinkedSiteToken(
   {
@@ -82,7 +84,7 @@ export async function resolveLinkedSiteToken(
       'Project is linked but no OAuth credentials found.',
       [
         'Run "datocms login" to authenticate',
-        'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
+        'Use --api-token (or --source-api-token for the source project) to provide a token directly',
       ],
     );
   const client = dependencies.buildClient({
@@ -105,7 +107,7 @@ export async function resolveLinkedSiteToken(
         'Your OAuth token is invalid or has been revoked.',
         [
           'Run "datocms login" to re-authenticate',
-          'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
+          'Use --api-token (or --source-api-token for the source project) to provide a token directly',
         ],
       );
     throw authenticationError(
@@ -114,7 +116,7 @@ export async function resolveLinkedSiteToken(
       [
         'Run "datocms login" to re-authenticate with updated permissions',
         'Run "datocms link" to re-link to a project',
-        'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
+        'Use --api-token (or --source-api-token for the source project) to provide a token directly',
       ],
     );
   }
@@ -124,16 +126,17 @@ export async function resolveLinkedSiteToken(
       `Could not retrieve an API token for project "${site.name}" (ID: ${siteId}). You may not have access to this project.`,
       [
         'Run "datocms link" to re-link to a project',
-        'Use --api-token (or the matching --source-api-token/--destination-api-token) to provide a token directly',
+        'Use --api-token (or --source-api-token for the source project) to provide a token directly',
       ],
     );
   return site.access_token;
 }
 
+/** A native CLI error (exit 2, pretty-printed), with a code for --json. */
 function authenticationError(
-  code: string,
+  code: ContentErrorCode,
   message: string,
   suggestions: string[],
-): ContentError {
-  return Object.assign(new ContentError(code, message), { suggestions });
+): oclif.Errors.CLIError {
+  return new oclif.Errors.CLIError(message, { code, suggestions });
 }

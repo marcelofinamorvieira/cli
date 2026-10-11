@@ -27,7 +27,7 @@ type NativeError = { suggestions?: string[]; oclif?: { exit?: number } };
 describe('content error reporting contract', () => {
   it('reports only the documented error fields', () => {
     const failure = Object.assign(new Error('Request failed'), {
-      code: 'APPLY_FAILED',
+      code: 'CMA_REQUEST_FAILED',
       details: { step: 'records' },
       suggestions: ['Retry', 3],
       keptForkEnvironmentId: 'review-kept',
@@ -39,7 +39,7 @@ describe('content error reporting contract', () => {
     assert.deepEqual(contentErrorReport(failure), {
       name: 'Error',
       message: 'Request failed The fork "review-kept" was kept.',
-      code: 'APPLY_FAILED',
+      code: 'CMA_REQUEST_FAILED',
       details: { step: 'records' },
       suggestions: ['Retry'],
       keptForkEnvironmentId: 'review-kept',

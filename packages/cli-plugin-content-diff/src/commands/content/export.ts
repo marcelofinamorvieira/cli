@@ -1,13 +1,9 @@
-import { CmaClient, CmaClientCommand, oclif } from '@datocms/cli-utils';
+import { CmaClientCommand, oclif } from '@datocms/cli-utils';
 import { writeDump } from '../../engine/dump';
 import type { DumpManifest } from '../../engine/dump';
 import type { ContentFailureContext } from '../../engine/errors';
 import { environmentId } from '../../engine/generation';
-import {
-  jsonFailure,
-  outputPath,
-  requestLogLevel,
-} from '../../utils/command-helpers';
+import { jsonFailure, outputPath } from '../../utils/command-helpers';
 import { withInterruptHandling } from '../../utils/interruption';
 
 type ContentExportResult = DumpManifest & { dumpPath: string };
@@ -20,7 +16,7 @@ export default class ContentExportCommand extends CmaClientCommand {
     'Export an environment to a project dump: a zip of JSON lines that content:diff can use as its source';
   static examples = [
     '<%= config.bin %> <%= command.id %> backup',
-    '<%= config.bin %> <%= command.id %> backup --environment=staging --include-assets --output=./backups',
+    '<%= config.bin %> <%= command.id %> backup --environment=staging --include-assets --out=./backups',
   ];
   static args = {
     NAME: oclif.Args.string({
@@ -37,7 +33,7 @@ export default class ContentExportCommand extends CmaClientCommand {
       description: 'Also store every asset file in the dump',
       default: false,
     }),
-    output: oclif.Flags.string({
+    out: oclif.Flags.string({
       description:
         'Dump .zip file, or directory for a timestamped name (defaults to the current directory)',
     }),
@@ -56,7 +52,7 @@ export default class ContentExportCommand extends CmaClientCommand {
   private dumpPath() {
     this.path ??= this.parse(ContentExportCommand).then(({ flags, args }) =>
       outputPath({
-        output: flags.output,
+        output: flags.out,
         directory: process.cwd(),
         name: args.NAME,
         kind: 'dump',
@@ -75,19 +71,9 @@ export default class ContentExportCommand extends CmaClientCommand {
 
   // The environment client reuses the options `init` resolved for
   // `this.client`; resolving them again would repeat a linked project's
-  // Dashboard request. CmaClientCommand reads any --output as an output
-  // format and silences request logs; here --output names the dump.
+  // Dashboard request.
   protected buildBaseClientInitializationOptions(): Promise<ClientOptions> {
-    this.clientOptions ??= (async () => {
-      const { flags } = await this.parse(ContentExportCommand);
-      return {
-        ...(await super.buildBaseClientInitializationOptions()),
-        logLevel: requestLogLevel(
-          flags as Parameters<typeof requestLogLevel>[0],
-          this.datoProfileConfig,
-        ),
-      };
-    })();
+    this.clientOptions ??= super.buildBaseClientInitializationOptions();
     return this.clientOptions;
   }
 
@@ -108,10 +94,9 @@ export default class ContentExportCommand extends CmaClientCommand {
     const path = await this.dumpPath();
     const environments = await this.client.environments.list();
     const id = environmentId(flags.environment, environments);
-    const options = await this.buildBaseClientInitializationOptions();
     const dumpPath = path(flags['include-assets']);
     const manifest = await writeDump({
-      client: CmaClient.buildClient({ ...options, environment: id }),
+      client: await this.buildClient({ environment: id }),
       environmentId: id,
       primary: environments.some(
         (environment) => environment.id === id && environment.meta.primary,

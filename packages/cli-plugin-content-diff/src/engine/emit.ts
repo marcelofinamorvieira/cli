@@ -1,5 +1,4 @@
 import { join } from 'node:path';
-import { setImmediate } from 'node:timers/promises';
 import { assertNotAborted } from './cancellation';
 import {
   hashJson,
@@ -425,7 +424,10 @@ function recordOperations(
       continue;
     }
     if (!fields) {
-      write(phase, 'record.unpublish', `Unpublish ${subject()}`);
+      // A record that a deleted record still links to is unpublished after
+      // that deletion, in the deletion phase (see the planner).
+      if (!entry.execution?.lateUnpublish)
+        write(phase, 'record.unpublish', `Unpublish ${subject()}`);
       live!.published = null;
       if (moves()) move(phase);
       continue;
@@ -452,6 +454,8 @@ function recordOperations(
   update('draft', draft.body, 'Update', desired!.current);
   live = { ...desired! };
   if (draft.republish) write('draft', 'record.publish', `Publish ${subject()}`);
+  if (entry.execution?.lateUnpublish)
+    write('delete', 'record.unpublish', `Unpublish ${subject()}`);
   // Schedules change last, and only where baseline and desired differ, so a
   // new schedule never sees a half-migrated record.
   const { publication, unpublishing } = desired!.schedules;
@@ -459,23 +463,12 @@ function recordOperations(
     [
       'publication',
       'schedule.publication',
-      publication && {
-        publication_scheduled_at: publication.at,
-        selective_publication: publication.selective
-          ? {
-              content_in_locales: publication.selective.locales,
-              non_localized_content: publication.selective.nonLocalized,
-            }
-          : null,
-      },
+      publication && { publication_scheduled_at: publication.at },
     ],
     [
       'unpublishing',
       'schedule.unpublishing',
-      unpublishing && {
-        unpublishing_scheduled_at: unpublishing.at,
-        content_in_locales: unpublishing.locales,
-      },
+      unpublishing && { unpublishing_scheduled_at: unpublishing.at },
     ],
   ] as const) {
     const before = baseline?.schedules[key] ?? null;
@@ -566,14 +559,23 @@ function folderWrites(context: Context): Operation[] {
         op: 'folder.create',
         id: entry.id,
         label: `Create ${subject}`,
-        data: { label: desired.label, parent: folderRef(desired.parentId) },
+        data: {
+          label: desired.label,
+          parent: folderRef(desired.parentId),
+          position: desired.position,
+        },
       });
       continue;
     }
     const body: JsonObject = {};
     if (entry.baseline?.label !== desired.label) body.label = desired.label;
-    if (entry.baseline?.parentId !== desired.parentId)
+    // A folder entering another group says where it goes; one that stays
+    // only when its place changes.
+    if (entry.baseline?.parentId !== desired.parentId) {
       body.parent = folderRef(desired.parentId);
+      body.position = desired.position;
+    } else if (entry.baseline?.position !== desired.position)
+      body.position = desired.position;
     if (Object.keys(body).length)
       operations.push({
         op: 'folder.update',
@@ -614,51 +616,6 @@ function folderDeletes(context: Context): Operation[] {
       )})`,
       expect: { hash: entry.baseline!.hash },
     }));
-}
-
-/**
- * Every folder that exists once the run is over, at its desired position:
- * the source position for managed folders, the destination one for the rest.
- * Nothing when no folder changes.
- */
-function folderOrder(context: Context): Operation[] {
-  const entries = [...context.plan.collections.values()];
-  if (
-    !entries.some((entry) =>
-      ['create', 'update', 'delete'].includes(entry.action),
-    )
-  )
-    return [];
-  const final = new Map<string, CollectionState>(context.target.collections);
-  for (const entry of entries)
-    if (entry.action === 'delete') final.delete(entry.id);
-    else if (
-      (entry.action === 'create' || entry.action === 'update') &&
-      entry.desired
-    )
-      final.set(entry.id, entry.desired);
-  const folders = [...final.values()]
-    .sort(
-      (a, b) =>
-        compareIds(a.parentId ?? '', b.parentId ?? '') ||
-        a.position - b.position ||
-        compareIds(a.id, b.id),
-    )
-    .map((folder) => ({
-      id: folder.id,
-      type: 'upload_collection',
-      position: folder.position,
-      parent: folderRef(folder.parentId),
-    }));
-  return folders.length
-    ? [
-        {
-          op: 'folders.reorder',
-          label: 'Set the position of every folder',
-          data: folders,
-        },
-      ]
-    : [];
 }
 
 /** SQL-like ascending order with nulls first. */
@@ -749,8 +706,7 @@ function recordOrders(context: Context): Operation[] {
           const kept =
             other &&
             other.modelId === row.modelId &&
-            other.parentId === row.parentId &&
-            plan.records.get(row.id)?.action !== 'skip';
+            other.parentId === row.parentId;
           return {
             id: row.id,
             position:
@@ -876,7 +832,9 @@ export async function* planOperations(args: {
   for (const entry of [...writes].sort(byModel))
     slot(entry, 'draft', entry.desired!.bytes);
   for (const entry of records
-    .filter((entry) => entry.action === 'delete')
+    .filter(
+      (entry) => entry.action === 'delete' || entry.execution?.lateUnpublish,
+    )
     .sort(order('deleteOrder')))
     slot(entry, 'delete', 512);
   for (const entry of uploads
@@ -884,7 +842,6 @@ export async function* planOperations(args: {
     .sort(byId))
     uploadSlots.set(entry.id, assign(512));
   memory(folderDeletes(context));
-  memory(folderOrder(context));
   memory(recordOrders(context));
   for (const entry of [...writes].sort(byModel)) slot(entry, 'schedule', 1024);
 
@@ -929,7 +886,6 @@ export async function* planOperations(args: {
         sources.get(id),
       ))
         await spill(emitted);
-    await setImmediate();
   }
   for (const [bucket, wanted] of byBucket(uploadSlots.keys(), source.buckets)) {
     assertNotAborted(signal);

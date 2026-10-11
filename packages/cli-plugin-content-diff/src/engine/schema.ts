@@ -150,7 +150,7 @@ function rules(value: unknown): Record<string, unknown>[] {
 async function effectivePermissions(
   client: Client,
 ): Promise<JsonObject | null> {
-  const actor: unknown = await client.users.findMe({ include: 'role' });
+  const actor: unknown = await client.users.findMe();
   if (!object(actor))
     throw new ContentError(
       'UNPROVEN_FULL_ACCESS',
@@ -167,10 +167,8 @@ async function effectivePermissions(
       'UNPROVEN_FULL_ACCESS',
       'The actor has no inspectable effective role.',
     );
-  const role: unknown =
-    object(actor.role.meta) && object(actor.role.meta.final_permissions)
-      ? actor.role
-      : await client.roles.find(actor.role.id);
+  // The SDK reduces the actor's role to its identity, so the role is read.
+  const role: unknown = await client.roles.find(actor.role.id);
   if (
     !object(role) ||
     !object(role.meta) ||

@@ -1,17 +1,17 @@
-import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { CmaClient } from '@datocms/cli-utils';
 import { assertNotAborted } from './cancellation';
 import { DiffFile } from './diff-file';
 import { ContentError, contentErrorReport, destinationChanged } from './errors';
 import { assertExpectations, runOperations } from './execution';
-import { projectMigrationSchema } from './migration-schema';
+import { environmentId as resolveEnvironmentId } from './generation';
+import { withoutTrackingModel } from './migration-schema';
 import { fetchSchema } from './schema';
 import type { ApplyOptions, ApplyOutcome, Client } from './types';
 
 interface Arguments {
   rootClient: Client;
-  buildEnvironmentClient: (environmentId: string) => Client;
+  buildEnvironmentClient: (environmentId: string) => Promise<Client>;
   diffPath: string;
   options: ApplyOptions;
 }
@@ -25,13 +25,18 @@ async function findMaybe<T>(read: () => Promise<T>): Promise<T | null> {
     throw error;
   }
 }
+
+/**
+ * Polls the fork until it is ready. The SDK's own wait on the fork job can
+ * neither be interrupted nor report progress, so the fork is requested with
+ * `immediate_return` and read back here.
+ */
 async function waitForFork(
   client: Client,
   id: string,
   signal?: AbortSignal,
   log?: (message: string) => void,
 ) {
-  const deadline = Date.now() + 2 * 60 * 60 * 1000;
   for (let wait = 1000; ; wait = Math.min(wait * 2, 10_000)) {
     assertNotAborted(signal);
     const environment = await findMaybe(() => client.environments.find(id));
@@ -46,11 +51,6 @@ async function waitForFork(
         'FORK_FAILED',
         `Fork "${id}" ended in status ${environment.meta.status}.`,
       );
-    if (Date.now() >= deadline)
-      throw new ContentError(
-        'FORK_TIMEOUT',
-        `Fork "${id}" was still being created after 120 minutes.`,
-      );
     log?.(
       `Waiting for fork "${id}" (${
         environment.meta.fork_completion_percentage ?? 0
@@ -63,30 +63,16 @@ async function waitForFork(
     }
   }
 }
-/** Listing keeps the requested name out of a request path. */
-async function environmentExists(client: Client, id: string): Promise<boolean> {
-  const existing = await client.environments.list();
-  return existing.some((environment) => environment.id === id);
-}
 
-async function assertForkIdUnused(client: Client, id: string): Promise<void> {
-  if (await environmentExists(client, id))
+function assertForkIdUnused(
+  environments: Array<{ id: string }>,
+  id: string,
+): void {
+  if (environments.some((environment) => environment.id === id))
     throw new ContentError(
       'FORK_ID_COLLISION',
       `Environment "${id}" already exists. Choose another --fork-name.`,
     );
-}
-
-/**
- * A 4xx answer means the CMA did not create the fork. Anything else (a
- * timeout, a network error, a server error) may hide a fork that exists.
- */
-function forkMayExist(error: unknown): boolean {
-  return !(
-    error instanceof CmaClient.ApiError &&
-    error.response.status >= 400 &&
-    error.response.status < 500
-  );
 }
 
 /** The native message for a fast fork refused while editors are at work. */
@@ -106,8 +92,8 @@ function fastForkBlocked(
     ),
     {
       suggestions: [
-        'Run again once nobody is editing records in the destination',
-        'Use --no-fast-fork to create a regular fork, which does not block the destination while it copies',
+        'To proceed anyway, use the --force flag',
+        'Or leave --fast-fork out: a regular fork does not block the destination while it copies',
       ],
     },
   );
@@ -125,26 +111,15 @@ async function assertDestination(
   options: ApplyOptions,
 ): Promise<number> {
   const { manifest } = diff;
-  let schemaHash: string;
-  try {
-    const schema = await fetchSchema(client, environmentId, (schema) =>
-      projectMigrationSchema(schema, manifest.destinationTracking),
+  const schema = await fetchSchema(client, environmentId, (schema) =>
+    withoutTrackingModel(schema, manifest.trackingModelApiKey),
+  );
+  if (schema.siteId !== manifest.destination.siteId)
+    throw new ContentError(
+      'DESTINATION_MISMATCH',
+      'Destination project does not match the diff.',
     );
-    if (schema.siteId !== manifest.destination.siteId)
-      throw new ContentError(
-        'DESTINATION_MISMATCH',
-        'Destination project does not match the diff.',
-      );
-    schemaHash = schema.hash;
-  } catch (error) {
-    if (
-      error instanceof ContentError &&
-      error.code === 'INVALID_MIGRATION_TRACKING_MODEL'
-    )
-      throw destinationChanged({ reason: 'schema' });
-    throw error;
-  }
-  if (schemaHash !== manifest.schemaHash)
+  if (schema.hash !== manifest.schemaHash)
     throw destinationChanged({ reason: 'schema' });
   options.log?.(`Checking what the diff touches in "${environmentId}".`);
   return assertExpectations(client, diff, options);
@@ -200,23 +175,21 @@ async function applyDiff(
   const { diff, options } = args;
   const { manifest } = diff;
   let forkId: string | undefined;
-  let forkRequested = false;
-  let forkAppeared = false;
+  let forkCreated = false;
   let runStarted = false;
   let destinationId: string | undefined;
   try {
     assertNotAborted(options.signal);
-    destinationId =
-      options.destinationEnvironmentId ?? manifest.destination.environmentId;
-    const [rootSite, environment] = await Promise.all([
-      args.rootClient.site.find(),
-      args.rootClient.environments.find(destinationId),
-    ]);
-    if (rootSite.id !== manifest.destination.siteId)
-      throw new ContentError(
-        'DESTINATION_MISMATCH',
-        'Destination project does not match the diff.',
-      );
+    // The listing resolves "primary" as content:diff and content:export do
+    // and answers the fork ID check; assertDestination checks the project.
+    const environments = await args.rootClient.environments.list();
+    destinationId = resolveEnvironmentId(
+      options.destinationEnvironmentId ?? manifest.destination.environmentId,
+      environments,
+    );
+    const environment = environments.find(
+      (candidate) => candidate.id === destinationId,
+    )!;
     // Only an in-place run writes to the destination; whether it can be
     // forked is for the fork request to answer.
     if (
@@ -233,21 +206,19 @@ async function applyDiff(
         'Applying in place to primary requires --allow-primary.',
       );
     if (!options.inPlace) {
-      forkId = options.forkName ?? `content-apply-${randomUUID()}`;
+      forkId =
+        options.forkName ?? `content-apply-${Math.floor(Date.now() / 1000)}`;
       // Fails fast before the checks; the fork request itself leaves the
       // ID's validation to the CMA.
-      await assertForkIdUnused(args.rootClient, forkId);
+      assertForkIdUnused(environments, forkId);
     }
     // Before a fork the check only fails fast: a change made meanwhile is
     // part of the fork, whose own check sees it.
     const operations = await assertDestination(
-      args.buildEnvironmentClient(destinationId),
+      await args.buildEnvironmentClient(destinationId),
       destinationId,
       diff,
       options,
-    );
-    const partial = Object.values(manifest.counts).some(
-      (counts) => counts.skip > 0,
     );
     assertNotAborted(options.signal);
     if (options.preflightOnly)
@@ -256,16 +227,10 @@ async function applyDiff(
         preflightOnly: true,
         executed: false,
         operations,
-        partial,
         generatedCounts: manifest.counts,
       };
     let environmentId = destinationId;
     if (forkId) {
-      // The check can take minutes, so the ID is checked again right before
-      // the request: whatever answers to it afterwards was created by this
-      // request and is removed on failure.
-      await assertForkIdUnused(args.rootClient, forkId);
-      assertNotAborted(options.signal);
       options.log?.(`Creating destination fork "${forkId}".`);
       try {
         await args.rootClient.environments.fork(
@@ -273,27 +238,19 @@ async function applyDiff(
           { id: forkId },
           {
             immediate_return: true,
-            ...(options.fastFork ? { fast: true } : {}),
+            ...(options.fastFork
+              ? { fast: true, ...(options.force ? { force: true } : {}) }
+              : {}),
           },
         );
       } catch (error) {
-        forkRequested = forkMayExist(error);
-        const failure = fastForkBlocked(error, destinationId) ?? error;
-        // The SDK retries a fork request that timed out, so a 4xx may answer
-        // the retry of a request that did create the fork. An environment
-        // under the ID may still belong to someone else: report it, never
-        // remove it.
-        if (!forkRequested)
-          forkAppeared = await environmentExists(args.rootClient, forkId).catch(
-            () => false,
-          );
-        throw failure;
+        throw fastForkBlocked(error, destinationId) ?? error;
       }
-      forkRequested = true;
+      forkCreated = true;
       await waitForFork(args.rootClient, forkId, options.signal, options.log);
       environmentId = forkId;
       await assertDestination(
-        args.buildEnvironmentClient(environmentId),
+        await args.buildEnvironmentClient(environmentId),
         environmentId,
         diff,
         options,
@@ -303,36 +260,38 @@ async function applyDiff(
     options.log?.(`Running ${operations} operations in "${environmentId}".`);
     runStarted = true;
     await runOperations(
-      args.buildEnvironmentClient(environmentId),
+      await args.buildEnvironmentClient(environmentId),
       diff,
       options,
     );
-    return { environmentId, executed: true, operations, partial };
+    return { environmentId, executed: true, operations };
   } catch (error) {
     let failure = error;
-    let kept = forkAppeared;
-    // A fork name the CMA may never have accepted stays out of request
-    // paths: the cleanup finds it in the listing before removing it.
-    if (forkRequested && forkId && options.keepFailedFork)
-      // Nothing is removed, so a failed lookup only means the fork may exist.
-      kept = await environmentExists(args.rootClient, forkId).catch(() => true);
-    else if (forkRequested && forkId) {
-      try {
-        if (await environmentExists(args.rootClient, forkId)) {
-          options.log?.(`Removing failed fork "${forkId}".`);
-          await args.rootClient.environments.destroy(forkId);
+    let kept = false;
+    if (forkCreated && forkId) {
+      const id = forkId;
+      const exists = () =>
+        findMaybe(() => args.rootClient.environments.find(id));
+      if (options.keepFailedFork)
+        // Nothing is removed, so a failed lookup only means it may exist.
+        kept = await exists().then(
+          (found) => found !== null,
+          () => true,
+        );
+      else {
+        try {
+          options.log?.(`Removing failed fork "${id}".`);
+          if (await exists()) await args.rootClient.environments.destroy(id);
+        } catch (cleanup) {
+          kept = true;
+          failure = cleanupIncomplete(error, id, cleanup);
         }
-      } catch (cleanup) {
-        kept = true;
-        failure = cleanupIncomplete(error, forkId, cleanup);
       }
     }
     // What the failure left behind, said once. A failed cleanup says it in
     // its own message.
     const outcome = (): string | undefined => {
       if (failure !== error) return undefined;
-      if (forkAppeared)
-        return `The fork "${forkId}" was kept: an environment with that ID exists after the fork request failed and may have been created by a retried request of this run.`;
       if (kept)
         return runStarted
           ? `The fork "${forkId}" was kept; "${destinationId}" was not changed.`

@@ -5,7 +5,7 @@ type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
 export type JsonObject = { [key: string]: JsonValue };
 export type Side = 'source' | 'target';
-export type Action = 'create' | 'update' | 'delete' | 'noop' | 'skip';
+export type Action = 'create' | 'update' | 'delete' | 'noop';
 /** Plan entry kinds; `collection` is an upload folder. */
 export const KINDS = ['record', 'upload', 'collection'] as const;
 export type Kind = (typeof KINDS)[number];
@@ -55,17 +55,14 @@ export interface SchemaState {
   workflows: WorkflowSchema[];
   hash: string;
 }
-interface PublicationSchedule {
-  at: string;
-  selective: { locales: string[]; nonLocalized: boolean } | null;
-}
-interface UnpublishingSchedule {
-  at: string;
-  locales: string[] | null;
-}
+/**
+ * A record's scheduled publication and unpublishing instants, as the record
+ * listing reports them. Selective schedules (some locales only) are recreated
+ * as full ones: their details are only readable through an unstable API.
+ */
 export interface Schedules {
-  publication: PublicationSchedule | null;
-  unpublishing: UnpublishingSchedule | null;
+  publication: { at: string } | null;
+  unpublishing: { at: string } | null;
 }
 export interface RecordState {
   id: string;
@@ -131,8 +128,6 @@ export interface RecordFacts {
   title?: string;
   /** Read only for records the plan creates, updates or deletes. */
   references: ReferenceFact[];
-  /** Keys in the record's values the SDK would corrupt through a write. */
-  unsupportedKeys?: string[];
   /** Size of the record's JSON, to size operation files. */
   bytes: number;
 }
@@ -144,10 +139,6 @@ export type UploadFacts = Pick<
   'id' | 'hash' | 'md5' | 'size' | 'collectionId' | 'filename'
 >;
 
-export interface Diagnostic {
-  code: string;
-  message: string;
-}
 export interface RecordPlan {
   kind: 'record';
   id: string;
@@ -157,7 +148,6 @@ export interface RecordPlan {
   inDestination: boolean;
   baseline?: RecordFacts | null;
   desired?: RecordFacts | null;
-  diagnostics: Diagnostic[];
   execution?: {
     createOrder?: number;
     publishOrder?: number;
@@ -173,6 +163,12 @@ export interface RecordPlan {
      * the full published fields are published again once they are published.
      */
     provisionalTargets?: string[];
+    /**
+     * The record is unpublished in the deletion phase, after the deletion of
+     * a published record that still linked to it, instead of the
+     * publication phase.
+     */
+    lateUnpublish?: true;
   };
 }
 export interface UploadPlan {
@@ -182,7 +178,6 @@ export interface UploadPlan {
   inDestination: boolean;
   baseline?: UploadFacts | null;
   desired?: UploadFacts | null;
-  diagnostics: Diagnostic[];
 }
 export interface CollectionPlan {
   kind: 'collection';
@@ -191,14 +186,12 @@ export interface CollectionPlan {
   inDestination: boolean;
   baseline?: CollectionState | null;
   desired?: CollectionState | null;
-  diagnostics: Diagnostic[];
 }
 export type PlanEntry = RecordPlan | UploadPlan | CollectionPlan;
 export interface PlanOptions {
   modelIds: string[];
   uploads: 'referenced' | 'all';
   includeDeletions: boolean;
-  allowPartial: boolean;
 }
 export type PlanCounts = Record<Kind, Record<Action, number>>;
 export interface PlanMetadata {
@@ -211,6 +204,8 @@ export interface PlanMetadata {
 export interface CaptureOptions {
   signal?: AbortSignal;
   concurrency: number;
+  /** IDs of the models to read; every regular model when absent. */
+  models?: ReadonlySet<string>;
   progress?: (message: string) => void;
 }
 /** Options of content:apply, already validated by the command. */
@@ -226,24 +221,24 @@ export interface ApplyOptions {
   preflightOnly?: boolean;
   concurrency: number;
   /**
-   * Use DatoCMS's fast fork (the command's default), which blocks destination
-   * writes while it copies; false creates a regular fork.
+   * Use DatoCMS's fast fork, which blocks destination writes while it copies;
+   * false (the command's default, as native) creates a regular fork.
    */
   fastFork: boolean;
+  /** Start a fast fork even while users are editing records. */
+  force: boolean;
   log?: (message: string) => void;
 }
 interface ApplyResult {
   environmentId: string;
   executed: true;
   operations: number;
-  partial: boolean;
 }
 export interface PreflightResult {
   environmentId: string;
   preflightOnly: true;
   executed: false;
   operations: number;
-  partial: boolean;
   /** Generation summary, not a prediction of the effects of edited lines. */
   generatedCounts: PlanCounts;
 }

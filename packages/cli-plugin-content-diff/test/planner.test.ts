@@ -21,7 +21,7 @@ import type {
   UploadState,
 } from '../src/engine/types';
 import { fixtureId } from './fixture-id';
-import { type Content, content, diff } from './pipeline';
+import { type Content, content, diff, replay } from './pipeline';
 
 const id = fixtureId;
 const MODEL = id('model');
@@ -128,7 +128,6 @@ function options(overrides: Partial<PlanOptions> = {}): PlanOptions {
     modelIds: [MODEL],
     uploads: 'referenced',
     includeDeletions: false,
-    allowPartial: false,
     ...overrides,
   };
 }
@@ -197,8 +196,6 @@ function firstPublished(operations: Operation[], recordId: string) {
   }
   assert.fail(`Record ${recordId} is never published.`);
 }
-const unsafe = (error: unknown) =>
-  error instanceof ContentError && error.code === 'UNSAFE_REQUESTED_CHANGE';
 
 describe('planner', () => {
   it('pops a heap in order, whatever the push order', () => {
@@ -335,67 +332,6 @@ describe('planner', () => {
     ]);
   });
 
-  it('rejects lossy native metadata payloads and skips only their requested dependency closure', async () => {
-    const state = schema([
-      model({
-        fields: [
-          field({ apiKey: 'asset', type: 'file' }),
-          field({ id: LINK, apiKey: 'link', type: 'link' }),
-        ],
-      }),
-    ]);
-    for (const key of ['__proto__', '__itemTypeId']) {
-      for (const slice of ['current', 'published']) {
-        const asset = upload();
-        const safe: JsonObject = { asset: null, link: null };
-        const lossy: JsonObject = {
-          asset: {
-            upload_id: asset.id,
-            custom_data: { [key]: 'business value' },
-          },
-          link: null,
-        };
-        const refused = record(
-          A,
-          slice === 'current' ? lossy : safe,
-          slice === 'published' ? { published: lossy } : {},
-        );
-        const source = content({
-          records: [
-            refused,
-            record(B, { asset: null, link: A }),
-            record(C, safe),
-          ],
-          uploads: [asset],
-        });
-        const target = content({ uploads: [asset] });
-        await assert.rejects(
-          fixture(source, target, state),
-          (error: unknown) =>
-            unsafe(error) &&
-            (error as ContentError).details?.reason ===
-              'UNSUPPORTED_PAYLOAD_KEY',
-        );
-        const partial = await fixture(
-          source,
-          target,
-          state,
-          options({ allowPartial: true }),
-        );
-        assert.equal(partial.plan.records.get(A)?.action, 'skip');
-        assert.equal(partial.plan.records.get(B)?.action, 'skip');
-        assert.equal(partial.plan.records.get(C)?.action, 'create');
-        const { plan } = await fixture(
-          source,
-          { ...target, records: [refused] },
-          state,
-        );
-        assert.equal(plan.records.get(A)?.action, 'noop');
-        assert.equal(plan.records.get(B)?.action, 'create');
-      }
-    }
-  });
-
   it('retains destination-only and unselected model records', async () => {
     const other = model({ id: id('other-model'), apiKey: 'other' });
     const { plan } = await diff({
@@ -409,7 +345,6 @@ describe('planner', () => {
     });
     const entry = plan.records.get(B)!;
     assert.equal(entry.action, 'noop');
-    assert.deepEqual(entry.diagnostics, []);
     assert.equal(plan.metadata.counts.record.delete, 0);
   });
 
@@ -972,7 +907,7 @@ describe('planner', () => {
     );
   });
 
-  it('plans scheduled records whatever their scheduled scope holds', async () => {
+  it('plans scheduled records without predicting their publication validity', async () => {
     const state = {
       ...schema([
         model({
@@ -986,32 +921,13 @@ describe('planner', () => {
       { title: { en: 'English', it: null } },
       {
         schedules: {
-          publication: {
-            at: '2090-01-01T12:00:00.000Z',
-            selective: { locales: ['en'], nonLocalized: false },
-          },
+          publication: { at: '2090-01-01T12:00:00.000Z' },
           unpublishing: null,
         },
       },
     );
     const planned = await fixture([scheduled], [], state);
     assert.equal(planned.plan.metadata.counts.record.create, 1);
-    const elsewhere = await fixture(
-      [
-        record(A, scheduled.current, {
-          schedules: {
-            publication: {
-              at: '2090-01-01T12:00:00.000Z',
-              selective: { locales: ['it'], nonLocalized: false },
-            },
-            unpublishing: null,
-          },
-        }),
-      ],
-      [],
-      state,
-    );
-    assert.equal(elsewhere.plan.metadata.counts.record.create, 1);
     const nonnative = {
       ...schema([model({ fields: [field({ validators: { required: {} } })] })]),
       semantics: { improved_validation_at_publishing: true },
@@ -1023,7 +939,7 @@ describe('planner', () => {
           { title: 'valid' },
           {
             schedules: {
-              publication: { at: '2090-01-01T12:00:00.000Z', selective: null },
+              publication: { at: '2090-01-01T12:00:00.000Z' },
               unpublishing: null,
             },
           },
@@ -1033,58 +949,6 @@ describe('planner', () => {
       nonnative,
     );
     assert.equal(improved.plan.metadata.counts.record.create, 1);
-  });
-
-  it('plans writes around scheduled unchanged records that the SDK cannot write back', async () => {
-    const state = schema([
-      model({
-        fields: [field({ apiKey: 'asset', type: 'file' })],
-      }),
-    ]);
-    for (const write of ['none', 'record', 'upload', 'collection']) {
-      const asset = upload();
-      const scheduled = record(
-        A,
-        {
-          asset: {
-            upload_id: asset.id,
-            custom_data: { __itemTypeId: 'business value' },
-          },
-        },
-        {
-          schedules: {
-            publication: { at: '2099-01-01T12:00:00.000Z', selective: null },
-            unpublishing: null,
-          },
-        },
-      );
-      const source = content({ records: [scheduled], uploads: [asset] });
-      if (write === 'record') source.records.push(record(B, { asset: null }));
-      if (write === 'upload') {
-        const changed = { ...asset, filename: 'renamed.png', hash: '' };
-        changed.hash = hashJson(changed);
-        source.uploads = [changed];
-      }
-      if (write === 'collection') {
-        const created = {
-          id: id('new-collection'),
-          label: 'New',
-          parentId: null,
-          position: 1,
-          hash: '',
-        };
-        created.hash = hashJson(created);
-        source.collections.push(created);
-      }
-      // The unchanged record is never rewritten, so it does not block writes.
-      const { plan } = await fixture(
-        source,
-        { records: [scheduled], uploads: [asset] },
-        state,
-        options({ allowPartial: true, uploads: 'all' }),
-      );
-      assert.equal(plan.metadata.counts.record.noop, 1);
-    }
   });
 
   it('plans records whose values violate destination validators', async () => {
@@ -1129,8 +993,6 @@ describe('planner', () => {
     );
     assert.equal(plan.metadata.counts.record.update, 5);
     assert.equal(plan.metadata.counts.record.noop, 1);
-    for (const entry of plan.records.values())
-      if (entry.action === 'update') assert.deepEqual(entry.diagnostics, []);
   });
 
   it('never reads field validators or default values while planning', async () => {
@@ -1211,7 +1073,6 @@ describe('planner', () => {
       );
     // One record publishes without its cycle link, the other can then
     // publish, and apply republishes the first one with the link.
-    assert.deepEqual([first.diagnostics, second.diagnostics], [[], []]);
     assert.deepEqual(first.execution?.provisionalTargets, [second.id]);
     assert.deepEqual(firstPublished(operations, first.id), { link: null });
     assert.equal(first.execution?.publishOrder, 0);
@@ -1265,10 +1126,6 @@ describe('planner', () => {
     const [entry] = provisional;
     assert.deepEqual(entry.execution!.provisionalTargets, [next.get(entry.id)]);
     assert.deepEqual(firstPublished(operations, entry.id), { links: [X] });
-    assert.deepEqual(
-      entries.map((candidate) => candidate.diagnostics),
-      [[], [], []],
-    );
   });
 
   it('breaks a required publication cycle link without consulting validators', async () => {
@@ -1306,7 +1163,7 @@ describe('planner', () => {
     );
   });
 
-  it('still diagnoses publication cycles through links inside blocks', async () => {
+  it('refuses a publication cycle through links inside blocks', async () => {
     const state = schema([
       model({
         fields: [
@@ -1337,20 +1194,21 @@ describe('planner', () => {
       );
     };
     const source = [linked(A, B), linked(B, A)];
-    await assert.rejects(
-      fixture(source, [], state),
-      (error: unknown) =>
-        unsafe(error) &&
-        (error as ContentError).details?.reason === 'PUBLICATION_CYCLE',
-    );
-    const { plan, operations } = await fixture(
-      source,
-      [],
-      state,
-      options({ allowPartial: true }),
-    );
-    assert.equal(plan.metadata.counts.record.skip, 2);
-    assert.deepEqual(operations, []);
+    const members = [A, B].sort();
+    await assert.rejects(fixture(source, [], state), (error: unknown) => {
+      assert.ok(error instanceof ContentError);
+      assert.equal(error.code, 'PUBLICATION_CYCLE');
+      assert.match(
+        error.message,
+        /is in a publication cycle that omitting top-level links cannot break/,
+      );
+      assert.deepEqual(error.details, {
+        kind: 'record',
+        id: members[0],
+        records: members,
+      });
+      return true;
+    });
   });
 
   it('breaks a cycle of a link and a Structured Text link at the link in either ID order', async () => {
@@ -1394,7 +1252,6 @@ describe('planner', () => {
       );
       const { plan, operations } = await fixture(source, [], state);
       assert.equal(plan.metadata.counts.record.create, 2);
-      assert.equal(plan.metadata.counts.record.skip, 0);
       const owner = plan.records.get(linking)!;
       const other = plan.records.get(linked)!;
       assert.deepEqual(owner.execution?.provisionalTargets, [linked]);
@@ -1441,7 +1298,6 @@ describe('planner', () => {
     const [first, second] = creationCycle(automated);
     for (const entry of [first, second]) {
       assert.equal(entry.action, 'create');
-      assert.deepEqual(entry.diagnostics, []);
       assert.equal(entry.execution?.publishOrder, 0);
     }
     assert.deepEqual(creationFields(automated.operations, first.id), {
@@ -1460,10 +1316,7 @@ describe('planner', () => {
     );
     const draft = plan.records.get(A)!;
     const owner = plan.records.get(B)!;
-    for (const entry of [draft, owner]) {
-      assert.equal(entry.action, 'create');
-      assert.deepEqual(entry.diagnostics, []);
-    }
+    for (const entry of [draft, owner]) assert.equal(entry.action, 'create');
     assert.deepEqual(owner.execution?.deferredFields, ['link']);
     assert.deepEqual(creationFields(operations, B), { link: null });
     assert.ok(draft.execution!.publishOrder! < owner.execution!.publishOrder!);
@@ -1730,10 +1583,6 @@ describe('planner', () => {
       record(recordId, { title: 'node' }, { parentId, position: 0 });
     const order = ({ plan }: Planned, recordId: string) =>
       plan.records.get(recordId)!.execution!.publishOrder!;
-    const clean = ({ plan }: Planned) => {
-      for (const entry of plan.records.values())
-        assert.deepEqual(entry.diagnostics, []);
-    };
     // X > P > Y becomes P > Y > X with Y unchanged. Moving X first would put
     // it beneath Y while Y's ancestors still include X, whatever the ID order.
     const [first, second] = [A, B].sort();
@@ -1750,7 +1599,6 @@ describe('planner', () => {
       assert.equal(planned.plan.metadata.counts.record.update, 2);
       assert.equal(planned.plan.metadata.counts.record.noop, 1);
       assert.ok(order(planned, ancestor) < order(planned, moved));
-      clean(planned);
     }
     // X > P > U > Q > V becomes Q > V > P > U > X with U and V unchanged.
     // Each move waits for the nearest moved ancestor, which waits for its own.
@@ -1763,7 +1611,6 @@ describe('planner', () => {
     assert.equal(chain.plan.metadata.counts.record.update, 3);
     assert.ok(order(chain, q) < order(chain, p));
     assert.ok(order(chain, p) < order(chain, x));
-    clean(chain);
     // An ordinary leaf move has no moved ancestor to wait for.
     const leaf = await fixture(
       [
@@ -1780,7 +1627,6 @@ describe('planner', () => {
     );
     assert.equal(leaf.plan.metadata.counts.record.update, 1);
     assert.equal(order(leaf, C), 0);
-    clean(leaf);
   });
 
   it('plans a 6000-record dependency chain without a recursive graph traversal', async () => {
@@ -1876,7 +1722,6 @@ describe('planner', () => {
     );
     const entry = plan.records.get(A)!;
     assert.equal(entry.action, 'update');
-    assert.deepEqual(entry.diagnostics, []);
   });
 
   it('releases previous published references before unpublishing their dependencies', async () => {
@@ -1937,14 +1782,94 @@ describe('planner', () => {
         { published: { title: 'dependency', link: null } },
       ),
     ];
-    const { plan } = await fixture(
-      source,
-      target,
-      state,
-      options({ includeDeletions: true }),
-    );
+    const { plan, operations } = await replay({
+      source: content({ records: source }),
+      target: content({ records: target }),
+      sourceSchema: state,
+      options: options({ includeDeletions: true }),
+    });
     assert.equal(plan.records.get(A)?.action, 'delete');
     assert.equal(plan.records.get(B)?.action, 'update');
+    // The CMA refuses to unpublish a record that a published record still
+    // links to, so the deletion releases the link first.
+    const ops = operations.map(
+      (operation) => `${operation.op}:${operation.id}`,
+    );
+    assert.ok(
+      ops.indexOf(`record.delete:${A}`) < ops.indexOf(`record.unpublish:${B}`),
+      ops.join(', '),
+    );
+  });
+
+  it('unpublishes a tree parent after the deletion of its published child', async () => {
+    const state = schema([model({ tree: true })]);
+    const source = [record(A, { title: 'parent' })];
+    const target = [
+      record(A, { title: 'parent' }, { published: { title: 'parent' } }),
+      record(
+        C,
+        { title: 'child' },
+        { published: { title: 'child' }, parentId: A },
+      ),
+    ];
+    const { operations } = await replay({
+      source: content({ records: source }),
+      target: content({ records: target }),
+      sourceSchema: state,
+      options: options({ includeDeletions: true }),
+    });
+    const ops = operations.map(
+      (operation) => `${operation.op}:${operation.id}`,
+    );
+    assert.ok(
+      ops.indexOf(`record.delete:${C}`) < ops.indexOf(`record.unpublish:${A}`),
+      ops.join(', '),
+    );
+  });
+
+  it('unpublishes a chain of records after the deletion that releases it', async () => {
+    const D = id('d');
+    const state = schema([
+      model({
+        fields: [field(), field({ id: LINK, apiKey: 'link', type: 'link' })],
+      }),
+    ]);
+    const source = [
+      record(B, { title: 'middle', link: D }),
+      record(D, { title: 'last', link: null }),
+    ];
+    const target = [
+      record(
+        A,
+        { title: 'owner', link: B },
+        { published: { title: 'owner', link: B } },
+      ),
+      record(
+        B,
+        { title: 'middle', link: D },
+        { published: { title: 'middle', link: D } },
+      ),
+      record(
+        D,
+        { title: 'last', link: null },
+        { published: { title: 'last', link: null } },
+      ),
+    ];
+    const { operations } = await replay({
+      source: content({ records: source }),
+      target: content({ records: target }),
+      sourceSchema: state,
+      options: options({ includeDeletions: true }),
+    });
+    const ops = operations.map(
+      (operation) => `${operation.op}:${operation.id}`,
+    );
+    const at = (op: string) => ops.indexOf(op);
+    assert.ok(
+      at(`record.delete:${A}`) < at(`record.unpublish:${B}`) &&
+        at(`record.unpublish:${B}`) < at(`record.unpublish:${D}`),
+      ops.join(', '),
+    );
   });
 
   it('plans no update when only ordering differs', async () => {
@@ -1982,104 +1907,6 @@ describe('planner', () => {
     assert.equal(plan.records.get(A)?.action, 'noop');
   });
 
-  it('skips a refused record without closing over its ordered model', async () => {
-    const state = schema([model({ sortable: true })]);
-    const lossy = { title: { __itemTypeId: 'business value' } };
-    const { plan } = await fixture(
-      [
-        record(A, lossy, { position: 0 }),
-        record(B, { title: 'sibling' }, { position: 1 }),
-      ],
-      [],
-      state,
-      options({ allowPartial: true }),
-    );
-    assert.equal(plan.records.get(A)?.action, 'skip');
-    assert.equal(plan.records.get(B)?.action, 'create');
-    assert.equal(plan.metadata.counts.record.skip, 1);
-  });
-
-  it('spreads a skip only to writes referencing a skipped create and deletes its retained state needs', async () => {
-    const state = schema([
-      model({
-        fields: [field(), field({ id: LINK, apiKey: 'link', type: 'link' })],
-      }),
-    ]);
-    const lossy = { title: { __itemTypeId: 'business value' }, link: null };
-    const X = id('x');
-    const Y = id('y');
-    const { plan } = await fixture(
-      [
-        // A is a refused create: B and C reference it and are skipped too,
-        // whether they are creates or updates.
-        record(A, lossy),
-        record(B, { title: 'new', link: A }),
-        record(C, { title: 'changed', link: A }),
-        // X is a refused update: Y references X and is still written, and
-        // the deletion of D, which X's destination state links to, is kept.
-        record(X, { ...lossy, link: null }),
-        record(Y, { title: 'changed', link: X }),
-      ],
-      [
-        record(C, { title: 'old', link: null }),
-        record(X, { title: 'old', link: id('d') }),
-        record(Y, { title: 'old', link: null }),
-        record(id('d'), { title: 'linked', link: null }),
-        record(id('e'), { title: 'unlinked', link: null }),
-      ],
-      state,
-      options({ allowPartial: true, includeDeletions: true }),
-    );
-    const action = (recordId: string) => plan.records.get(recordId)?.action;
-    assert.equal(action(A), 'skip');
-    assert.equal(action(B), 'skip');
-    assert.equal(action(C), 'skip');
-    assert.equal(action(X), 'skip');
-    assert.equal(action(Y), 'update');
-    assert.equal(action(id('d')), 'skip');
-    assert.equal(action(id('e')), 'delete');
-    assert.deepEqual(
-      plan.records.get(id('d'))?.diagnostics.map((item) => item.code),
-      ['PRESERVED_SKIP_DEPENDENCY'],
-    );
-  });
-
-  it('keeps the uploads and folders that a skipped record still needs', async () => {
-    const FILE = id('file');
-    const state = schema([
-      model({
-        fields: [field(), field({ id: FILE, apiKey: 'file', type: 'file' })],
-      }),
-    ]);
-    const folder = collection(id('folder'));
-    const kept = { ...upload(id('kept')), collectionId: folder.id, hash: '' };
-    kept.hash = hashJson(kept);
-    const unrelated = upload(id('unrelated'));
-    const X = id('x');
-    const { plan } = await fixture(
-      [record(X, { title: { __itemTypeId: 'business value' }, file: null })],
-      {
-        records: [record(X, { title: 'old', file: { upload_id: kept.id } })],
-        uploads: [kept, unrelated],
-        collections: [folder],
-      },
-      state,
-      options({ allowPartial: true, includeDeletions: true, uploads: 'all' }),
-    );
-    assert.equal(plan.records.get(X)?.action, 'skip');
-    for (const entry of [
-      plan.uploads.get(kept.id),
-      plan.collections.get(folder.id),
-    ]) {
-      assert.equal(entry?.action, 'skip');
-      assert.deepEqual(
-        entry?.diagnostics.map((item) => item.code),
-        ['PRESERVED_SKIP_DEPENDENCY'],
-      );
-    }
-    assert.equal(plan.uploads.get(unrelated.id)?.action, 'delete');
-  });
-
   it('unpublishes published records that link to each other in a forced order', async () => {
     const state = schema([
       model({
@@ -2100,7 +1927,6 @@ describe('planner', () => {
     const orders = [A, B].map((recordId) => {
       const entry = plan.records.get(recordId)!;
       assert.equal(entry.action, 'update');
-      assert.deepEqual(entry.diagnostics, []);
       return entry.execution!.publishOrder;
     });
     assert.notEqual(orders[0], orders[1]);
@@ -2132,11 +1958,8 @@ describe('planner', () => {
       ],
       state,
     );
-    const order = (recordId: string) => {
-      const entry = plan.records.get(recordId)!;
-      assert.deepEqual(entry.diagnostics, []);
-      return entry.execution!.publishOrder!;
-    };
+    const order = (recordId: string) =>
+      plan.records.get(recordId)!.execution!.publishOrder!;
     assert.notEqual(order(first!), order(second!));
     assert.ok(order(target!) > order(first!));
   });
@@ -2164,7 +1987,6 @@ describe('planner', () => {
     );
     const parent = plan.records.get(A)!;
     const child = plan.records.get(B)!;
-    assert.deepEqual([...parent.diagnostics, ...child.diagnostics], []);
     assert.ok(child.execution!.publishOrder! < parent.execution!.publishOrder!);
   });
 
@@ -2217,7 +2039,6 @@ describe('planner', () => {
     const created = plan.records.get(B)!;
     assert.equal(parent.action, 'update');
     assert.equal(created.action, 'create');
-    assert.deepEqual([...parent.diagnostics, ...created.diagnostics], []);
     assert.equal(parent.execution?.provisionalTargets, undefined);
     assert.equal(created.execution?.provisionalTargets, undefined);
     assert.ok(
@@ -2275,10 +2096,6 @@ describe('planner', () => {
       );
       const parentPlan = plan.records.get(A)!;
       const childPlan = plan.records.get(B)!;
-      assert.deepEqual(
-        [...parentPlan.diagnostics, ...childPlan.diagnostics],
-        [],
-      );
       assert.ok(
         childPlan.execution!.publishOrder! <
           parentPlan.execution!.publishOrder!,

@@ -117,7 +117,6 @@ let counts: PlanCounts;
 function fixture() {
   /** What the destination schema reads as; tests change it. */
   const schema = clone(SCHEMA);
-  const site = { id: 'project' };
   const environments = new Map([['main', environment('main', true)]]);
   const contents = new Map([
     ['main', cmaFixture(content({ records: [original] }), SCHEMA)],
@@ -136,9 +135,8 @@ function fixture() {
         body: { data: [] },
       },
     });
-  // The root client: the project and its environments.
+  // The root client: the project's environments.
   const root = {
-    site: { find: async () => clone(site) },
     environments: {
       list: async () => [...environments.values()].map(clone),
       find: async (id: string) => {
@@ -172,19 +170,21 @@ function fixture() {
       project: (schema: SchemaState) => SchemaState,
     ) => project({ ...clone(schema), environmentId }),
   );
+  // The command's defaults: a regular fork, named by the test.
   const options: ApplyOptions = {
     inPlace: false,
     allowPrimary: false,
     keepFailedFork: false,
     concurrency: 2,
-    fastFork: true,
+    fastFork: false,
+    force: false,
     forkName: 'review',
     log: (message) => logs.push(message),
   };
   const apply = (overrides: Partial<ApplyOptions> = {}) =>
     applyContentDiff({
       rootClient: root as unknown as Client,
-      buildEnvironmentClient: (id: string) => {
+      buildEnvironmentClient: async (id: string) => {
         const { client } = contents.get(id)!;
         if (failure)
           client.items.publish = async () => {
@@ -197,7 +197,6 @@ function fixture() {
     });
   return {
     schema,
-    site,
     environments,
     contents,
     events,
@@ -266,7 +265,6 @@ describe('content diff apply', () => {
         modelIds: [MODEL],
         uploads: 'all',
         includeDeletions: false,
-        allowPartial: false,
       },
     });
     assert.deepEqual(
@@ -289,7 +287,6 @@ describe('content diff apply', () => {
       environmentId: 'review',
       executed: true,
       operations: 2,
-      partial: false,
     });
     assert.deepEqual(test.events, ['fork:review']);
     assert.deepEqual(test.writes('review'), [
@@ -321,7 +318,6 @@ describe('content diff apply', () => {
       preflightOnly: true,
       executed: false,
       operations: 2,
-      partial: false,
       generatedCounts: counts,
     });
     assert.deepEqual(test.events, []);
@@ -370,16 +366,27 @@ describe('content diff apply', () => {
     test.events.length = 0;
     test.schema.locales = ['en', 'it'];
     await assert.rejects(test.apply(), changed({ reason: 'schema' }));
-    test.schema.locales = ['en'];
-    // The migration tracking model the diff was generated against is gone.
-    replace(schemaApi, 'fetchSchema', async () => {
-      throw new ContentError(
-        'INVALID_MIGRATION_TRACKING_MODEL',
-        'The exact migration tracking model is missing, renamed, or replaced.',
-      );
-    });
-    await assert.rejects(test.apply(), changed({ reason: 'schema' }));
     assert.deepEqual(test.events, []);
+  });
+
+  it('ignores the migration tracking model when comparing the destination schema', async () => {
+    const test = fixture();
+    // The native migration runner's tracking model, under any ID: it is left
+    // out of the diff and of the destination before the hashes are compared.
+    const tracking = {
+      ...clone(SCHEMA.models[0]!),
+      id: fixtureId('apply-tracking'),
+      apiKey: 'schema_migration',
+      name: 'Schema migration',
+    };
+    test.schema.models.push(tracking);
+    const result = await test.apply();
+    assert.equal(result.environmentId, 'review');
+    assert.deepEqual(test.record('review').published, { title: 'Edited' });
+    // Any other model is a schema change.
+    test.schema.models.push({ ...tracking, apiKey: 'other' });
+    test.environments.delete('review');
+    await assert.rejects(test.apply(), changed({ reason: 'schema' }));
   });
 
   it('reports a failed check request as itself', async () => {
@@ -421,18 +428,20 @@ describe('content diff apply', () => {
       );
       return true;
     };
-    test.site.id = 'wrong';
-    await assert.rejects(test.apply(), mismatch);
-    // The environment client may still answer for another project.
-    test.site.id = 'project';
     test.schema.siteId = 'wrong';
     await assert.rejects(test.apply(), mismatch);
     assert.deepEqual(test.events, []);
     assert.deepEqual(test.writes('main'), []);
   });
 
-  it('deletes a failed fork, including one whose fork request failed after creating it', async () => {
+  it('deletes a failed fork after looking it up under its ID', async () => {
     const test = fixture();
+    const find = test.root.environments.find;
+    const found: string[] = [];
+    replace(test.root.environments, 'find', async (id: string) => {
+      found.push(id);
+      return find(id);
+    });
     test.failPublication(new Error('Publication failed'));
     await assert.rejects(
       test.apply(),
@@ -446,21 +455,12 @@ describe('content diff apply', () => {
         return true;
       },
     );
+    // Once while waiting for the fork, once before removing it.
+    assert.deepEqual(found, ['review', 'review']);
     assert.deepEqual(test.events, ['fork:review', 'destroy:review']);
+    assert.equal(test.environments.has('review'), false);
     assert.equal(test.environments.has('main'), true);
     assert.equal(test.record('main').current.title, 'Original');
-    const fork = test.root.environments.fork;
-    replace(
-      test.root.environments,
-      'fork',
-      async (...args: Parameters<typeof fork>) => {
-        await fork(...args);
-        throw new Error('Uncertain fork request');
-      },
-    );
-    await assert.rejects(test.apply(), /Uncertain fork request/);
-    assert.equal(test.environments.has('review'), false);
-    assert.deepEqual(test.events.slice(2), ['fork:review', 'destroy:review']);
   });
 
   it('keeps the original failure when the failed fork cannot be removed', async () => {
@@ -541,23 +541,14 @@ describe('content diff apply', () => {
     }
   });
 
-  it('never removes an environment whose fork request DatoCMS rejected', async () => {
+  it('reports a rejected fork request as it is and cleans nothing up', async () => {
     const test = fixture();
-    const list = test.root.environments.list;
-    let lists = 0;
-    // Someone else takes the ID while the destination is checked.
-    replace(test.root.environments, 'list', async () => {
-      if (++lists === 2)
-        test.environments.set('review', environment('review', false));
-      return list();
+    const find = test.root.environments.find;
+    const found: string[] = [];
+    replace(test.root.environments, 'find', async (id: string) => {
+      found.push(id);
+      return find(id);
     });
-    await assert.rejects(
-      test.apply(),
-      (error: ContentError) => error.code === 'FORK_ID_COLLISION',
-    );
-    assert.deepEqual(test.events, []);
-    replace(test.root.environments, 'list', list);
-    test.environments.delete('review');
     const rejection = new CmaClient.ApiError({
       request: { method: 'POST', url: '/environments/main/fork', headers: {} },
       response: {
@@ -572,32 +563,14 @@ describe('content diff apply', () => {
     });
     await assert.rejects(
       test.apply(),
-      (error: Error & { keptForkEnvironmentId?: string }) => {
-        assert.equal(error === rejection, true);
-        assert.equal(error.keptForkEnvironmentId, undefined);
-        return true;
-      },
-    );
-    // An environment under the ID after a rejected request may come from
-    // someone else right after the second check, or from a retried request
-    // of this run whose first attempt timed out: kept and reported.
-    replace(test.root.environments, 'fork', async () => {
-      test.environments.set('review', environment('review', false));
-      throw rejection;
-    });
-    await assert.rejects(
-      test.apply(),
       (error: Error & ContentFailureContext) => {
         assert.equal(error === rejection, true);
-        assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.match(
-          error.outcome ?? '',
-          /^The fork "review" was kept: an environment with that ID exists after the fork request failed/,
-        );
+        assert.equal(error.keptForkEnvironmentId, undefined);
+        assert.equal(error.outcome, undefined);
         return true;
       },
     );
-    assert.equal(test.environments.has('review'), true);
+    assert.deepEqual(found, []);
     assert.deepEqual(test.events, []);
   });
 
@@ -662,7 +635,7 @@ describe('content diff apply', () => {
       assert.match(
         error.message,
         new RegExp(
-          `^operations/000001\\.jsonl line 2, Publish Article "Edited" \\(${RECORD}\\): The CMA rejected PUT /items/${RECORD}/publish: INVALID_FIELD \\(title: VALIDATION_UNIQUE\\)\\. A unique value may still be held by another record`,
+          `^operations/000001\\.jsonl line 2, Publish Article "Edited" \\(${RECORD}\\): The CMA rejected PUT /items/${RECORD}/publish: INVALID_FIELD \\(title: VALIDATION_UNIQUE\\)\\.$`,
         ),
       );
       assert.match(error.outcome ?? '', /The fork "review" was deleted/);
@@ -676,15 +649,56 @@ describe('content diff apply', () => {
     assert.deepEqual(test.events, ['fork:review', 'destroy:review']);
   });
 
-  it('requests a fast fork unless a regular fork is asked for', async () => {
+  it('requests a regular fork unless a fast fork is asked for, forced or not', async () => {
+    const regular = fixture();
+    await regular.apply();
+    assert.deepEqual(regular.forkQueries, [{ immediate_return: true }]);
     const fast = fixture();
-    await fast.apply();
+    await fast.apply({ fastFork: true });
     assert.deepEqual(fast.forkQueries, [
       { immediate_return: true, fast: true },
     ]);
-    const regular = fixture();
-    await regular.apply({ fastFork: false });
-    assert.deepEqual(regular.forkQueries, [{ immediate_return: true }]);
+    const forced = fixture();
+    await forced.apply({ fastFork: true, force: true });
+    assert.deepEqual(forced.forkQueries, [
+      { immediate_return: true, fast: true, force: true },
+    ]);
+    // Force only means something to a fast fork.
+    const unforced = fixture();
+    await unforced.apply({ force: true });
+    assert.deepEqual(unforced.forkQueries, [{ immediate_return: true }]);
+  });
+
+  it('names a fork it creates after the time by default', async () => {
+    const test = fixture();
+    const before = Math.floor(Date.now() / 1000);
+    const result = await test.apply({ forkName: undefined });
+    const after = Math.floor(Date.now() / 1000);
+    assert.match(result.environmentId, /^content-apply-\d+$/);
+    const seconds = Number(result.environmentId.slice('content-apply-'.length));
+    assert.ok(seconds >= before && seconds <= after, result.environmentId);
+    assert.deepEqual(test.events, [`fork:${result.environmentId}`]);
+  });
+
+  it('resolves the destination through the environment listing', async () => {
+    const primary = fixture();
+    const result = await primary.apply({ destinationEnvironmentId: 'primary' });
+    assert.equal(result.environmentId, 'review');
+    assert.deepEqual(primary.checks(), [
+      'Checking what the diff touches in "main".',
+      'Checking what the diff touches in "review".',
+    ]);
+    const unknown = fixture();
+    await assert.rejects(
+      unknown.apply({ destinationEnvironmentId: 'missing' }),
+      (error: ContentError) => {
+        assert.equal(error.code, 'ENVIRONMENT_NOT_FOUND');
+        assert.equal(error.message, 'Environment "missing" is not available.');
+        return true;
+      },
+    );
+    assert.deepEqual(unknown.checks(), []);
+    assert.deepEqual(unknown.events, []);
   });
 
   it('explains a fast fork refused while users are editing, and removes nothing', async () => {
@@ -713,14 +727,14 @@ describe('content diff apply', () => {
     const message =
       'Cannot proceed with a fast fork of "main", as some users are currently editing records.';
     const suggestions = [
-      'Run again once nobody is editing records in the destination',
-      'Use --no-fast-fork to create a regular fork, which does not block the destination while it copies',
+      'To proceed anyway, use the --force flag',
+      'Or leave --fast-fork out: a regular fork does not block the destination while it copies',
     ];
     replace(test.root.environments, 'fork', async () => {
       throw refusal;
     });
     await assert.rejects(
-      test.apply(),
+      test.apply({ fastFork: true }),
       (
         error: ContentError &
           ContentFailureContext & { suggestions?: string[] },
@@ -729,34 +743,10 @@ describe('content diff apply', () => {
         assert.equal(error.message, message);
         assert.deepEqual(error.suggestions, suggestions);
         assert.equal(error.keptForkEnvironmentId, undefined);
+        assert.equal(error.outcome, undefined);
         return true;
       },
     );
-    assert.deepEqual(test.events, []);
-    // A refused request creates no fork, so an environment that answers to
-    // the ID afterwards is reported as kept and never removed.
-    replace(test.root.environments, 'fork', async () => {
-      test.environments.set('review', environment('review', false));
-      throw refusal;
-    });
-    await assert.rejects(
-      test.apply(),
-      (
-        error: ContentError &
-          ContentFailureContext & { suggestions?: string[] },
-      ) => {
-        assert.equal(error.code, 'FAST_FORK_BLOCKED');
-        assert.equal(error.keptForkEnvironmentId, 'review');
-        assert.equal(error.message, message);
-        assert.match(
-          error.outcome ?? '',
-          /^The fork "review" was kept: an environment with that ID exists after the fork request failed/,
-        );
-        assert.deepEqual(error.suggestions, suggestions);
-        return true;
-      },
-    );
-    assert.equal(test.environments.has('review'), true);
     assert.deepEqual(test.events, []);
   });
 
@@ -773,31 +763,14 @@ describe('content diff apply', () => {
     assert.deepEqual(test.writes('main'), []);
   });
 
-  it('looks a possibly created fork up in the listing, never by its name', async () => {
-    const test = fixture();
-    const find = test.root.environments.find;
-    const forkName = 'x/../../items/record';
-    const found: string[] = [];
-    replace(test.root.environments, 'find', async (id: string) => {
-      found.push(id);
-      return find(id);
-    });
-    replace(test.root.environments, 'fork', async () => {
-      throw new Error('Uncertain fork request');
-    });
-    await assert.rejects(test.apply({ forkName }), /Uncertain fork request/);
-    assert.deepEqual(found, ['main']);
-    assert.deepEqual(test.events, []);
-  });
-
   it('reports a kept fork with the original failure when its lookup fails', async () => {
     const test = fixture();
-    const list = test.root.environments.list;
-    let lists = 0;
-    // Both fork ID checks succeed; the lookup after the failure does not.
-    replace(test.root.environments, 'list', async () => {
-      if (++lists > 2) throw new Error('lookup failed');
-      return list();
+    const find = test.root.environments.find;
+    let finds = 0;
+    // The fork is found ready once; the lookup after the failure fails.
+    replace(test.root.environments, 'find', async (id: string) => {
+      if (++finds > 1) throw new Error('lookup failed');
+      return find(id);
     });
     test.failPublication(validationError('VALIDATION_UNIQUE'));
     await assert.rejects(
@@ -815,21 +788,19 @@ describe('content diff apply', () => {
     assert.deepEqual(test.events, ['fork:review']);
   });
 
-  it('requests no fork when interrupted while the fork ID is checked again', async () => {
+  it('requests no fork when interrupted before the fork request', async () => {
     const test = fixture();
     const controller = new AbortController();
     const list = test.root.environments.list;
-    let lists = 0;
+    // Interrupted while the destination is checked.
     replace(test.root.environments, 'list', async () => {
-      // The second check runs right before the fork request.
-      if (++lists === 2) controller.abort();
+      controller.abort();
       return list();
     });
     await assert.rejects(
       test.apply({ signal: controller.signal }),
       (error: ContentError) => error.code === 'INTERRUPTED',
     );
-    assert.equal(lists, 2);
     assert.deepEqual(test.events, []);
   });
 

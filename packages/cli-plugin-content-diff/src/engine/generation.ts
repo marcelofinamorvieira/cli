@@ -14,28 +14,21 @@ import { DumpFile } from './dump';
 import { planOperations } from './emit';
 import { ContentError } from './errors';
 import {
-  type MigrationTrackingBinding,
-  prepareMigrationSchema,
+  DEFAULT_TRACKING_MODEL_API_KEY,
+  withoutTrackingModel,
 } from './migration-schema';
 import { type Plan, assertSchemaCompatible, createPlan } from './planner';
 import { fetchSchema } from './schema';
 import { SideIndex } from './side';
 import { assertSourceRecordsValid } from './source-validity';
-import {
-  type Client,
-  KINDS,
-  type Kind,
-  type PlanCounts,
-  type PlanOptions,
-  type SchemaState,
-} from './types';
+import type { Client, PlanCounts, PlanOptions, SchemaState } from './types';
 
 /** Records are spread over this many files per side, read one at a time. */
-const BUCKETS = 1024;
+const BUCKETS = 128;
 
 interface GenerationEndpoint {
   rootClient: Client;
-  buildEnvironmentClient: (environmentId: string) => Client;
+  buildEnvironmentClient: (environmentId: string) => Promise<Client>;
 }
 
 export interface ContentGenerationArguments {
@@ -63,15 +56,13 @@ export interface ContentGenerationResult {
   destinationEnvironmentId: string;
   counts: PlanCounts;
   operations: number;
-  /** Why each entry --allow-partial left out of the diff was skipped. */
-  skipped: Array<{ kind: Kind; id: string; code: string; message: string }>;
 }
 
-/** A capture sink that puts canonical states into a side index. */
-function indexSink(index: SideIndex, skipModel?: string): CaptureSink {
+/** A capture sink that puts canonical states of `models` into a side index. */
+function indexSink(index: SideIndex, models: ReadonlySet<string>): CaptureSink {
   return {
     async record(line) {
-      if (itemTypeId(line.current) === skipModel) return;
+      if (!models.has(itemTypeId(line.current))) return;
       await index.record(canonicalRecordLine(line, index.schema));
     },
     upload: (upload) => index.upload(canonicalUpload(upload)),
@@ -121,9 +112,10 @@ export async function generateContentDiff({
     const sourceEnvironmentId = live
       ? environmentId(live.environment, sourceEnvironments!)
       : dump!.manifest.site.environment;
-    const sourceClient =
-      live?.endpoint.buildEnvironmentClient(sourceEnvironmentId);
-    const destinationClient = destination.endpoint.buildEnvironmentClient(
+    const sourceClient = live
+      ? await live.endpoint.buildEnvironmentClient(sourceEnvironmentId)
+      : undefined;
+    const destinationClient = await destination.endpoint.buildEnvironmentClient(
       destinationEnvironmentId,
     );
     const [sourceRawSchema, destinationRawSchema] = await Promise.all([
@@ -132,13 +124,16 @@ export async function generateContentDiff({
         : dump!.schema,
       fetchSchema(destinationClient, destinationEnvironmentId),
     ]);
-    const { schema: sourceSchema, tracking: sourceTracking } =
-      prepareMigrationSchema(sourceRawSchema, sourceMigrationModelApiKey);
-    const { schema: destinationSchema, tracking: destinationTracking } =
-      prepareMigrationSchema(
-        destinationRawSchema,
-        destinationMigrationModelApiKey,
-      );
+    const trackingModelApiKey =
+      destinationMigrationModelApiKey || DEFAULT_TRACKING_MODEL_API_KEY;
+    const sourceSchema = withoutTrackingModel(
+      sourceRawSchema,
+      sourceMigrationModelApiKey || DEFAULT_TRACKING_MODEL_API_KEY,
+    );
+    const destinationSchema = withoutTrackingModel(
+      destinationRawSchema,
+      trackingModelApiKey,
+    );
     // A dump may be a backup of the destination itself.
     if (
       live &&
@@ -158,7 +153,7 @@ export async function generateContentDiff({
       join(directory, 'source'),
       sourceSchema,
       BUCKETS,
-      { models, payloadSchema: destinationSchema },
+      { models },
     );
     const targetIndex = new SideIndex(
       join(directory, 'target'),
@@ -166,8 +161,8 @@ export async function generateContentDiff({
       BUCKETS,
       { models },
     );
-    // Both sides are read in full: the model selection limits what changes,
-    // while every record supplies incoming links and retained state.
+    // Only the selected models are read on both sides; links from other
+    // records to records the diff changes are left to the CMA.
     const capture = (
       label: string,
       client: Client,
@@ -179,10 +174,11 @@ export async function generateContentDiff({
       return captureEnvironment({
         client,
         schema,
-        sink: indexSink(index),
+        sink: indexSink(index, models),
         options: {
           signal: captureSignal,
           concurrency: options.concurrency,
+          models,
           progress: (message) => progress(`${label}: ${message}`),
         },
       });
@@ -198,10 +194,7 @@ export async function generateContentDiff({
             captureSignal,
           );
         progress(`Reading dump "${basename(dumpPath!)}".`);
-        return dump.read(
-          indexSink(sourceIndex, sourceTracking.model?.id),
-          captureSignal,
-        );
+        return dump.read(indexSink(sourceIndex, models), captureSignal);
       },
       (captureSignal) =>
         capture(
@@ -212,7 +205,7 @@ export async function generateContentDiff({
           captureSignal,
         ),
     ];
-    if (sameEndpoint) {
+    if (live && sourceSchema.siteId === destinationSchema.siteId) {
       // One project shares one API rate limit, so reading both environments
       // at once would only trade time for retries.
       for (const read of readers) await read(signal);
@@ -255,7 +248,6 @@ export async function generateContentDiff({
       modelIds,
       uploads: options.uploads,
       includeDeletions: options.includeDeletions,
-      allowPartial: options.allowPartial,
     });
     // Only records the diff writes matter, so check after planning and
     // before any file is written.
@@ -275,8 +267,7 @@ export async function generateContentDiff({
         },
         destination: plan.metadata.destination,
         schemaHash: destinationSchema.hash,
-        sourceTracking,
-        destinationTracking,
+        trackingModelApiKey,
         options: plan.metadata.options,
         counts: plan.metadata.counts,
       },
@@ -290,24 +281,12 @@ export async function generateContentDiff({
       }),
       files: assetFiles ? dump!.zip : undefined,
     });
-    const skipped: ContentGenerationResult['skipped'] = [];
-    for (const kind of KINDS)
-      for (const entry of (kind === 'record'
-        ? plan.records
-        : kind === 'upload'
-          ? plan.uploads
-          : plan.collections
-      ).values())
-        if (entry.action === 'skip')
-          for (const { code, message } of entry.diagnostics)
-            skipped.push({ kind, id: entry.id, code, message });
     return {
       diffPath,
       sourceEnvironmentId,
       destinationEnvironmentId,
       counts: plan.metadata.counts,
       operations,
-      skipped,
     };
   } finally {
     dump?.close();

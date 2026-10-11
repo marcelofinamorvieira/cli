@@ -222,8 +222,11 @@ function recorder(answers: Record<string, (...args: any[]) => unknown> = {}) {
   return { client, calls };
 }
 
+const DOC_URL =
+  'https://www.datocms.com/docs/content-management-api/resources/item/update#INVALID_FIELD';
+
 describe('CMA failure reporting', () => {
-  it('names the request, error codes and field validations of a 422', () => {
+  it('names the request, error codes and field validations of a 422, and the documentation of its first error', () => {
     const error = cmaFailure(
       apiError(422, 'https://site-api.datocms.com/items/abc?nested=true', [
         {
@@ -232,6 +235,7 @@ describe('CMA failure reporting', () => {
           attributes: {
             code: 'INVALID_FIELD',
             details: { field: 'slug', code: 'VALIDATION_UNIQUE' },
+            doc_url: DOC_URL,
           },
         },
         {
@@ -247,7 +251,7 @@ describe('CMA failure reporting', () => {
     assert.equal(error.code, 'CMA_VALIDATION_FAILED');
     assert.equal(
       error.message,
-      'The CMA rejected PUT /items/abc: INVALID_FIELD (slug: VALIDATION_UNIQUE); INVALID_FIELD (author: VALIDATION_ITEM_ITEM_TYPE). A unique value may still be held by another record; reorder or edit the diff so that record releases it first. A referenced record or asset may be missing or unpublished; make sure the diff creates or publishes it first.',
+      `The CMA rejected PUT /items/abc: INVALID_FIELD (slug: VALIDATION_UNIQUE); INVALID_FIELD (author: VALIDATION_ITEM_ITEM_TYPE). See ${DOC_URL}.`,
     );
     assert.deepEqual(error.details, {
       method: 'PUT',
@@ -257,6 +261,7 @@ describe('CMA failure reporting', () => {
         {
           code: 'INVALID_FIELD',
           details: { field: 'slug', code: 'VALIDATION_UNIQUE' },
+          docUrl: DOC_URL,
         },
         {
           code: 'INVALID_FIELD',
@@ -289,16 +294,19 @@ describe('CMA failure reporting', () => {
         {
           id: '1',
           type: 'api_error',
-          attributes: { code: 'NOT_FOUND', details: {} },
+          attributes: { code: 'NOT_FOUND', details: {}, doc_url: DOC_URL },
         },
       ]),
     ) as ContentError;
     assert.equal(error.code, 'CMA_REQUEST_FAILED');
     assert.equal(
       error.message,
-      'The CMA request PUT /uploads/u1 failed: NOT_FOUND.',
+      `The CMA request PUT /uploads/u1 failed: NOT_FOUND. See ${DOC_URL}.`,
     );
     assert.equal(error.details?.status, 404);
+    assert.deepEqual(error.details?.errors, [
+      { code: 'NOT_FOUND', details: {}, docUrl: DOC_URL },
+    ]);
     const timeout = cmaFailure(
       new CmaClient.TimeoutError({
         request: {
@@ -336,7 +344,6 @@ describe('content diff execution', () => {
         modelIds: [MODEL],
         uploads: 'all',
         includeDeletions: false,
-        allowPartial: false,
       },
     });
     operations = generated.operations;
@@ -538,6 +545,14 @@ describe('content diff execution', () => {
           },
           'the diff has no file assets/u/missing.svg.',
         ],
+        [
+          {
+            op: 'records.reorder',
+            label: 'x',
+            data: { model: 'm', parent: null, order: ['a', 1] },
+          },
+          '"data" must be a record order: model, parent and order.',
+        ],
       ] as const) {
         const { client, calls } = recorder();
         await assert.rejects(
@@ -563,13 +578,22 @@ describe('content diff execution', () => {
     it('runs every operation in order through its SDK call', async () => {
       const md5 = { md5: 'ABCDEF' };
       const lines = [
-        { op: 'folder.create', id: 'f', label: '1', data: { label: 'F' } },
-        { op: 'folder.update', id: 'f', label: '2', data: { label: 'G' } },
-        { op: 'folders.reorder', label: '3', data: [{ id: 'f' }] },
+        {
+          op: 'folder.create',
+          id: 'f',
+          label: '1',
+          data: { label: 'F', parent: null, position: 1 },
+        },
+        {
+          op: 'folder.update',
+          id: 'f',
+          label: '2',
+          data: { label: 'G', position: 2 },
+        },
         {
           op: 'upload.create',
           id: 'u',
-          label: '4',
+          label: '3',
           url: 'https://example.test/u.svg',
           md5: 'abcdef',
           data: { filename: 'u.svg' },
@@ -577,33 +601,33 @@ describe('content diff execution', () => {
         {
           op: 'upload.replace',
           id: 'u',
-          label: '5',
+          label: '4',
           url: 'https://example.test/v.svg',
           md5: 'abcdef',
           data: { filename: 'v.svg' },
         },
-        { op: 'upload.update', id: 'u', label: '6', data: { notes: 'n' } },
-        { op: 'record.create', id: 'r', label: '7', data: { title: 't' } },
-        { op: 'record.update', id: 'r', label: '8', data: { title: 'u' } },
-        { op: 'record.publish', id: 'r', label: '9' },
+        { op: 'upload.update', id: 'u', label: '5', data: { notes: 'n' } },
+        { op: 'record.create', id: 'r', label: '6', data: { title: 't' } },
+        { op: 'record.update', id: 'r', label: '7', data: { title: 'u' } },
+        { op: 'record.publish', id: 'r', label: '8' },
         {
           op: 'schedule.publication.create',
           id: 'r',
-          label: '10',
+          label: '9',
           data: { publication_scheduled_at: DATE },
         },
-        { op: 'schedule.publication.delete', id: 'r', label: '11' },
+        { op: 'schedule.publication.delete', id: 'r', label: '10' },
         {
           op: 'schedule.unpublishing.create',
           id: 'r',
-          label: '12',
+          label: '11',
           data: { unpublishing_scheduled_at: DATE },
         },
-        { op: 'schedule.unpublishing.delete', id: 'r', label: '13' },
-        { op: 'record.unpublish', id: 'r', label: '14' },
-        { op: 'record.delete', id: 'r', label: '15' },
-        { op: 'upload.delete', id: 'u', label: '16' },
-        { op: 'folder.delete', id: 'f', label: '17' },
+        { op: 'schedule.unpublishing.delete', id: 'r', label: '12' },
+        { op: 'record.unpublish', id: 'r', label: '13' },
+        { op: 'record.delete', id: 'r', label: '14' },
+        { op: 'upload.delete', id: 'u', label: '15' },
+        { op: 'folder.delete', id: 'f', label: '16' },
       ];
       const { client, calls } = recorder({
         'uploads.createFromUrl': () => md5,
@@ -613,9 +637,11 @@ describe('content diff execution', () => {
       // A record is published or unpublished alone, never with its links.
       const alone = [undefined, { recursive: false }];
       assert.deepEqual(calls, [
-        ['uploadCollections.create', { id: 'f', label: 'F' }],
-        ['uploadCollections.update', 'f', { label: 'G' }],
-        ['uploadCollections.reorder', [{ id: 'f' }]],
+        [
+          'uploadCollections.create',
+          { id: 'f', label: 'F', parent: null, position: 1 },
+        ],
+        ['uploadCollections.update', 'f', { label: 'G', position: 2 }],
         [
           'uploads.createFromUrl',
           { id: 'u', url: 'https://example.test/u.svg', filename: 'u.svg' },
@@ -778,7 +804,7 @@ describe('content diff execution', () => {
           assert.equal(error.code, 'CMA_VALIDATION_FAILED');
           assert.equal(
             error.message,
-            `${where}, Update b: The CMA rejected PUT /items/b: INVALID_FIELD (title: VALIDATION_UNIQUE). A unique value may still be held by another record; reorder or edit the diff so that record releases it first.`,
+            `${where}, Update b: The CMA rejected PUT /items/b: INVALID_FIELD (title: VALIDATION_UNIQUE).`,
           );
           assert.deepEqual(error.details, {
             method: 'PUT',

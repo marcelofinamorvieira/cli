@@ -1,15 +1,10 @@
 import assert from 'node:assert/strict';
-import { CmaClient } from '@datocms/cli-utils';
 import { buildBlockRecord } from '@datocms/cma-client';
 import { buildClient } from '@datocms/cma-client-node';
-import {
-  deserializeJsonEntity,
-  serializeRawRequestBodyWithItems,
-} from '@datocms/rest-client-utils';
+import { deserializeJsonEntity } from '@datocms/rest-client-utils';
 import { type CaptureSink, captureEnvironment } from '../src/engine/capture';
 import {
   type RecordLine,
-  type ScheduleResource,
   canonicalCollection,
   canonicalFields,
   canonicalRecord,
@@ -20,7 +15,6 @@ import {
   recordPayloadFields,
   recordReferences,
   recordTitle,
-  unsupportedRecordPayloadKey,
 } from '../src/engine/codec';
 import { ContentError } from '../src/engine/errors';
 import { assertFullReadAccess, fetchSchema } from '../src/engine/schema';
@@ -44,22 +38,6 @@ const ASSET = identity('asset');
 const DATE = '2020-01-01T00:00:00.000Z';
 const FUTURE = '2090-01-01T12:30:00.000Z';
 const LATER = '2090-02-01T12:30:00.000Z';
-const PUBLICATION: ScheduleResource = {
-  id: 'pub',
-  type: 'scheduled_publication',
-  attributes: {
-    publication_scheduled_at: FUTURE,
-    selective_publication: {
-      content_in_locales: ['it', 'en'],
-      non_localized_content: false,
-    },
-  },
-};
-const UNPUBLISHING: ScheduleResource = {
-  id: 'unpub',
-  type: 'scheduled_unpublishing',
-  attributes: { unpublishing_scheduled_at: LATER, content_in_locales: ['it'] },
-};
 
 function field(
   apiKey: string,
@@ -148,35 +126,11 @@ function nativeBlock(
     relationships: { item_type: { data: { type: 'item_type', id: modelId } } },
   };
 }
-/** A block as `RecordState` stores it. */
-function canonicalBlock(
-  id: string,
-  modelId: string,
-  attributes: JsonObject,
-): JsonObject {
-  return { id, __itemTypeId: modelId, attributes };
-}
 function response(
   rows: unknown[],
   total = rows.length,
 ): Record<string, unknown> {
   return { data: rows, meta: { total_count: total } };
-}
-/** The CMA's current-vs-published state of a record with these schedules. */
-function scheduleResponse(...resources: ScheduleResource[]) {
-  const relationship = (type: string) => {
-    const resource = resources.find((entry) => entry.type === type);
-    return { data: resource ? { type, id: resource.id } : null };
-  };
-  return {
-    data: {
-      relationships: {
-        scheduled_publication: relationship('scheduled_publication'),
-        scheduled_unpublishing: relationship('scheduled_unpublishing'),
-      },
-    },
-    included: resources,
-  };
 }
 function errorCode(code: string) {
   return (error: unknown) =>
@@ -291,9 +245,6 @@ function mockClient(
           filtered.slice(offset, offset + args.page.limit),
           filtered.length,
         );
-      },
-      rawCurrentVsPublishedState: async (_id: string): Promise<unknown> => {
-        throw new Error('No schedules expected.');
       },
     },
     uploads: {
@@ -522,85 +473,6 @@ describe('native payload codec', () => {
     );
   });
 
-  it('detects custom metadata keys lost by native SDK serialization without rejecting block annotations or JSON strings', () => {
-    const localizedFile = { ...field('image', 'file'), localized: true };
-    const schema = state([
-      model(MODEL, [
-        field('images', 'gallery'),
-        field('blocks', 'rich_text'),
-        field('opaque', 'json'),
-      ]),
-      model(BLOCK, [localizedFile], true),
-    ]);
-    for (const key of ['__itemTypeId', '__proto__']) {
-      const customData = JSON.parse(
-        `{"${key}":"business-value","credit":"Artist"}`,
-      ) as JsonObject;
-      const file = {
-        upload_id: ASSET,
-        alt: null,
-        title: null,
-        custom_data: customData,
-        focal_point: null,
-        poster_time: null,
-      };
-      const sourceFields: JsonObject = {
-        images: [file],
-        blocks: [nativeBlock(NESTED, BLOCK, { image: { en: file } })],
-        opaque: JSON.stringify(customData),
-      };
-      const canonical = canonicalFields(sourceFields, MODEL, schema);
-      const native = recordPayloadFields(canonical, MODEL, schema);
-      const serialized = serializeRawRequestBodyWithItems({
-        data: { id: RECORD, type: 'item', attributes: native },
-      });
-      assert.equal(
-        Object.hasOwn(
-          (native.images as JsonObject[])[0].custom_data as JsonObject,
-          key,
-        ),
-        true,
-      );
-      assert.equal(
-        Object.hasOwn(serialized.data.attributes.images[0].custom_data, key),
-        false,
-      );
-      assert.equal(serialized.data.attributes.opaque, sourceFields.opaque);
-      assert.equal(unsupportedRecordPayloadKey(canonical, MODEL, schema), key);
-      // Check both the direct gallery and localized nested file independently.
-      assert.equal(
-        unsupportedRecordPayloadKey(
-          { ...canonical, blocks: [] },
-          MODEL,
-          schema,
-        ),
-        key,
-      );
-      assert.equal(
-        unsupportedRecordPayloadKey(
-          { ...canonical, images: [] },
-          MODEL,
-          schema,
-        ),
-        key,
-      );
-      const safe = canonicalFields(
-        {
-          images: [{ ...file, custom_data: { credit: 'Artist' } }],
-          blocks: [
-            nativeBlock(NESTED, BLOCK, {
-              image: { en: { ...file, custom_data: {} } },
-            }),
-          ],
-          opaque: sourceFields.opaque,
-        },
-        MODEL,
-        schema,
-      );
-      assert.equal(unsupportedRecordPayloadKey(safe, MODEL, schema), undefined);
-    }
-  });
-
   it('canonicalizes SDK asset and collection entities without dropping localized metadata', () => {
     const metadata = {
       alt: { en: 'English', it: 'Italiano' },
@@ -702,137 +574,6 @@ describe('native payload codec', () => {
     );
   });
 
-  it('rejects metadata mistaken for an item by SDK response adaptation while allowing real blocks and JSON strings', async () => {
-    const schema = state([
-      model(MODEL, [
-        field('image', 'file'),
-        field('images', 'gallery'),
-        field('blocks', 'rich_text'),
-        field('content', 'structured_text'),
-        field('opaque', 'json'),
-      ]),
-      model(BLOCK, [{ ...field('image', 'file'), localized: true }], true),
-    ]);
-    const image = (type: string): JsonObject => ({
-      upload_id: ASSET,
-      alt: null,
-      title: null,
-      custom_data: { type, credit: 'Artist' },
-      focal_point: null,
-      poster_time: null,
-    });
-    const block = (type: string): JsonObject =>
-      nativeBlock(NESTED, BLOCK, { image: { en: image(type) } });
-    const safe: JsonObject = {
-      image: image('photo'),
-      images: [image('photo')],
-      blocks: [block('photo')],
-      content: {
-        schema: 'dast',
-        document: {
-          type: 'root',
-          children: [{ type: 'block', item: block('photo') }],
-        },
-      },
-      opaque: JSON.stringify({ type: 'item', __itemTypeId: 'business-data' }),
-    };
-    assert.equal(
-      unsupportedRecordPayloadKey(
-        canonicalFields(safe, MODEL, schema),
-        MODEL,
-        schema,
-      ),
-      undefined,
-    );
-    for (const placement of ['file', 'gallery', 'nested', 'dast']) {
-      const fields = structuredClone(safe);
-      if (placement === 'file') fields.image = image('item');
-      if (placement === 'gallery') fields.images = [image('item')];
-      if (placement === 'nested') fields.blocks = [block('item')];
-      if (placement === 'dast')
-        fields.content = {
-          schema: 'dast',
-          document: {
-            type: 'root',
-            children: [{ type: 'block', item: block('item') }],
-          },
-        };
-      const canonical = canonicalFields(fields, MODEL, schema);
-      let writes = 0;
-      const client = sdkClient((_url, init) => {
-        writes++;
-        const body = JSON.parse(String(init?.body)) as {
-          data: { attributes: JsonObject };
-        };
-        // The native write succeeds, but the SDK adapter then mistakes the
-        // custom_data object for a record and throws after the transport.
-        return { data: rawRecord(RECORD, body.data.attributes) };
-      });
-      await assert.rejects(
-        client.items.rawUpdate(RECORD, {
-          data: {
-            id: RECORD,
-            type: 'item',
-            attributes: recordPayloadFields(canonical, MODEL, schema),
-          },
-        }),
-        /item_type/,
-      );
-      assert.equal(writes, 1);
-      assert.equal(
-        unsupportedRecordPayloadKey(canonical, MODEL, schema),
-        'type',
-        placement,
-      );
-    }
-  });
-
-  it('checks INTEGER precision in localized and nested capture/write fields without parsing opaque JSON', () => {
-    const schema = state([
-      model(MODEL, [
-        { ...field('count', 'integer'), localized: true },
-        field('blocks', 'rich_text'),
-      ]),
-      model(
-        BLOCK,
-        [
-          field('count', 'integer'),
-          field('opaque', 'json'),
-          field('fraction', 'float'),
-        ],
-        true,
-      ),
-    ]);
-    const opaque = '{"count":9007199254740993}';
-    // canonicalFields reads native blocks; recordPayloadFields canonical ones.
-    for (const [convert, wrap] of [
-      [canonicalFields, nativeBlock],
-      [recordPayloadFields, canonicalBlock],
-    ] as const) {
-      const block = (count: number): JsonObject =>
-        wrap(NESTED, BLOCK, { count, opaque, fraction: 1e30 });
-      const invalidFields: JsonObject[] = [
-        { count: { en: 1, it: Number.MAX_SAFE_INTEGER + 1 }, blocks: [] },
-        { count: { en: 1 }, blocks: [block(Number.MIN_SAFE_INTEGER - 1)] },
-      ];
-      for (const fields of invalidFields)
-        assert.throws(
-          () => convert(fields, MODEL, schema),
-          errorCode('UNSUPPORTED_INTEGER_PRECISION'),
-        );
-      assert.doesNotThrow(() =>
-        convert(
-          {
-            count: { en: Number.MAX_SAFE_INTEGER, it: null },
-            blocks: [block(Number.MIN_SAFE_INTEGER)],
-          },
-          MODEL,
-          schema,
-        ),
-      );
-    }
-  });
-
   it('hashes canonical content independently from object insertion order', () => {
     assert.equal(
       hashJson({ b: 1, a: { z: true, x: null } }),
@@ -872,78 +613,46 @@ describe('native payload codec', () => {
     assert.notEqual(hashJson(opaque), hashJson({ normal: true }));
   });
 
-  it('canonicalizes schedule resources with sorted locales and UTC instants', () => {
-    assert.deepEqual(canonicalSchedules(null, null), {
-      publication: null,
-      unpublishing: null,
-    });
-    assert.deepEqual(canonicalSchedules(PUBLICATION, UNPUBLISHING), {
-      publication: {
-        at: FUTURE,
-        selective: { locales: ['en', 'it'], nonLocalized: false },
-      },
-      unpublishing: { at: LATER, locales: ['it'] },
-    });
-    // Sorting copies the locales the CMA returned.
+  it('canonicalizes schedule markers as UTC instants', () => {
+    const none = { publication: null, unpublishing: null };
+    assert.deepEqual(canonicalSchedules({}), none);
     assert.deepEqual(
-      (PUBLICATION.attributes.selective_publication as JsonObject)
-        .content_in_locales,
-      ['it', 'en'],
+      canonicalSchedules({
+        publication_scheduled_at: null,
+        unpublishing_scheduled_at: null,
+      }),
+      none,
     );
-    // An unpublishing of every locale has no locale list, null or missing.
-    for (const locales of [{ content_in_locales: null }, {}] as JsonObject[])
-      assert.deepEqual(
-        canonicalSchedules(
-          {
-            ...PUBLICATION,
-            attributes: {
-              publication_scheduled_at: '2090-01-01T13:30:00+01:00',
-              selective_publication: null,
-            },
-          },
-          {
-            ...UNPUBLISHING,
-            attributes: {
-              unpublishing_scheduled_at: '2090-02-01T12:30:00Z',
-              ...locales,
-            },
-          },
-        ),
-        {
-          publication: { at: FUTURE, selective: null },
-          unpublishing: { at: LATER, locales: null },
-        },
-      );
+    assert.deepEqual(
+      canonicalSchedules({
+        publication_scheduled_at: '2090-01-01T13:30:00+01:00',
+        unpublishing_scheduled_at: '2090-02-01T12:30:00Z',
+      }),
+      { publication: { at: FUTURE }, unpublishing: { at: LATER } },
+    );
   });
 
   it('canonicalizes a record line with both versions and its schedules', () => {
     const schema = state();
     const current = rawRecord(RECORD, { title: 'draft' }, true);
+    (current.meta as JsonObject).publication_scheduled_at = FUTURE;
     const published = rawRecord(RECORD, { title: 'live' }, true);
-    const line: RecordLine = {
-      id: RECORD,
-      current,
-      published,
-      scheduledPublication: PUBLICATION,
-      scheduledUnpublishing: null,
-    };
+    const line: RecordLine = { id: RECORD, current, published };
     const record = canonicalRecordLine(line, schema);
-    assert.deepEqual(
-      record,
-      canonicalRecord(
-        current,
-        published,
-        schema,
-        canonicalSchedules(PUBLICATION, null),
-      ),
-    );
+    assert.deepEqual(record, canonicalRecord(current, published, schema));
     assert.equal(record.current.title, 'draft');
     assert.equal(record.published?.title, 'live');
-    assert.equal(record.schedules.publication?.at, FUTURE);
+    assert.deepEqual(record.schedules, {
+      publication: { at: FUTURE },
+      unpublishing: null,
+    });
     // Schedules are part of the record's hash.
     assert.notEqual(
       record.hash,
-      canonicalRecordLine({ ...line, scheduledPublication: null }, schema).hash,
+      canonicalRecordLine(
+        { ...line, current: rawRecord(RECORD, { title: 'draft' }, true) },
+        schema,
+      ).hash,
     );
   });
 
@@ -1054,7 +763,7 @@ describe('environment capture', () => {
     }
   });
 
-  it('captures 30-record nested pages with backpressure and the complete unselected namespace', async () => {
+  it('captures 30-record nested pages with backpressure and every regular model unless some are selected', async () => {
     const other = model(identity('other'));
     other.fields[0].id = identity('other-title');
     const records = Array.from({ length: 125 }, (_, index) =>
@@ -1094,13 +803,7 @@ describe('environment capture', () => {
     assert.equal(lines.length, 126);
     assert.deepEqual(
       lines.find((line) => line.id === identity('outside')),
-      {
-        id: identity('outside'),
-        current: records[125],
-        published: null,
-        scheduledPublication: null,
-        scheduledUnpublishing: null,
-      },
+      { id: identity('outside'), current: records[125], published: null },
     );
     assert.equal(maximum, 2);
     assert.deepEqual(
@@ -1111,6 +814,17 @@ describe('environment capture', () => {
         .map((call) => call.page.offset)
         .sort((a, b) => (a ?? 0) - (b ?? 0)),
       [0, 30, 60, 90, 120],
+    );
+    // A selection leaves the other models unread.
+    fixture.calls.length = 0;
+    const { records: selected } = await capture(fixture.client, {
+      concurrency: 2,
+      models: new Set([MODEL]),
+    });
+    assert.equal(selected.length, 125);
+    assert.equal(
+      fixture.calls.some((call) => call.filter.type === other.id),
+      false,
     );
   });
 
@@ -1165,79 +879,12 @@ describe('environment capture', () => {
       id: flatIds[0],
       current: current[31],
       published: null,
-      scheduledPublication: null,
-      scheduledUnpublishing: null,
     });
     assert.deepEqual(line(flatIds[1])?.current, current[32]);
     assert.deepEqual(line(flatIds[1])?.published, published[31]);
   });
 
-  it('rejects unsafe native INTEGER wire values before capture can merge distinct integers', async () => {
-    const models = [
-      model(MODEL, [
-        field('counter', 'integer'),
-        field('opaque', 'json'),
-        field('fraction', 'float'),
-      ]),
-    ];
-    const schema = state(models);
-    const opaque = '{"counter":9007199254740993}';
-    for (const literal of [
-      '9007199254740992',
-      '9007199254740993',
-      '-9007199254740993',
-    ]) {
-      for (const slice of ['current', 'published']) {
-        const [line] = await captureNative(
-          models,
-          sdkClient((url) => {
-            const row = rawRecord(
-              RECORD,
-              {
-                counter:
-                  url.searchParams.get('version') === slice
-                    ? '__WIRE_INTEGER__'
-                    : 1,
-                opaque,
-                fraction: 1e30,
-              },
-              true,
-            );
-            return JSON.stringify(response([row])).replace(
-              '"__WIRE_INTEGER__"',
-              literal,
-            );
-          }),
-        );
-        assert.throws(
-          () => canonicalRecordLine(line, schema),
-          errorCode('UNSUPPORTED_INTEGER_PRECISION'),
-        );
-      }
-    }
-    for (const value of [
-      Number.MAX_SAFE_INTEGER,
-      Number.MIN_SAFE_INTEGER,
-      0,
-      null,
-    ]) {
-      const [line] = await captureNative(
-        models,
-        sdkClient(() =>
-          response([
-            rawRecord(RECORD, { counter: value, opaque, fraction: 1e30 }, true),
-          ]),
-        ),
-      );
-      const captured = canonicalRecordLine(line, schema);
-      assert.equal(captured.current.counter, value);
-      assert.equal(captured.published!.counter, value);
-      assert.equal(captured.current.opaque, opaque);
-      assert.equal(captured.current.fraction, 1e30);
-    }
-  });
-
-  it('captures exact native custom_data through the authenticated SDK request path before serializer diagnostics', async () => {
+  it('captures exact native custom_data through the authenticated SDK request path', async () => {
     const models = [
       model(MODEL, [
         field('image', 'file'),
@@ -1319,10 +966,6 @@ describe('environment capture', () => {
         Object.prototype,
       );
     }
-    assert.notEqual(
-      unsupportedRecordPayloadKey(captured.current, MODEL, schema),
-      undefined,
-    );
     assert.deepEqual(
       requests.map((url) => [
         url.searchParams.get('version'),
@@ -1457,112 +1100,59 @@ describe('environment capture', () => {
     assert.equal(sink.records.length, 1);
   });
 
-  it('reads schedule details concurrently, not one record at a time', async () => {
-    // Three scheduled records in one listed page.
-    const records = Array.from({ length: 90 }, (_, index) => {
-      const record = rawRecord(identity(`s${index}`), { title: `${index}` });
-      if (index % 30 === 0)
-        (record.meta as JsonObject).publication_scheduled_at = FUTURE;
-      return record;
-    });
-    const fixture = mockClient([model()], records);
-    const publication = {
-      ...PUBLICATION,
-      attributes: { publication_scheduled_at: FUTURE },
-    };
-    let active = 0;
-    let maximum = 0;
-    fixture.mock.items.rawCurrentVsPublishedState = async () => {
-      active++;
-      maximum = Math.max(maximum, active);
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      active--;
-      return scheduleResponse(publication);
-    };
-    const { records: lines } = await capture(fixture.client, {
-      concurrency: 4,
-    });
-    for (const index of [0, 30, 60]) {
-      const line = lines.find((entry) => entry.id === identity(`s${index}`))!;
-      assert.deepEqual(line.scheduledPublication, publication);
-      assert.deepEqual(canonicalRecordLine(line, state()).schedules, {
-        publication: { at: FUTURE, selective: null },
-        unpublishing: null,
-      });
-    }
-    assert.equal(maximum, 3);
-  });
-
-  it('captures exact private selective schedules and rejects drifting state', async () => {
-    const current = rawRecord();
-    Object.assign(current.meta as JsonObject, {
+  it('captures schedules from the markers of the listed current version', async () => {
+    const records = Array.from({ length: 3 }, (_, index) =>
+      rawRecord(identity(`s${index}`), { title: `${index}` }),
+    );
+    Object.assign(records[0].meta as JsonObject, {
       publication_scheduled_at: FUTURE,
       unpublishing_scheduled_at: LATER,
     });
-    const fixture = mockClient([model()], [current]);
-    const read = (answer: () => Promise<unknown>) => {
-      fixture.mock.items.rawCurrentVsPublishedState = answer;
-      return capture(fixture.client);
-    };
-    const failing = (status: number) =>
-      read(async () => {
-        throw new CmaClient.ApiError({
-          request: { method: 'GET', url: '/items/x', headers: {} },
-          response: { status, statusText: '', headers: {}, body: {} },
-        });
-      });
-    const {
-      records: [line],
-    } = await read(async () => scheduleResponse(PUBLICATION, UNPUBLISHING));
-    assert.deepEqual(line.scheduledPublication, PUBLICATION);
-    assert.deepEqual(line.scheduledUnpublishing, UNPUBLISHING);
-    assert.deepEqual(canonicalRecordLine(line, state()).schedules, {
-      publication: {
-        at: FUTURE,
-        selective: { locales: ['en', 'it'], nonLocalized: false },
-      },
-      unpublishing: { at: LATER, locales: ['it'] },
-    });
-    // The listing's markers and the details are two requests.
-    for (const resources of [
-      [
-        {
-          ...PUBLICATION,
-          attributes: {
-            ...PUBLICATION.attributes,
-            publication_scheduled_at: '2091-01-01T12:30:00.000Z',
-          },
-        },
-        UNPUBLISHING,
-      ],
-      [PUBLICATION],
-    ])
-      await assert.rejects(
-        read(async () => scheduleResponse(...resources)),
-        errorCode('CAPTURE_DRIFT'),
-      );
-    // A record deleted after the listing is drift, not a CMA failure.
-    await assert.rejects(failing(404), errorCode('CAPTURE_DRIFT'));
-    await assert.rejects(
-      failing(500),
-      (error) => error instanceof CmaClient.ApiError,
+    (records[1].meta as JsonObject).publication_scheduled_at = FUTURE;
+    const fixture = mockClient([model()], records);
+    const { records: lines } = await capture(fixture.client);
+    const schedules = (index: number) =>
+      canonicalRecordLine(
+        lines.find((entry) => entry.id === identity(`s${index}`))!,
+        state(),
+      ).schedules;
+    // The listing is the only request: the lines carry the rows as listed.
+    assert.deepEqual(
+      lines.map((line) => line.id),
+      records.map((record) => record.id),
     );
+    assert.deepEqual(lines[0], {
+      id: records[0].id,
+      current: records[0],
+      published: null,
+    });
+    assert.deepEqual(schedules(0), {
+      publication: { at: FUTURE },
+      unpublishing: { at: LATER },
+    });
+    assert.deepEqual(schedules(1), {
+      publication: { at: FUTURE },
+      unpublishing: null,
+    });
+    assert.deepEqual(schedules(2), { publication: null, unpublishing: null });
+    assert.equal(fixture.calls.length, 1);
   });
 
   it('proves full namespace permissions before any content read', async () => {
     const fixture = mockClient([model()], [rawRecord()]);
     Reflect.set(fixture.mock.users, 'findMe', async () => ({
       type: 'access_token',
-      role: {
-        id: 'role',
-        meta: {
-          final_permissions: {
-            can_manage_upload_collections: true,
-            positive_item_type_permissions: [],
-            negative_item_type_permissions: [],
-            positive_upload_permissions: [],
-            negative_upload_permissions: [],
-          },
+      role: { id: 'role', type: 'role' },
+    }));
+    Reflect.set(fixture.mock.roles, 'find', async () => ({
+      id: 'role',
+      meta: {
+        final_permissions: {
+          can_manage_upload_collections: true,
+          positive_item_type_permissions: [],
+          negative_item_type_permissions: [],
+          positive_upload_permissions: [],
+          negative_upload_permissions: [],
         },
       },
     }));

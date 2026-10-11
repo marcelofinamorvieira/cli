@@ -46,7 +46,6 @@ async function fixture(before: CollectionState[], after: CollectionState[]) {
       modelIds: [],
       uploads: 'all',
       includeDeletions: true,
-      allowPartial: false,
     },
   });
   assert.deepEqual(byId(result.fixture.folders.values()), byId(after));
@@ -54,34 +53,42 @@ async function fixture(before: CollectionState[], after: CollectionState[]) {
 }
 
 describe('folder operations', () => {
-  it('creates folders without a position and sets every position in one reorder', async () => {
-    const result = await fixture(
-      [folder('a', 1), folder('b', 2)],
-      [folder('new', 1), folder('a', 2), folder('b', 3)],
-    );
-    const id = fixtureId('new');
-    assert.deepEqual(result.events, [`create-folder:${id}`, 'reorder-folders']);
-    assert.deepEqual(result.operations, [
-      {
-        op: 'folder.create',
-        id,
-        label: `Create folder "new" (${id})`,
-        data: { label: 'new', parent: null },
-      },
-      {
-        op: 'folders.reorder',
-        label: 'Set the position of every folder',
-        data: ['new', 'a', 'b'].map((name, index) => ({
-          id: fixtureId(name),
-          type: 'upload_collection',
-          position: index + 1,
-          parent: null,
-        })),
-      },
+  it('creates a folder at its position and moves the siblings it shifts', async () => {
+    const before = [folder('a', 1), folder('b', 2)];
+    const result = await fixture(before, [
+      folder('new', 1),
+      folder('a', 2),
+      folder('b', 3),
     ]);
+    const id = fixtureId('new');
+    const shifted = ['a', 'b'].map((name, index) => ({
+      op: 'folder.update',
+      id: fixtureId(name),
+      label: `Update folder "${name}" (${fixtureId(name)})`,
+      expect: { hash: before[index].hash },
+      data: { position: index + 2 },
+    }));
+    // The create shifts both siblings down, so the position updates that
+    // follow it find them where the diff expects them.
+    const [create, ...updates] = result.operations;
+    assert.deepEqual(create, {
+      op: 'folder.create',
+      id,
+      label: `Create folder "new" (${id})`,
+      data: { label: 'new', parent: null, position: 1 },
+    });
+    assert.deepEqual(
+      Object.fromEntries(updates.map((operation) => [operation.id, operation])),
+      Object.fromEntries(shifted.map((operation) => [operation.id, operation])),
+    );
+    assert.equal(result.events[0], `create-folder:${id}`);
+    assert.deepEqual(
+      result.events.slice(1).sort(),
+      shifted.map((update) => `update-folder:${update.id}`).sort(),
+    );
   });
 
-  it('updates only the label and parent that differ', async () => {
+  it('updates only the label that differs, and a parent with its position', async () => {
     const before = [folder('a', 1), folder('b', 2), folder('child', 1, 'a')];
     const result = await fixture(before, [
       folder('a', 1, null, 'Renamed'),
@@ -90,7 +97,7 @@ describe('folder operations', () => {
     ]);
     assert.deepEqual(
       result.operations.map((operation) => operation.op),
-      ['folder.update', 'folder.update', 'folders.reorder'],
+      ['folder.update', 'folder.update'],
     );
     const update = (name: string) =>
       result.operations.find((operation) => operation.id === fixtureId(name));
@@ -106,9 +113,12 @@ describe('folder operations', () => {
       id: fixtureId('child'),
       label: `Update folder "child" (${fixtureId('child')})`,
       expect: { hash: before[2].hash },
-      data: { parent: { id: fixtureId('b'), type: 'upload_collection' } },
+      // A folder entering another group says where it goes.
+      data: {
+        parent: { id: fixtureId('b'), type: 'upload_collection' },
+        position: 1,
+      },
     });
-    assert.equal(result.events.at(-1), 'reorder-folders');
   });
 
   it('emits nothing for unchanged folders', async () => {

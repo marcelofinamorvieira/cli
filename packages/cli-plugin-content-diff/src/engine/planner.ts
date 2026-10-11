@@ -1,15 +1,13 @@
 import { hashJson } from './codec';
 import { compareIds } from './compare-ids';
 import { ContentError } from './errors';
-import { Heap, PlannerGraph, stronglyConnected } from './planner-graph';
+import { PlannerGraph, stronglyConnected } from './planner-graph';
 import type { SideIndex } from './side';
 import type {
   Action,
   CollectionPlan,
   CollectionState,
-  Diagnostic,
   JsonValue,
-  Kind,
   ModelSchema,
   PlanCounts,
   PlanEntry,
@@ -51,17 +49,13 @@ function plannedAction(
 }
 
 function blankCounts(): PlanCounts {
-  const actions = () => ({ create: 0, update: 0, delete: 0, noop: 0, skip: 0 });
+  const actions = () => ({ create: 0, update: 0, delete: 0, noop: 0 });
   return { record: actions(), upload: actions(), collection: actions() };
 }
 
 /** Whether an entry exists in the destination once the plan has run. */
 function remains(entry: PlanEntry | undefined): boolean {
-  return (
-    !!entry &&
-    entry.action !== 'delete' &&
-    (entry.action !== 'skip' || entry.inDestination)
-  );
+  return !!entry && entry.action !== 'delete';
 }
 
 /** Whether a field is a top-level link or links field of a model. */
@@ -267,20 +261,6 @@ export function assertSchemaCompatible(
   }
 }
 
-interface Refusal {
-  kind: Kind;
-  id: string;
-  code: string;
-  message: string;
-  dependencyId?: string;
-}
-/** Refusals are processed in this order, whenever they were queued. */
-const refusalOrder = (a: Refusal, b: Refusal) =>
-  compareIds(a.kind, b.kind) ||
-  compareIds(a.id, b.id) ||
-  compareIds(a.code, b.code) ||
-  compareIds(a.message, b.message);
-
 /** The entries of one kind in plan order: by model, then ID. */
 function ordered<T extends PlanEntry>(entries: Iterable<T>): T[] {
   return [...entries].sort(
@@ -304,9 +284,9 @@ export interface Plan {
 /**
  * Compares the captured source and destination and turns the difference into
  * ordered work. The CMA validates every write when the diff runs, so planning
- * predicts no acceptance: it refuses only content its own serialization
- * cannot reproduce, and otherwise decides the order of writes and the shape
- * of their payloads. It works on the facts of each record (identity, hash,
+ * predicts no acceptance: it refuses only a publication cycle it cannot
+ * order, and otherwise decides the order of writes and the shape of their
+ * payloads. It works on the facts of each record (identity, hash,
  * publication, position and references); field values stay on disk.
  */
 class Planning {
@@ -316,9 +296,6 @@ class Planning {
   readonly records = new Map<string, RecordPlan>();
   readonly uploads = new Map<string, UploadPlan>();
   readonly collections = new Map<string, CollectionPlan>();
-  /** Every refusal ever queued, so none is queued twice. */
-  private readonly refusals = new Set<string>();
-  private readonly pending = new Heap<Refusal>(refusalOrder);
   private readonly assetScope = {
     upload: new Set<string>(),
     collection: new Set<string>(),
@@ -337,36 +314,12 @@ class Planning {
     );
   }
 
-  entry(kind: Kind, id: string): PlanEntry | undefined {
-    return kind === 'record'
-      ? this.records.get(id)
-      : kind === 'upload'
-        ? this.uploads.get(id)
-        : this.collections.get(id);
-  }
-
   recordEntries(...actions: Action[]): RecordPlan[] {
     return ordered(
       [...this.records.values()].filter(
         (entry) => !actions.length || actions.includes(entry.action),
       ),
     );
-  }
-
-  /** Queues a structural refusal of a requested mutation. */
-  refuse(
-    kind: Kind,
-    id: string,
-    code: string,
-    message: string,
-    dependencyId?: string,
-  ): void {
-    const plan = this.entry(kind, id);
-    if (!plan || !MUTATIONS.has(plan.action)) return;
-    const key = [kind, id, code, message].join('\0');
-    if (this.refusals.has(key)) return;
-    this.refusals.add(key);
-    this.pending.push({ kind, id, code, message, dependencyId });
   }
 
   planRecords(): void {
@@ -394,7 +347,6 @@ class Planning {
         modelId: (managed && source ? source : target)!.modelId,
         action,
         inDestination: !!target,
-        diagnostics: [],
       };
       if (action !== 'noop') {
         plan.baseline = target ?? null;
@@ -434,9 +386,8 @@ class Planning {
   }
 
   /**
-   * Reads the references of the records the plan changes, on both sides,
-   * and the values the SDK would corrupt in the records it writes. No other
-   * record's references take part in planning.
+   * Reads the references of the records the plan changes, on both sides. No
+   * other record's references take part in planning.
    */
   async loadDetails(): Promise<void> {
     const changed = [...this.records.values()].filter((entry) =>
@@ -473,7 +424,6 @@ class Planning {
           id,
           action,
           inDestination: !!target,
-          diagnostics: [],
         } as PlanEntry;
         if (action !== 'noop')
           Object.assign(plan, {
@@ -483,18 +433,6 @@ class Planning {
         entries.set(id, plan);
       }
     }
-  }
-
-  /** Content the SDK would silently corrupt through a write and its response. */
-  payloadRefusals(): void {
-    for (const plan of this.recordEntries('create', 'update'))
-      for (const key of plan.desired?.unsupportedKeys ?? [])
-        this.refuse(
-          'record',
-          plan.id,
-          'UNSUPPORTED_PAYLOAD_KEY',
-          `Record ${plan.id} contains native field metadata at ${key} that the CMA client cannot safely preserve through writes and responses.`,
-        );
   }
 
   private defer(owner: string, root: string): void {
@@ -536,14 +474,12 @@ class Planning {
       // A creation cycle is broken like a publication cycle: its members are
       // ordered so that as few references as possible point to a member
       // created later, and only the fields holding those references are
-      // emptied. A tree parent and a reference whose field cannot be
-      // identified cannot be left out. Records that merely depend on a cycle
-      // wait for it and keep their fields.
+      // emptied. A tree parent cannot be left out. Records that merely
+      // depend on a cycle wait for it and keep their fields.
       const edges = new Map<string, Map<string, boolean>>();
       const roots = new Map<string, Set<string>>();
       for (const entry of creates) {
         if (this.graph.done(CREATION_PHASE, 'record', entry.id)) continue;
-        const model = this.models.get(entry.modelId)!;
         for (const reference of entry.desired!.references) {
           if (
             reference.kind !== creationKind(entry.desired!) ||
@@ -553,9 +489,7 @@ class Planning {
             continue;
           const owner = entry.id;
           const target = reference.targetId;
-          const root = reference.fieldId ? reference.root : undefined;
-          const breakable =
-            !!root && model.fields.some((field) => field.apiKey === root);
+          const breakable = !!reference.fieldId;
           const dependencies = edges.get(owner) ?? new Map<string, boolean>();
           edges.set(owner, dependencies);
           dependencies.set(
@@ -565,7 +499,9 @@ class Planning {
           if (breakable)
             roots.set(
               `${owner}\0${target}`,
-              (roots.get(`${owner}\0${target}`) ?? new Set()).add(root!),
+              (roots.get(`${owner}\0${target}`) ?? new Set()).add(
+                reference.root,
+              ),
             );
         }
       }
@@ -621,17 +557,7 @@ class Planning {
           (model.draftMode || !this.models.get(dependency.modelId)?.draftMode)
         )
           continue;
-        const root = reference.root;
-        if (!root || !model.fields.some((field) => field.apiKey === root)) {
-          this.refuse(
-            'record',
-            entry.id,
-            'UNSUPPORTED_CREATION_REFERENCE',
-            `Record ${entry.id} has a creation reference whose containing field cannot be identified.`,
-          );
-          continue;
-        }
-        deferred.add(root);
+        deferred.add(reference.root);
       }
       entry.execution = {
         ...entry.execution,
@@ -792,23 +718,64 @@ class Planning {
     }
     // Records referenced by a destination publication (tree parents
     // included) are unpublished only after the referrers' own publication
-    // changes and moves release those references.
+    // changes and moves release those references. A referrer the plan
+    // deletes releases them by its deletion, which runs in a later phase, so
+    // its target is unpublished in the deletion phase, after that deletion,
+    // and so is every record whose own unpublishing waits for such a target.
+    const releases: Array<[owner: string, dependency: string]> = [];
+    const late = new Map<string, Set<string>>();
+    const waits = (id: string) => {
+      let ids = late.get(id);
+      if (!ids) {
+        ids = new Set();
+        late.set(id, ids);
+      }
+      return ids;
+    };
     for (const owner of entries) {
-      if (owner.action !== 'update') continue;
+      if (owner.action !== 'update' && owner.action !== 'delete') continue;
       for (const reference of owner.baseline?.references ?? []) {
         if (reference.kind !== 'published' || reference.targetId === owner.id)
           continue;
         const dependency = this.records.get(reference.targetId);
-        if (dependency?.action === 'update' && !dependency.desired?.published)
-          this.graph.edge(
-            'publish',
-            'record',
-            dependency.id,
-            'record',
-            owner.id,
-            'publication-release',
-          );
+        if (dependency?.action !== 'update' || dependency.desired?.published)
+          continue;
+        if (owner.action === 'delete') {
+          waits(dependency.id).add(owner.id);
+          continue;
+        }
+        releases.push([owner.id, dependency.id]);
+        this.graph.edge(
+          'publish',
+          'record',
+          dependency.id,
+          'record',
+          owner.id,
+          'publication-release',
+        );
       }
+    }
+    for (let added = true; added; ) {
+      added = false;
+      for (const [owner, dependency] of releases)
+        if (late.has(owner) && !late.get(dependency)?.has(owner)) {
+          waits(dependency).add(owner);
+          added = true;
+        }
+    }
+    for (const [id, dependencies] of late) {
+      const entry = this.records.get(id)!;
+      entry.execution = { ...entry.execution, lateUnpublish: true };
+      this.graph.node('delete', 'record', id);
+      for (const dependency of dependencies)
+        this.graph.edge(
+          'delete',
+          'record',
+          id,
+          'record',
+          dependency,
+          'publication-release',
+        );
     }
     // Deleted referrers and children go before the records they point to.
     for (const owner of entries) {
@@ -847,14 +814,13 @@ class Planning {
           'parent',
         );
     }
-    for (const id of this.breakPublicationCycles())
-      this.refuse(
-        'record',
-        id,
+    const unbreakable = this.breakPublicationCycles();
+    if (unbreakable.length)
+      throw new ContentError(
         'PUBLICATION_CYCLE',
-        `Record ${id} is in a publication cycle that omitting top-level links cannot break, so no publication order exists.`,
+        `Record ${unbreakable[0]} is in a publication cycle that omitting top-level links cannot break, so no publication order exists.`,
+        { kind: 'record', id: unbreakable[0], records: unbreakable },
       );
-    // Refused publication cycles are planned again without their members.
     // Any other cycle comes from content the CMA judges when the diff runs,
     // so its members still get a deterministic order.
     for (const phase of RECORD_PHASES) {
@@ -895,12 +861,6 @@ class Planning {
   // broken otherwise, that wait is dropped and the CMA judges the writes.
   // Returns the members of the cycles that cannot be broken.
   breakPublicationCycles(): string[] {
-    // Planning reruns after each round of skips, so earlier breaks start over.
-    for (const entry of this.records.values())
-      if (entry.execution?.provisionalTargets) {
-        const { provisionalTargets: _, ...execution } = entry.execution;
-        entry.execution = execution;
-      }
     if (!this.graph.order('publish')) return [];
     // Only the unresolved part of the graph is analysed: records in a cycle
     // and records waiting on one. An owner/dependency pair is breakable only
@@ -1011,102 +971,6 @@ class Planning {
     return unbreakable;
   }
 
-  /**
-   * Skips refused entries under --allow-partial, or fails on the first one.
-   * A skip spreads only where it is structurally needed: to writes that
-   * reference a skipped create, and to deletes of entries that the skipped
-   * entry's retained destination state still references.
-   */
-  processRefusals(): boolean {
-    const first = this.pending.peek();
-    if (!first) return false;
-    if (!this.options.allowPartial)
-      throw new ContentError('UNSAFE_REQUESTED_CHANGE', first.message, {
-        kind: first.kind,
-        id: first.id,
-        reason: first.code,
-        dependencyId: first.dependencyId ?? null,
-      });
-    for (let row = this.pending.pop(); row; row = this.pending.pop()) {
-      const entry = this.entry(row.kind, row.id);
-      if (!entry) continue;
-      const diagnostic: Diagnostic = { code: row.code, message: row.message };
-      if (
-        !entry.diagnostics.some(
-          (existing) =>
-            existing.code === diagnostic.code &&
-            existing.message === diagnostic.message,
-        )
-      )
-        entry.diagnostics.push(diagnostic);
-      const created = entry.action === 'create';
-      const alreadySkipped = entry.action === 'skip';
-      entry.action = 'skip';
-      if (entry.kind === 'record') entry.execution = undefined;
-      if (alreadySkipped) continue;
-      if (created && entry.kind === 'record')
-        for (const owner of this.referrers(entry.id))
-          this.refuse(
-            'record',
-            owner,
-            'SKIPPED_DEPENDENCY',
-            `Record ${owner} references skipped new record ${entry.id}.`,
-            entry.id,
-          );
-      if (entry.inDestination)
-        for (const dependency of this.retainedDependencies(entry))
-          if (this.entry(dependency.kind, dependency.id)?.action === 'delete')
-            this.refuse(
-              dependency.kind,
-              dependency.id,
-              'PRESERVED_SKIP_DEPENDENCY',
-              `${dependency.kind} ${dependency.id} must remain for skipped ${entry.kind} ${entry.id}.`,
-              entry.id,
-            );
-    }
-    return true;
-  }
-
-  /** Source records that reference a record (uploads aside), in ID order. */
-  private referrers(id: string): string[] {
-    if (!this.referrersById) {
-      this.referrersById = new Map();
-      for (const record of this.source.records.values())
-        for (const reference of record.references) {
-          if (reference.kind === 'upload') continue;
-          const owners =
-            this.referrersById.get(reference.targetId) ?? new Set();
-          owners.add(record.id);
-          this.referrersById.set(reference.targetId, owners);
-        }
-    }
-    return [...(this.referrersById.get(id) ?? [])].sort(compareIds);
-  }
-  private referrersById?: Map<string, Set<string>>;
-
-  /** What an entry's destination state references: records, uploads, folders. */
-  *retainedDependencies(
-    entry: PlanEntry,
-  ): Generator<{ kind: Kind; id: string }> {
-    if (entry.kind === 'record') {
-      const seen = new Set<string>();
-      for (const reference of [
-        ...(this.target.records.get(entry.id)?.references ?? []),
-      ].sort((a, b) => compareIds(a.targetId, b.targetId))) {
-        const kind = reference.kind === 'upload' ? 'upload' : 'record';
-        if (seen.has(`${kind}\0${reference.targetId}`)) continue;
-        seen.add(`${kind}\0${reference.targetId}`);
-        yield { kind, id: reference.targetId };
-      }
-      return;
-    }
-    const parent =
-      entry.kind === 'upload'
-        ? this.target.uploads.get(entry.id)?.collectionId
-        : this.target.collections.get(entry.id)?.parentId;
-    if (parent) yield { kind: 'collection', id: parent };
-  }
-
   finish(): Plan {
     const counts = blankCounts();
     for (const entries of [this.records, this.uploads, this.collections])
@@ -1139,12 +1003,28 @@ class Planning {
   }
 }
 
-/** Folder creates and updates, parents before children in the final tree. */
+/**
+ * Folder creates and updates, parents before children in the final tree and,
+ * within a sibling group, by final position: a folder written at its position
+ * shifts the siblings after it, so writing the group in ascending position
+ * leaves every folder written so far where it belongs.
+ */
 export function orderedCollectionWrites(plan: Plan): CollectionPlan[] {
   return plan.graph
     .ranks(COLLECTION_WRITE_PHASE)
-    .map((rank) => plan.collections.get(rank.id)!)
-    .filter((entry) => WRITES.has(entry.action));
+    .map((rank) => ({ rank: rank.rank, entry: plan.collections.get(rank.id)! }))
+    .filter(({ entry }) => WRITES.has(entry.action))
+    .sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        compareIds(
+          a.entry.desired!.parentId ?? '',
+          b.entry.desired!.parentId ?? '',
+        ) ||
+        a.entry.desired!.position - b.entry.desired!.position ||
+        compareIds(a.entry.id, b.entry.id),
+    )
+    .map(({ entry }) => entry);
 }
 
 export async function createPlan(
@@ -1157,11 +1037,7 @@ export async function createPlan(
   planning.planAssetScope();
   planning.planAssets();
   await planning.loadDetails();
-  planning.payloadRefusals();
   planning.creationFields();
-  // Each pass skips at least one refused mutation, and the orders are
-  // recomputed without it.
-  do planning.executionOrders();
-  while (planning.processRefusals());
+  planning.executionOrders();
   return planning.finish();
 }

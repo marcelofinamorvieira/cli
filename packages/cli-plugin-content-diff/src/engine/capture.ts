@@ -1,12 +1,6 @@
-import { CmaClient } from '@datocms/cli-utils';
 import { boundedWork } from './bounded-work';
 import { assertNotAborted } from './cancellation';
-import {
-  type RecordLine,
-  type ScheduleResource,
-  canonicalSchedules,
-  timestamp,
-} from './codec';
+import type { RecordLine } from './codec';
 import { ContentError } from './errors';
 import { assertFullReadAccess } from './schema';
 import type { CaptureOptions, Client, ModelSchema, SchemaState } from './types';
@@ -94,70 +88,14 @@ async function pages(
   return total;
 }
 
-type ScheduleBody = {
-  data: { relationships: Record<string, { data: { id: string } | null }> };
-  included?: ScheduleResource[];
-};
-
-/** A record's scheduled publication and unpublishing, as the CMA returns them. */
-async function readSchedules(
-  client: Client,
-  record: NativeRow,
-): Promise<[ScheduleResource | null, ScheduleResource | null]> {
-  const pubAt = record.meta.publication_scheduled_at;
-  const unpubAt = record.meta.unpublishing_scheduled_at;
-  if (!pubAt && !unpubAt) return [null, null];
-  let body: ScheduleBody;
-  try {
-    body = (await client.items.rawCurrentVsPublishedState(
-      record.id,
-    )) as unknown as ScheduleBody;
-  } catch (error) {
-    // The record was listed a moment ago, so it was deleted meanwhile.
-    if (error instanceof CmaClient.ApiError && error.response.status === 404)
-      throw new ContentError(
-        'CAPTURE_DRIFT',
-        `Record ${record.id} was deleted during capture.`,
-      );
-    throw error;
-  }
-  const resource = (key: string) => {
-    const id = body.data.relationships[key]?.data?.id;
-    return (
-      (id &&
-        body.included?.find(
-          (entry) => entry.id === id && entry.type === key,
-        )) ||
-      null
-    );
-  };
-  const publication = resource('scheduled_publication');
-  const unpublishing = resource('scheduled_unpublishing');
-  const schedules = canonicalSchedules(publication, unpublishing);
-  // The listing and this read are two requests: a schedule that changed
-  // between them makes the marker and the details disagree.
-  if (
-    Boolean(pubAt) !== Boolean(schedules.publication) ||
-    Boolean(unpubAt) !== Boolean(schedules.unpublishing) ||
-    (pubAt && schedules.publication?.at !== timestamp(pubAt)) ||
-    (unpubAt && schedules.unpublishing?.at !== timestamp(unpubAt))
-  )
-    throw new ContentError(
-      'CAPTURE_DRIFT',
-      'A record schedule changed during capture.',
-    );
-  return [publication, unpublishing];
-}
-
 /**
  * One listed page of current records as complete record lines: their
- * published versions, read by ID, and their schedules.
+ * published versions, read by ID. Schedules travel in the listing's meta.
  */
 async function recordLines(
   client: Client,
   rows: NativeRow[],
   nested: boolean,
-  concurrency: number,
 ): Promise<RecordLine[]> {
   const published = new Map<string, unknown>();
   const ids = rows.filter((row) => row.meta.published_at).map((row) => row.id);
@@ -174,7 +112,7 @@ async function recordLines(
     for (const resource of pageBody(body).data as NativeRow[])
       published.set(resource.id, resource);
   }
-  const lines = rows.map((row): RecordLine => {
+  return rows.map((row): RecordLine => {
     const pub = published.get(row.id) ?? null;
     // The current and published versions are two requests.
     if (Boolean(row.meta.published_at) !== Boolean(pub))
@@ -182,29 +120,8 @@ async function recordLines(
         'CAPTURE_DRIFT',
         `Publication state changed while reading record ${row.id}.`,
       );
-    return {
-      id: row.id,
-      current: row,
-      published: pub,
-      scheduledPublication: null,
-      scheduledUnpublishing: null,
-    };
+    return { id: row.id, current: row, published: pub };
   });
-  // Schedule details cost one request per scheduled record. Few records are
-  // scheduled, so they are read together rather than one after another.
-  await boundedWork(
-    lines.filter(
-      ({ current }) =>
-        (current as NativeRow).meta.publication_scheduled_at ||
-        (current as NativeRow).meta.unpublishing_scheduled_at,
-    ),
-    concurrency,
-    async (line) => {
-      [line.scheduledPublication, line.scheduledUnpublishing] =
-        await readSchedules(client, line.current as NativeRow);
-    },
-  );
-  return lines;
 }
 
 /** Uploads and folders. */
@@ -280,7 +197,8 @@ export async function captureEnvironment(args: {
   const seen = new Set<string>();
   for (const model of schema.models) {
     assertNotAborted(signal);
-    if (model.block) continue;
+    if (model.block || (options.models && !options.models.has(model.id)))
+      continue;
     const nested = readsBlocks(model);
     const limit = nested ? 30 : 500;
     options.progress?.(`Reading ${model.apiKey}`);
@@ -300,7 +218,6 @@ export async function captureEnvironment(args: {
           client,
           rows as NativeRow[],
           nested,
-          options.concurrency,
         )) {
           assertNotAborted(signal);
           // A record listed twice moved between pages meanwhile.

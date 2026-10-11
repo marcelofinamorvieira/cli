@@ -1,4 +1,4 @@
-import { CmaClient, CmaClientCommand, oclif } from '@datocms/cli-utils';
+import { CmaClientCommand, oclif } from '@datocms/cli-utils';
 import { applyContentDiff } from '../../engine/apply';
 import {
   ContentError,
@@ -33,7 +33,7 @@ export default class ContentApplyCommand extends CmaClientCommand {
   static flags = {
     destination: oclif.Flags.string({
       description:
-        'Apply against this destination environment ID instead of the one the diff was generated for',
+        'Apply against this destination environment ID, or "primary", instead of the one the diff was generated for',
     }),
     'preflight-only': oclif.Flags.boolean({
       description:
@@ -43,7 +43,7 @@ export default class ContentApplyCommand extends CmaClientCommand {
     }),
     'fork-name': oclif.Flags.string({
       description:
-        'Name of the new fork to create (defaults to a unique generated name)',
+        'Name of the new fork to create (defaults to content-apply-<seconds>)',
       exclusive: ['in-place'],
     }),
     // No defaults: oclif only enforces `dependsOn` for a flag left unset.
@@ -60,9 +60,12 @@ export default class ContentApplyCommand extends CmaClientCommand {
     }),
     'fast-fork': oclif.Flags.boolean({
       description:
-        'Create the fork with a fast fork (the default), which blocks writes to the destination while it copies; use --no-fast-fork for a regular fork',
-      default: true,
-      allowNo: true,
+        'Run a fast fork. A fast fork reduces processing time, but it also prevents writing to the destination environment during the process',
+    }),
+    force: oclif.Flags.boolean({
+      description:
+        'Forces the start of a fast fork, even there are users currently editing records in the environment to copy',
+      dependsOn: ['fast-fork'],
     }),
     concurrency: oclif.Flags.integer({
       description:
@@ -79,11 +82,20 @@ export default class ContentApplyCommand extends CmaClientCommand {
   // command's own option checks run first: a bad flag fails without
   // authentication or network access.
   protected async init(): Promise<void> {
-    const { args } = await this.parse(ContentApplyCommand);
+    const { args, flags } = await this.parse(ContentApplyCommand);
     if (!args.FILE.endsWith('.zip'))
       throw new ContentError(
         'INVALID_DIFF_PATH',
         'Pass the .zip diff written by content:diff to content:apply.',
+      );
+    // Environment IDs go into request paths.
+    if (
+      flags['fork-name'] !== undefined &&
+      !/^[a-z0-9-]+$/.test(flags['fork-name'])
+    )
+      throw new ContentError(
+        'INVALID_FORK_NAME',
+        'The fork name can only contain lowercase letters, numbers and dashes.',
       );
     await super.init();
   }
@@ -107,11 +119,10 @@ export default class ContentApplyCommand extends CmaClientCommand {
 
   private async runOperation(signal: AbortSignal): Promise<ApplyOutcome> {
     const { flags, args } = await this.parse(ContentApplyCommand);
-    const options = await this.buildBaseClientInitializationOptions();
     const result = await applyContentDiff({
       rootClient: this.client,
       buildEnvironmentClient: (environment) =>
-        CmaClient.buildClient({ ...options, environment }),
+        this.buildClient({ environment }),
       diffPath: args.FILE,
       options: {
         signal,
@@ -124,7 +135,8 @@ export default class ContentApplyCommand extends CmaClientCommand {
           : {}),
         ...(flags['preflight-only'] ? { preflightOnly: true } : {}),
         concurrency: flags.concurrency,
-        fastFork: flags['fast-fork'],
+        fastFork: flags['fast-fork'] ?? false,
+        force: flags.force ?? false,
         log: (message) => this.logToStderr(message),
       },
     });
@@ -132,15 +144,10 @@ export default class ContentApplyCommand extends CmaClientCommand {
       this.log(
         `Preflight checks passed against environment "${result.environmentId}" for ${result.operations} operations. Nothing was run.`,
       );
-      if (result.partial)
-        this.log('Partial diff: generation omitted unsupported content.');
       return result;
     }
-    const partial = result.partial
-      ? ' (generation omitted unsupported content)'
-      : '';
     this.log(
-      `Ran ${result.operations} operations in environment "${result.environmentId}"${partial}.`,
+      `Ran ${result.operations} operations in environment "${result.environmentId}".`,
     );
     return result;
   }

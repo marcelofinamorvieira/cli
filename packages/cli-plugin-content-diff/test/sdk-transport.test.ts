@@ -181,7 +181,6 @@ describe('content diffs over the real CMA SDK transport', () => {
       modelIds: [MODEL],
       uploads: 'all' as const,
       includeDeletions: true,
-      allowPartial: false,
     },
   };
   beforeEach(async () => {

@@ -21,7 +21,6 @@ const options = {
   modelIds: [MODEL],
   uploads: 'all' as const,
   includeDeletions: true,
-  allowPartial: false,
 };
 
 function schema(
@@ -249,7 +248,6 @@ describe('content diff pipeline', () => {
         'upload.replace',
         'upload.delete',
         'folder.delete',
-        'folders.reorder',
       ],
     );
   });

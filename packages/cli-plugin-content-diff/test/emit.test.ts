@@ -33,7 +33,6 @@ const options = {
   modelIds: [MODEL],
   uploads: 'all' as const,
   includeDeletions: true,
-  allowPartial: false,
 };
 
 function schema(
@@ -646,7 +645,6 @@ describe('diff operations', () => {
       update: 0,
       delete: 0,
       noop: 30,
-      skip: 0,
     });
     assert.deepEqual(ops(operations), ['record.create', 'records.reorder']);
     assert.deepEqual(
@@ -1002,10 +1000,7 @@ describe('diff operations', () => {
       'scheduled',
       {},
       {
-        schedules: {
-          publication: { at, selective: null },
-          unpublishing: null,
-        },
+        schedules: { publication: { at }, unpublishing: null },
       },
     );
     const { operations } = await replayed(
@@ -1016,10 +1011,7 @@ describe('diff operations', () => {
             'scheduled',
             { title: 'Edited' },
             {
-              schedules: {
-                publication: null,
-                unpublishing: { at, locales: null },
-              },
+              schedules: { publication: null, unpublishing: { at } },
             },
           ),
         ],
@@ -1045,7 +1037,7 @@ describe('diff operations', () => {
         op: 'schedule.unpublishing.create',
         id: before.id,
         label: `Schedule the unpublishing of ${article('scheduled', 'Edited')}`,
-        data: { unpublishing_scheduled_at: at, content_in_locales: null },
+        data: { unpublishing_scheduled_at: at },
       },
     ]);
   });
@@ -1087,32 +1079,6 @@ describe('diff operations', () => {
       },
       deleted('child'),
       deleted('parent'),
-      {
-        op: 'folders.reorder',
-        label: 'Set the position of every folder',
-        data: [
-          {
-            id: id('kept-folder'),
-            type: 'upload_collection',
-            position: 1,
-            parent: null,
-          },
-        ],
-      },
     ]);
-  });
-
-  it('sets no folder positions once every folder is deleted', async () => {
-    const { operations } = await replayed(
-      { collections: [folder('parent', 1), folder('child', 1, 'parent')] },
-      {},
-    );
-    assert.deepEqual(
-      operations.map((operation) => [operation.op, operation.id]),
-      [
-        ['folder.delete', id('child')],
-        ['folder.delete', id('parent')],
-      ],
-    );
   });
 });

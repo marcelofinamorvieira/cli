@@ -29,7 +29,6 @@ export const OPERATIONS = {
   'folder.create': { id: true, data: 'object' },
   'folder.update': { id: true, data: 'object' },
   'folder.delete': { id: true },
-  'folders.reorder': { data: 'array' },
   'upload.create': { id: true, data: 'object', upload: true },
   'upload.replace': { id: true, data: 'object', upload: true },
   'upload.update': { id: true, data: 'object' },
@@ -46,7 +45,7 @@ export const OPERATIONS = {
   'schedule.unpublishing.delete': { id: true },
 } as const satisfies Record<
   string,
-  { id?: true; data?: 'object' | 'array'; upload?: true }
+  { id?: true; data?: 'object'; upload?: true }
 >;
 export type OperationName = keyof typeof OPERATIONS;
 
@@ -96,8 +95,18 @@ export function assertOperation(
     invalid('"id" must be a DatoCMS ID.');
   if (spec.data === 'object' && !object(line.data))
     invalid('"data" must be an object.');
-  if (spec.data === 'array' && !Array.isArray(line.data))
-    invalid('"data" must be an array.');
+  // The one body the plugin interprets itself; the SDK and the CMA validate
+  // every other one.
+  if (name === 'records.reorder') {
+    const order = line.data as Record<string, unknown>;
+    if (
+      typeof order.model !== 'string' ||
+      !nullableString(order.parent) ||
+      !Array.isArray(order.order) ||
+      order.order.some((entry) => typeof entry !== 'string')
+    )
+      invalid('"data" must be a record order: model, parent and order.');
+  }
   if (spec.upload) {
     if (typeof line.md5 !== 'string') invalid('"md5" must be a string.');
     if (typeof line.file === 'string') {

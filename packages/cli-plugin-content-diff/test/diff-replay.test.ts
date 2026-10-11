@@ -27,7 +27,6 @@ const options = {
   modelIds: [MODEL],
   uploads: 'all' as const,
   includeDeletions: true,
-  allowPartial: false,
 };
 
 function schema(ordered = false): SchemaState {
@@ -242,7 +241,7 @@ describe('diff replay', () => {
         firstPublishedAt,
         publishedUpdatedAt: firstPublishedAt,
         schedules: {
-          publication: { at: '2099-01-01T00:00:00.000Z', selective: null },
+          publication: { at: '2099-01-01T00:00:00.000Z' },
           unpublishing: null,
         },
       },
@@ -255,11 +254,8 @@ describe('diff replay', () => {
         firstPublishedAt,
         publishedUpdatedAt: firstPublishedAt,
         schedules: {
-          publication: {
-            at: '2099-01-02T00:00:00.000Z',
-            selective: { locales: ['en'], nonLocalized: true },
-          },
-          unpublishing: { at: '2099-02-01T00:00:00.000Z', locales: ['en'] },
+          publication: { at: '2099-01-02T00:00:00.000Z' },
+          unpublishing: { at: '2099-02-01T00:00:00.000Z' },
         },
       },
     );
@@ -371,44 +367,44 @@ describe('diff replay', () => {
   });
 
   it('changes schedules last and only for records whose schedules differ', async () => {
-    const at = (day: number) => `2099-01-0${day}T00:00:00.000Z`;
-    const publication = (day: number) => ({ at: at(day), selective: null });
-    const unpublishing = (day: number) => ({ at: at(day), locales: null });
+    const scheduledAt = (day: number) => ({
+      at: `2099-01-0${day}T00:00:00.000Z`,
+    });
     const before = [
       record(
         'kept',
         { title: 'Old' },
-        { schedules: { publication: publication(1), unpublishing: null } },
+        { schedules: { publication: scheduledAt(1), unpublishing: null } },
       ),
       record(
         'moved',
         {},
-        { schedules: { publication: publication(1), unpublishing: null } },
+        { schedules: { publication: scheduledAt(1), unpublishing: null } },
       ),
       record(
         'cleared',
         {},
-        { schedules: { publication: null, unpublishing: unpublishing(2) } },
+        { schedules: { publication: null, unpublishing: scheduledAt(2) } },
       ),
       record(
         'deleted',
         {},
-        { schedules: { publication: publication(3), unpublishing: null } },
+        { schedules: { publication: scheduledAt(3), unpublishing: null } },
       ),
     ];
     const after = [
       record(
         'kept',
         { title: 'New' },
-        { schedules: { publication: publication(1), unpublishing: null } },
+        { schedules: { publication: scheduledAt(1), unpublishing: null } },
       ),
       record(
         'moved',
         {},
         {
           schedules: {
-            publication: publication(4),
-            unpublishing: unpublishing(5),
+            publication: scheduledAt(4),
+            unpublishing: scheduledAt(5),
           },
         },
       ),
@@ -416,7 +412,7 @@ describe('diff replay', () => {
       record(
         'created',
         {},
-        { schedules: { publication: publication(6), unpublishing: null } },
+        { schedules: { publication: scheduledAt(6), unpublishing: null } },
       ),
     ];
     const { fixture } = await replay({

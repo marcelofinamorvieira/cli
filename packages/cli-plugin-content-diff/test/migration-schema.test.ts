@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
-import { ContentError } from '../src/engine/errors';
 import {
-  prepareMigrationSchema,
-  projectMigrationSchema,
+  DEFAULT_TRACKING_MODEL_API_KEY,
+  withoutTrackingModel,
 } from '../src/engine/migration-schema';
 import { schemaHash } from '../src/engine/schema';
 import type { ModelSchema, SchemaState } from '../src/engine/types';
@@ -34,10 +33,16 @@ function tracking(overrides: Partial<ModelSchema> = {}): ModelSchema {
   };
 }
 
-function fixture(models: ModelSchema[] = [tracking()]): SchemaState {
+const article = () =>
+  tracking({ id: 'article', apiKey: 'article', name: 'Article' });
+
+function fixture(
+  models: ModelSchema[] = [tracking()],
+  side: Partial<Pick<SchemaState, 'siteId' | 'environmentId'>> = {},
+): SchemaState {
   const schema: SchemaState = {
-    siteId: 'project',
-    environmentId: 'main',
+    siteId: side.siteId ?? 'project',
+    environmentId: side.environmentId ?? 'main',
     models,
     workflows: [],
     locales: ['en', 'it'],
@@ -48,73 +53,58 @@ function fixture(models: ModelSchema[] = [tracking()]): SchemaState {
   return schema;
 }
 
-function rejected(work: () => unknown): void {
-  assert.throws(
-    work,
-    (error: unknown) =>
-      error instanceof ContentError &&
-      error.code === 'INVALID_MIGRATION_TRACKING_MODEL',
-  );
-}
-
-describe('migration tracking schema projection', () => {
-  it('records a configured exact identity and recomputes the projected schema hash', () => {
-    const source = fixture();
-    const before = JSON.stringify(source);
-    const result = prepareMigrationSchema(source, 'custom_migration');
-    assert.deepEqual(result.tracking, {
-      apiKey: 'custom_migration',
-      model: { id: 'tracking-model' },
-    });
-    assert.deepEqual(result.schema.models, []);
-    assert.equal(result.schema.hash, schemaHash(result.schema));
-    assert.notEqual(result.schema.hash, source.hash);
-    assert.equal(result.schema.siteId, source.siteId);
-    assert.equal(JSON.stringify(source), before);
+describe('migration tracking model removal', () => {
+  it('names the native migration runner tracking model by default', () => {
+    assert.equal(DEFAULT_TRACKING_MODEL_API_KEY, 'schema_migration');
   });
 
-  it('records absence and preserves unrelated models, including canonical-looking other names', () => {
-    const source = fixture([tracking({ apiKey: 'other_migration' })]);
-    const prepared = prepareMigrationSchema(source, 'custom_migration');
-    assert.deepEqual(prepared.tracking, {
-      apiKey: 'custom_migration',
-      model: null,
-    });
-    assert.deepEqual(prepared.schema.models, source.models);
+  it('removes the model holding the API key from either side and recomputes the hash', () => {
+    for (const side of [
+      { siteId: 'source', environmentId: 'sandbox' },
+      { siteId: 'destination', environmentId: 'main' },
+    ]) {
+      const schema = fixture([tracking(), article()], side);
+      const before = JSON.stringify(schema);
+      const projected = withoutTrackingModel(schema, 'custom_migration');
+      assert.deepEqual(projected.models, [article()]);
+      assert.equal(projected.hash, schemaHash(projected));
+      assert.notEqual(projected.hash, schema.hash);
+      assert.equal(projected.siteId, side.siteId);
+      assert.equal(projected.environmentId, side.environmentId);
+      assert.equal(JSON.stringify(schema), before);
+    }
+  });
+
+  it('hashes a schema that lost the model like one that never had it', () => {
+    const never = fixture([article()]);
+    const removed = withoutTrackingModel(
+      fixture([tracking(), article()]),
+      'custom_migration',
+    );
+    assert.deepEqual(removed.models, never.models);
+    assert.equal(removed.hash, never.hash);
+  });
+
+  it('hashes a tracking model recreated under another ID the same once removed', () => {
+    const generated = fixture([tracking(), article()]);
+    const recreated = fixture([tracking({ id: 'replacement' }), article()]);
+    assert.notEqual(recreated.hash, generated.hash);
     assert.equal(
-      projectMigrationSchema(source, prepared.tracking).hash,
-      source.hash,
+      withoutTrackingModel(recreated, 'custom_migration').hash,
+      withoutTrackingModel(generated, 'custom_migration').hash,
     );
   });
 
-  it('accepts the exact pre-existing identity without a native runner context', () => {
-    const source = fixture();
-    const prepared = prepareMigrationSchema(source, 'custom_migration');
-    assert.equal(
-      projectMigrationSchema(source, prepared.tracking).hash,
-      prepared.schema.hash,
-    );
-  });
-
-  it('leaves a tracking model that appeared after generation to the schema hash check', () => {
-    const before = prepareMigrationSchema(fixture([]), 'custom_migration');
-    const after = fixture();
-    assert.equal(
-      projectMigrationSchema(after, before.tracking).hash,
-      after.hash,
-    );
-    assert.notEqual(after.hash, before.schema.hash);
-  });
-
-  it('rejects replaced, renamed, missing, and wrongly bound tracking identities', () => {
-    const source = fixture();
-    const prepared = prepareMigrationSchema(source, 'custom_migration');
-    for (const changed of [
-      fixture([]),
-      fixture([tracking({ id: 'replacement' })]),
-      fixture([tracking({ apiKey: 'renamed' })]),
-    ])
-      rejected(() => projectMigrationSchema(changed, prepared.tracking));
+  it('leaves a schema without the model as it is, canonical-looking other names included', () => {
+    const schema = fixture([
+      tracking({ apiKey: 'other_migration' }),
+      article(),
+    ]);
+    const projected = withoutTrackingModel(schema, 'custom_migration');
+    assert.deepEqual(projected.models, schema.models);
+    assert.equal(projected.hash, schema.hash);
+    const empty = fixture([]);
+    assert.deepEqual(withoutTrackingModel(empty, 'custom_migration'), empty);
   });
 
   it('excludes the model holding the API key whatever its shape, validators or inbound links', () => {
@@ -138,13 +128,11 @@ describe('migration tracking schema projection', () => {
         },
       ],
     });
-    const source = fixture([shaped, inbound]);
-    const result = prepareMigrationSchema(source, 'custom_migration');
-    assert.deepEqual(result.schema.models, [inbound]);
-    assert.deepEqual(result.tracking.model, { id: 'tracking-model' });
-    assert.equal(
-      projectMigrationSchema(source, result.tracking).hash,
-      result.schema.hash,
+    const result = withoutTrackingModel(
+      fixture([shaped, inbound]),
+      'custom_migration',
     );
+    assert.deepEqual(result.models, [inbound]);
+    assert.equal(result.hash, fixture([inbound]).hash);
   });
 });

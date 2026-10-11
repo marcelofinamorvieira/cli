@@ -103,7 +103,6 @@ async function planned(source: RecordState[], target: RecordState[]) {
       modelIds: [STRICT, LENIENT, PLAIN],
       uploads: 'referenced',
       includeDeletions: false,
-      allowPartial: false,
     },
   });
   return plan;

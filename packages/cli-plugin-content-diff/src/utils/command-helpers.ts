@@ -1,11 +1,5 @@
 import { lstat, stat } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
-import {
-  CmaClient,
-  type LogLevelFlagEnum,
-  type ProfileConfig,
-  logLevelMap,
-} from '@datocms/cli-utils';
 import { camelCase } from 'lodash';
 import { ContentError, contentErrorReport, exitStatus } from '../engine/errors';
 
@@ -25,18 +19,6 @@ export function jsonFailure(
   return { error: contentErrorReport(error) };
 }
 
-/**
- * The native request log level, except that `--output` does not silence it:
- * in this plugin it names a file, not an output format.
- */
-export function requestLogLevel(
-  flags: { json?: boolean; 'log-level'?: LogLevelFlagEnum },
-  profile?: ProfileConfig,
-): CmaClient.LogLevel {
-  const level = flags['log-level'] ?? profile?.logLevel;
-  return flags.json || !level ? CmaClient.LogLevel.NONE : logLevelMap[level];
-}
-
 async function assertOutputAbsent(path: string): Promise<void> {
   try {
     await lstat(path);
@@ -51,9 +33,9 @@ async function assertOutputAbsent(path: string): Promise<void> {
 }
 
 /**
- * The path of a dump or diff zip: `--output` when it names a .zip file,
+ * The path of a dump or diff zip: `--out` when it names a .zip file,
  * otherwise `<seconds>_<name>.<kind>-records.zip` (or `-records-assets.zip`
- * when it carries asset files) in `--output` or the default directory. Both
+ * when it carries asset files) in `--out` or the default directory. Both
  * names are checked to be free before any work starts.
  */
 export async function outputPath(args: {

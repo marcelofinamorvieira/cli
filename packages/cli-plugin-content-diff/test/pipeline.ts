@@ -76,7 +76,7 @@ export async function diff(
       join(directory, 'source'),
       args.sourceSchema,
       args.source,
-      { models: new Set(args.options.modelIds), payloadSchema: targetSchema },
+      { models: new Set(args.options.modelIds) },
     );
     const target = await sideIndex(
       join(directory, 'target'),
@@ -108,7 +108,6 @@ export async function writeTestDiff(
   name = 'test.diff-records.zip',
 ): Promise<string> {
   const path = join(directory, name);
-  const tracking = { apiKey: 'schema_migration', model: null };
   await writeDiff({
     path,
     manifest: {
@@ -116,8 +115,7 @@ export async function writeTestDiff(
       source: { kind: 'environment', ...plan.metadata.source },
       destination: plan.metadata.destination,
       schemaHash: plan.metadata.schema.hash,
-      sourceTracking: tracking,
-      destinationTracking: tracking,
+      trackingModelApiKey: 'schema_migration',
       options: plan.metadata.options,
       counts: plan.metadata.counts,
     },

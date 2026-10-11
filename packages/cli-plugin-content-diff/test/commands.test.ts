@@ -67,23 +67,25 @@ function schemaState(environmentId = 'source'): SchemaState {
   };
 }
 
-/** A project whose root client lists `ids`, the first one primary. */
-function project(
-  ids: string[],
-  client: (id: string) => unknown = (id) => ({ id }),
-) {
+/** A root client that lists `ids`, the first one primary. */
+function listing(ids: string[]) {
   return {
-    rootClient: {
-      environments: {
-        list: async () =>
-          ids.map((id, index) => ({ id, meta: { primary: index === 0 } })),
-      },
+    environments: {
+      list: async () =>
+        ids.map((id, index) => ({ id, meta: { primary: index === 0 } })),
     },
-    buildEnvironmentClient: client,
-  } as unknown as ContentGenerationArguments['destination']['endpoint'];
+  };
 }
 
-const none = { create: 0, update: 0, delete: 0, noop: 0, skip: 0 };
+/**
+ * A stand-in for the native `buildClient`: a client that records the options
+ * it was built with and lists `ids`.
+ */
+function clientBuilder(ids: string[] = []) {
+  return async (options: object) => ({ options, ...listing(ids) });
+}
+
+const none = { create: 0, update: 0, delete: 0, noop: 0 };
 /**
  * A command whose root client is built from the native client options, as
  * `CmaClientCommand.init` builds it, counting how often they are resolved.
@@ -92,6 +94,7 @@ async function nativeClientCommand(
   Command: { prototype: object },
   args: Record<string, string>,
   flags: Record<string, unknown>,
+  members: object = {},
 ) {
   let resolutions = 0;
   const command = instance(Command, {
@@ -104,6 +107,7 @@ async function nativeClientCommand(
     log: () => undefined,
     logToStderr: () => undefined,
     jsonEnabled: () => true,
+    ...members,
   });
   const native = Reflect.get(
     CmaClientCommand.prototype,
@@ -133,8 +137,12 @@ interface Rejection {
   status: number;
 }
 
-/** Runs each case through the CLI, with and without --json, without a token. */
-async function assertRejectedBeforeAuthentication(
+/**
+ * Runs each case through the CLI, with and without --json. No case may get
+ * as far as a token lookup failure or a request: cases that must pass the
+ * native init carry a placeholder token, which must never be printed.
+ */
+async function assertRejectedBeforeAnyRequest(
   cases: Rejection[],
 ): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), 'content-command-parse-'));
@@ -204,9 +212,9 @@ describe('content command integration', () => {
     assert.throws(() => environmentId('missing', []));
   });
 
-  for (const pairedProfiles of [false, true]) {
+  for (const sourceProfile of [false, true]) {
     it(`rejects incompatible schemas before capturing content with ${
-      pairedProfiles ? 'paired profiles' : 'one profile'
+      sourceProfile ? 'a source profile' : 'one project'
     }`, async () => {
       const directory = await mkdtemp(
         join(tmpdir(), 'content-command-schema-'),
@@ -242,18 +250,17 @@ describe('content command integration', () => {
           flags: {
             source: 'source',
             destination: 'target',
-            output: join(directory, 'diff.zip'),
+            out: join(directory, 'diff.zip'),
             'item-types': 'article',
             concurrency: 4,
-            ...(pairedProfiles
-              ? {
-                  'source-profile': 'source',
-                  'destination-profile': 'target',
-                }
+            ...(sourceProfile
+              ? { 'source-profile': 'source', 'source-api-token': 'token' }
               : {}),
           },
         }),
-        endpoint: async () => project(['target', 'source']),
+        datoConfig: sourceProfile ? { profiles: { source: {} } } : undefined,
+        client: listing(['target', 'source']),
+        buildClient: clientBuilder(['target', 'source']),
         jsonEnabled: () => true,
       });
       try {
@@ -287,28 +294,17 @@ describe('content command integration', () => {
     const directory = await mkdtemp(
       join(tmpdir(), 'content-command-generation-'),
     );
-    const endpoints = {
-      source: { project: 'source' },
-      destination: { project: 'destination' },
-    };
+    const destinationClient = { project: 'destination' };
     const result = {
       diffPath: join(directory, '1700000000_syncFaqContent.diff-records.zip'),
       sourceEnvironmentId: 'source',
       destinationEnvironmentId: 'main',
       counts: {
-        record: { ...none, update: 2, skip: 1 },
+        record: { ...none, update: 2 },
         upload: none,
         collection: none,
       },
       operations: 5,
-      skipped: [
-        {
-          kind: 'record' as const,
-          id: 'cycle',
-          code: 'PUBLICATION_CYCLE',
-          message: 'Record cycle is in a publication cycle.',
-        },
-      ],
     };
     let calls = 0;
     replace(Date, 'now', () => 1_700_000_000_000);
@@ -317,24 +313,49 @@ describe('content command integration', () => {
       'generateContentDiff',
       async (args: ContentGenerationArguments) => {
         calls++;
-        const { signal, progress, outputPath, ...options } = args;
+        const {
+          signal,
+          progress,
+          outputPath,
+          source,
+          destination,
+          ...options
+        } = args;
         assert.ok(signal instanceof AbortSignal);
         assert.deepEqual(options, {
-          source: { endpoint: endpoints.source, environment: 'source' },
-          destination: {
-            endpoint: endpoints.destination,
-            environment: 'primary',
-          },
           sourceMigrationModelApiKey: 'source_migration',
           destinationMigrationModelApiKey: 'destination_migration',
           options: {
             itemTypes: 'article',
             uploads: 'all',
             includeDeletions: true,
-            allowPartial: true,
             concurrency: 3,
           },
         });
+        if (!('endpoint' in source)) assert.fail('the source is live');
+        assert.equal(source.environment, 'source');
+        assert.equal(destination.environment, 'primary');
+        // The source project gets its own clients, from its profile and
+        // token; the destination reuses the native one.
+        assert.deepEqual(source.endpoint.rootClient, {
+          options: {
+            apiToken: 'source-token',
+            baseUrl: 'http://source.invalid',
+            environment: undefined,
+          },
+        });
+        assert.deepEqual(await source.endpoint.buildEnvironmentClient('x'), {
+          options: {
+            apiToken: 'source-token',
+            baseUrl: 'http://source.invalid',
+            environment: 'x',
+          },
+        });
+        assert.equal(destination.endpoint.rootClient, destinationClient);
+        assert.deepEqual(
+          await destination.endpoint.buildEnvironmentClient('main'),
+          { options: { environment: 'main' } },
+        );
         // A diff that carries asset files gets its own name.
         assert.deepEqual(
           [outputPath(false), outputPath(true)],
@@ -357,11 +378,17 @@ describe('content command integration', () => {
         const command = instance(ContentDiffCommand, {
           datoConfig: {
             profiles: {
-              source: { migrations: { modelApiKey: 'source_migration' } },
+              source: {
+                baseUrl: 'http://source.invalid',
+                migrations: { modelApiKey: 'source_migration' },
+              },
               destination: {
                 migrations: { modelApiKey: 'destination_migration' },
               },
             },
+          },
+          datoProfileConfig: {
+            migrations: { modelApiKey: 'destination_migration' },
           },
           parse: async () => ({
             args: { NAME: 'sync FAQ content' },
@@ -369,41 +396,32 @@ describe('content command integration', () => {
               source: 'source',
               destination: 'primary',
               'source-profile': 'source',
-              'destination-profile': 'destination',
-              output: directory,
+              'source-api-token': 'source-token',
+              out: directory,
               'item-types': 'article',
               uploads: 'all',
               'include-deletions': true,
-              'allow-partial': true,
               concurrency: 3,
             },
           }),
-          endpoint: async (profile: keyof typeof endpoints) =>
-            endpoints[profile],
+          client: destinationClient,
+          buildClient: async (options: object) => ({ options }),
           jsonEnabled: () => json,
           // oclif's log and logToStderr print nothing under --json.
           log: (message: string) => json || output.push(message),
           logToStderr: (message: string) => json || progress.push(message),
         });
         assert.equal(await command.run(), result);
-        assert.deepEqual(
-          progress,
-          json
-            ? []
-            : [
-                'Generation progress.',
-                'Skipped record cycle (PUBLICATION_CYCLE): Record cycle is in a publication cycle.',
-              ],
-        );
+        assert.deepEqual(progress, json ? [] : ['Generation progress.']);
         assert.deepEqual(
           output,
           json
             ? []
             : [
                 `Content diff: ${result.diffPath} (5 operations)`,
-                'record: 0 create, 2 update, 0 delete, 0 noop, 1 skip',
-                'upload: 0 create, 0 update, 0 delete, 0 noop, 0 skip',
-                'collection: 0 create, 0 update, 0 delete, 0 noop, 0 skip',
+                'record: 0 create, 2 update, 0 delete, 0 noop',
+                'upload: 0 create, 0 update, 0 delete, 0 noop',
+                'collection: 0 create, 0 update, 0 delete, 0 noop',
               ],
         );
       }
@@ -416,7 +434,6 @@ describe('content command integration', () => {
   it('passes a source dump through with the destination endpoint and profile', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'content-command-dump-'));
     const destination = { project: 'destination' };
-    const requested: unknown[][] = [];
     replace(
       generation,
       'generateContentDiff',
@@ -424,7 +441,11 @@ describe('content command integration', () => {
         assert.deepEqual(args.source, {
           dump: resolve('backup.dump-records.zip'),
         });
-        assert.equal(args.destination.endpoint, destination);
+        assert.equal(args.destination.endpoint.rootClient, destination);
+        assert.deepEqual(
+          await args.destination.endpoint.buildEnvironmentClient('main'),
+          { options: { environment: 'main' } },
+        );
         assert.equal(args.destination.environment, 'main');
         // The dump carries no profile: the destination's tracking model
         // names the one it leaves out.
@@ -432,7 +453,6 @@ describe('content command integration', () => {
         assert.equal(args.destinationMigrationModelApiKey, 'tracking');
         return {
           counts: { record: none, upload: none, collection: none },
-          skipped: [],
         };
       },
     );
@@ -444,21 +464,20 @@ describe('content command integration', () => {
           flags: {
             'source-dump': 'backup.dump-records.zip',
             destination: 'main',
-            output: directory,
+            out: directory,
             'item-types': 'all',
             uploads: 'referenced',
             concurrency: 4,
           },
         }),
-        endpoint: async (...args: unknown[]) => {
-          requested.push(args);
-          return destination;
-        },
+        client: destination,
+        buildClient: async (options: object) => ({ options }),
+        // Only the destination project is authenticated.
+        requireDatoConfig: () =>
+          assert.fail('a dump source must not resolve a source profile'),
         jsonEnabled: () => true,
       });
       await command.run();
-      // Only the destination project is authenticated.
-      assert.deepEqual(requested, [[]]);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -476,20 +495,20 @@ describe('content command integration', () => {
     const name = `${timestamp}_syncFaqContent.diff-records.zip`;
     const cases = [
       {
-        output: join(directory, 'explicit.zip'),
+        out: join(directory, 'explicit.zip'),
         profiles: undefined,
         selected: undefined,
         path: join(directory, 'explicit.zip'),
       },
       {
-        output: directory,
+        out: directory,
         profiles: undefined,
         selected: undefined,
         path: join(directory, name),
       },
       // The name of a diff carrying asset files is reserved too.
       {
-        output: join(directory, 'assets'),
+        out: join(directory, 'assets'),
         profiles: undefined,
         selected: undefined,
         path: join(
@@ -499,24 +518,22 @@ describe('content command integration', () => {
         ),
       },
       {
-        output: undefined,
+        out: undefined,
         profiles: undefined,
         selected: undefined,
         path: join(directory, 'migrations', 'content', name),
       },
       {
-        output: undefined,
+        out: undefined,
         profiles: undefined,
         selected: { migrations: { directory: '../single-profile' } },
         path: join(directory, 'single-profile', 'content', name),
       },
+      // The destination profile's directory, never the source profile's.
       {
-        output: undefined,
-        profiles: {
-          source: { migrations: { directory: '../wrong-source' } },
-          destination: { migrations: { directory: '../destination-profile' } },
-        },
-        selected: undefined,
+        out: undefined,
+        profiles: { source: { migrations: { directory: '../wrong-source' } } },
+        selected: { migrations: { directory: '../destination-profile' } },
         path: join(directory, 'destination-profile', 'content', name),
       },
     ];
@@ -530,21 +547,18 @@ describe('content command integration', () => {
             args: { NAME: 'sync FAQ content' },
             flags: {
               source: 'source',
-              output: entry.output,
+              out: entry.out,
               concurrency: 4,
-              ...(entry.profiles
-                ? {
-                    'source-profile': 'source',
-                    'destination-profile': 'destination',
-                  }
-                : {}),
+              ...(entry.profiles ? { 'source-profile': 'source' } : {}),
             },
           }),
           datoConfigPath: join(nested, 'datocms.config.json'),
           datoConfig: entry.profiles ? { profiles: entry.profiles } : undefined,
           datoProfileConfig: entry.selected,
-          endpoint: async () =>
-            assert.fail('existing output must fail before authentication'),
+          buildClient: async () =>
+            assert.fail(
+              'existing output must fail before the source project is authenticated',
+            ),
           jsonEnabled: () => true,
         });
         await assert.rejects(command.run(), (error: ContentError) => {
@@ -562,7 +576,7 @@ describe('content command integration', () => {
     }
   });
 
-  it('projects each configured migration tracking model from capture and planning', async () => {
+  it("leaves each profile's migration tracking model out of capture and planning", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), 'content-command-tracking-'),
     );
@@ -608,31 +622,30 @@ describe('content command integration', () => {
       assert.equal(target.schema.models.length, 3);
       throw new Error('projection verified');
     });
-    const endpoints: Record<string, unknown> = {
-      source: project(['source']),
-      destination: project(['destination']),
-    };
     const command = instance(ContentDiffCommand, {
       datoConfig: {
         profiles: {
           source: { migrations: { modelApiKey: 'source_migration' } },
-          destination: { migrations: { modelApiKey: 'destination_migration' } },
         },
+      },
+      datoProfileConfig: {
+        migrations: { modelApiKey: 'destination_migration' },
       },
       parse: async () => ({
         args: { NAME: 'content' },
         flags: {
           source: 'source',
           destination: 'destination',
-          output: join(directory, 'diff.zip'),
+          out: join(directory, 'diff.zip'),
           'source-profile': 'source',
-          'destination-profile': 'destination',
+          'source-api-token': 'source-token',
           'item-types': 'all',
           uploads: 'referenced',
           concurrency: 4,
         },
       }),
-      endpoint: async (profile: string) => endpoints[profile],
+      client: listing(['destination']),
+      buildClient: clientBuilder(['source']),
       jsonEnabled: () => true,
     });
     try {
@@ -681,7 +694,7 @@ describe('content command integration', () => {
       instance(ContentExportCommand, {
         parse: async () => ({
           args: { NAME: 'nightly backup' },
-          flags: { output: directory, concurrency: 3, ...flags },
+          flags: { out: directory, concurrency: 3, ...flags },
         }),
         client: {
           environments: {
@@ -789,19 +802,19 @@ describe('content command integration', () => {
     assert.deepEqual(defaults.args, { NAME: 'dump' });
     assert.equal(defaults.flags.environment, 'primary');
     assert.equal(defaults.flags['include-assets'], false);
-    assert.equal(defaults.flags.output, undefined);
+    assert.equal(defaults.flags.out, undefined);
     assert.equal(defaults.flags.concurrency, 8);
     const given = await parse([
       'backup',
       '--environment=staging',
       '--include-assets',
-      '--output=./backups',
+      '--out=./backups',
       '--concurrency=16',
     ]);
     assert.deepEqual(given.args, { NAME: 'backup' });
     assert.equal(given.flags.environment, 'staging');
     assert.equal(given.flags['include-assets'], true);
-    assert.equal(given.flags.output, './backups');
+    assert.equal(given.flags.out, './backups');
     assert.equal(given.flags.concurrency, 16);
   });
 
@@ -832,13 +845,88 @@ describe('content command integration', () => {
     assert.equal(resolutions(), 1);
   });
 
+  it('builds content:diff clients for the source project and the destination from the native client options', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'content-command-tokens-'));
+    const { command, resolutions } = await nativeClientCommand(
+      ContentDiffCommand,
+      { NAME: 'contentMigration' },
+      {
+        source: 'source',
+        destination: 'primary',
+        out: directory,
+        'source-profile': 'one',
+        'source-api-token': 'source-token',
+        'item-types': 'all',
+        uploads: 'referenced',
+        concurrency: 4,
+      },
+      {
+        datoConfig: { profiles: { one: { baseUrl: 'http://source.invalid' } } },
+      },
+    );
+    replace(
+      generation,
+      'generateContentDiff',
+      async (args: ContentGenerationArguments) => {
+        if (!('endpoint' in args.source)) assert.fail('the source is live');
+        assert.equal(args.destination.endpoint.rootClient, command.client);
+        assert.deepEqual(
+          [
+            args.source.endpoint.rootClient,
+            await args.source.endpoint.buildEnvironmentClient('staging'),
+            args.destination.endpoint.rootClient,
+            await args.destination.endpoint.buildEnvironmentClient('main'),
+          ].map(clientOptions),
+          [
+            [
+              'source-token',
+              'http://source.invalid',
+              CmaClient.LogLevel.BODY,
+              undefined,
+            ],
+            [
+              'source-token',
+              'http://source.invalid',
+              CmaClient.LogLevel.BODY,
+              'staging',
+            ],
+            [
+              'native-token',
+              'http://127.0.0.1:9',
+              CmaClient.LogLevel.BODY,
+              undefined,
+            ],
+            [
+              'native-token',
+              'http://127.0.0.1:9',
+              CmaClient.LogLevel.BODY,
+              'main',
+            ],
+          ],
+        );
+        return {
+          diffPath: join(directory, 'diff.zip'),
+          sourceEnvironmentId: 'source',
+          destinationEnvironmentId: 'main',
+          counts: { record: none, upload: none, collection: none },
+          operations: 0,
+        };
+      },
+    );
+    try {
+      await command.run();
+      assert.equal(resolutions(), 1);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('reports preflight without running operations and keeps JSON output quiet', async () => {
     const preview: PreflightResult = {
       preflightOnly: true,
       environmentId: 'main',
       executed: false,
       operations: 3,
-      partial: true,
       generatedCounts: {
         record: { ...none, update: 2 },
         upload: none,
@@ -885,7 +973,6 @@ describe('content command integration', () => {
           ? []
           : [
               'Preflight checks passed against environment "main" for 3 operations. Nothing was run.',
-              'Partial diff: generation omitted unsupported content.',
             ],
       );
     }
@@ -896,63 +983,86 @@ describe('content command integration', () => {
       environmentId: 'isolated',
       executed: true,
       operations: 2,
-      partial: false,
     };
-    replace(
-      apply,
-      'applyContentDiff',
-      async (args: Parameters<typeof apply.applyContentDiff>[0]) => {
-        assert.equal(args.diffPath, './diff.zip');
-        const { signal, ...options } = args.options;
-        assert.ok(signal instanceof AbortSignal);
-        assert.equal(signal.aborted, false);
-        assert.deepEqual(
-          { ...options, log: undefined },
-          {
-            inPlace: false,
-            allowPrimary: false,
-            keepFailedFork: true,
-            destinationEnvironmentId: 'target',
-            concurrency: 2,
-            fastFork: false,
-            log: undefined,
-          },
-        );
-        return result;
-      },
-    );
-    const command = instance(ContentApplyCommand, {
-      parse: async () => ({
-        args: { FILE: './diff.zip' },
-        flags: {
-          destination: 'target',
-          'in-place': false,
-          'allow-primary': false,
-          'fast-fork': false,
-          'keep-failed-fork': true,
-          concurrency: 2,
+    // Fast forks and forcing them are off unless asked for.
+    for (const [flags, expected] of [
+      [{}, { fastFork: false, force: false }],
+      [
+        { 'fast-fork': true, force: true },
+        { fastFork: true, force: true },
+      ],
+    ] as const) {
+      replace(
+        apply,
+        'applyContentDiff',
+        async (args: Parameters<typeof apply.applyContentDiff>[0]) => {
+          assert.equal(args.diffPath, './diff.zip');
+          const { signal, ...options } = args.options;
+          assert.ok(signal instanceof AbortSignal);
+          assert.equal(signal.aborted, false);
+          assert.deepEqual(
+            { ...options, log: undefined },
+            {
+              inPlace: false,
+              allowPrimary: false,
+              keepFailedFork: true,
+              destinationEnvironmentId: 'target',
+              concurrency: 2,
+              ...expected,
+              log: undefined,
+            },
+          );
+          return result;
         },
-      }),
-      client: {},
-      buildBaseClientInitializationOptions: async () => ({
-        apiToken: 'fixture-token',
-      }),
-      jsonEnabled: () => true,
-    });
-    assert.deepEqual(await command.run(), result);
+      );
+      const command = instance(ContentApplyCommand, {
+        parse: async () => ({
+          args: { FILE: './diff.zip' },
+          flags: {
+            destination: 'target',
+            'in-place': false,
+            'allow-primary': false,
+            'keep-failed-fork': true,
+            concurrency: 2,
+            ...flags,
+          },
+        }),
+        client: {},
+        buildBaseClientInitializationOptions: async () => ({
+          apiToken: 'fixture-token',
+        }),
+        jsonEnabled: () => true,
+      });
+      assert.deepEqual(await command.run(), result);
+    }
   });
 
-  it('creates fast forks unless --no-fast-fork is given', async () => {
-    const parse = async (argv: string[]) =>
-      (
-        await oclif.Parser.parse(argv, {
-          args: ContentApplyCommand.args,
-          flags: ContentApplyCommand.flags,
-        })
-      ).flags['fast-fork'];
-    assert.equal(await parse(['./diff.zip']), true);
-    assert.equal(await parse(['./diff.zip', '--no-fast-fork']), false);
-    assert.equal(await parse(['./diff.zip', '--fast-fork']), true);
+  it('parses --fast-fork and --force as opt-ins, --force only beside --fast-fork', async () => {
+    const parse = async (argv: string[]) => {
+      const { flags } = await oclif.Parser.parse(argv, {
+        args: ContentApplyCommand.args,
+        flags: ContentApplyCommand.flags,
+      });
+      return [flags['fast-fork'], flags.force, flags['fork-name']];
+    };
+    assert.deepEqual(await parse(['./diff.zip']), [
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    assert.deepEqual(await parse(['./diff.zip', '--fast-fork']), [
+      true,
+      undefined,
+      undefined,
+    ]);
+    assert.deepEqual(
+      await parse(['./diff.zip', '--fast-fork', '--force', '--fork-name=qa']),
+      [true, true, 'qa'],
+    );
+    await assert.rejects(
+      parse(['./diff.zip', '--force']),
+      /All of the following must be provided when using --force: --fast-fork/,
+    );
   });
 
   it('builds content:apply environment clients from the native client options', async () => {
@@ -974,8 +1084,8 @@ describe('content command integration', () => {
         assert.deepEqual(
           [
             args.rootClient,
-            args.buildEnvironmentClient('review'),
-            args.buildEnvironmentClient('main'),
+            await args.buildEnvironmentClient('review'),
+            await args.buildEnvironmentClient('main'),
           ].map(clientOptions),
           [undefined, 'review', 'main'].map((environment) => [
             'native-token',
@@ -988,7 +1098,6 @@ describe('content command integration', () => {
           environmentId: 'review',
           executed: true,
           operations: 0,
-          partial: false,
         };
       },
     );
@@ -996,57 +1105,11 @@ describe('content command integration', () => {
     assert.equal(resolutions(), 1);
   });
 
-  it('passes each paired profile its own endpoint API token', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'content-command-tokens-'));
-    const requested: [string | undefined, string | undefined][] = [];
-    const command = instance(ContentDiffCommand, {
-      parse: async () => ({
-        args: { NAME: 'contentMigration' },
-        flags: {
-          source: 'source',
-          destination: 'primary',
-          output: directory,
-          'source-profile': 'one',
-          'destination-profile': 'two',
-          'source-api-token': 'source-token',
-          'destination-api-token': 'destination-token',
-          'item-types': 'all',
-          uploads: 'referenced',
-          concurrency: 4,
-        },
-      }),
-      endpoint: async (profileId?: string, apiToken?: string) => {
-        requested.push([profileId, apiToken]);
-        return {
-          rootClient: {
-            environments: {
-              list: async () => {
-                throw new Error('stop after endpoint selection');
-              },
-            },
-          },
-          buildEnvironmentClient: () => ({}),
-        };
-      },
-      jsonEnabled: () => true,
-    });
-    try {
-      await assert.rejects(command.run(), /stop after endpoint selection/);
-      assert.deepEqual(requested.sort(), [
-        ['one', 'source-token'],
-        ['two', 'destination-token'],
-      ]);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it('reports a partial diff and a kept fork in human-readable output', async () => {
+  it('reports the run and a kept fork in human-readable output', async () => {
     let outcome: unknown = {
       environmentId: 'isolated',
       executed: true,
       operations: 4,
-      partial: true,
     };
     replace(
       apply,
@@ -1086,15 +1149,14 @@ describe('content command integration', () => {
       environmentId: 'isolated',
       executed: true,
       operations: 1,
-      partial: false,
     };
     await command('./diff.zip').run();
     assert.deepEqual(logged, [
-      'Ran 4 operations in environment "isolated" (generation omitted unsupported content).',
-      'Ran 4 operations in environment "isolated" (generation omitted unsupported content).',
+      'Ran 4 operations in environment "isolated".',
+      'Ran 4 operations in environment "isolated".',
       'Ran 1 operations in environment "isolated".',
     ]);
-    outcome = new ContentError('APPLY_FAILED', 'Injected failure.');
+    outcome = new ContentError('FORK_FAILED', 'Injected failure.');
     await assert.rejects(command('./diff.zip').run(), /Injected failure/);
     assert.deepEqual(progress, ['Kept failed fork content-apply-kept']);
   });
@@ -1115,7 +1177,7 @@ describe('content command integration', () => {
       try {
         for (const error of [
           Object.assign(
-            new ContentError('APPLY_FAILED', 'Request failed.', {
+            new ContentError('CMA_REQUEST_FAILED', 'Request failed.', {
               step: 'records',
             }),
             { keptForkEnvironmentId: 'content-apply-kept' },
@@ -1147,7 +1209,7 @@ describe('content command integration', () => {
           error: {
             name: 'ContentError',
             message: 'Request failed.',
-            code: 'APPLY_FAILED',
+            code: 'CMA_REQUEST_FAILED',
             details: { step: 'records' },
             keptForkEnvironmentId: 'content-apply-kept',
           },
@@ -1184,63 +1246,25 @@ describe('content command integration', () => {
       await assert.rejects(human.catch(failure), (error) => error === failure);
     });
 
-  // Unlike CmaClientCommand, these commands' --output names a file, not an
-  // output format, so it does not silence request logs.
-  for (const [name, Command, level] of [
-    [
-      'content:diff',
-      ContentDiffCommand,
-      async (command: {
-        endpoint(): Promise<{ rootClient: CmaClient.Client }>;
-      }) => (await command.endpoint()).rootClient.config.logLevel,
-    ],
-    [
-      'content:export',
-      ContentExportCommand,
-      async (command: {
-        buildBaseClientInitializationOptions(): Promise<{ logLevel?: unknown }>;
-      }) => (await command.buildBaseClientInitializationOptions()).logLevel,
-    ],
-  ] as const)
-    it(`honors --log-level for ${name} despite its --output flag`, async () => {
-      const levels: unknown[] = [];
-      for (const [flags, profile] of [
-        [{ 'log-level': 'BODY' }, undefined],
-        [{}, { logLevel: 'BASIC' }],
-        [{ 'log-level': 'BODY', json: true }, undefined],
-        [{}, undefined],
-      ] as const) {
-        const command = instance(Command, {
-          parse: async () => ({
-            flags: {
-              source: 'source',
-              output: './diff.zip',
-              'api-token': 'placeholder-token',
-              ...flags,
-            },
-          }),
-          profileId: 'default',
-          datoProfileConfig: profile,
-        });
-        levels.push(await level(command));
-      }
-      assert.deepEqual(levels, [
-        CmaClient.LogLevel.BODY,
-        CmaClient.LogLevel.BASIC,
-        CmaClient.LogLevel.NONE,
-        CmaClient.LogLevel.NONE,
-      ]);
-    });
-
   it('rejects incompatible or unknown CLI flags before resolving client authentication', () =>
-    assertRejectedBeforeAuthentication([
+    assertRejectedBeforeAnyRequest([
       ...['versions', 'full'].map((verification) => ({
         args: ['content:diff', '--source=a', `--verification=${verification}`],
         message: /Nonexistent flag: --verification/,
         status: 2,
       })),
+      ...[
+        '--output=b',
+        '--destination-profile=two',
+        '--allow-partial',
+        '--chunk-bytes=1024',
+      ].map((flag) => ({
+        args: ['content:diff', '--source=a', flag],
+        message: new RegExp(`Nonexistent flag: ${flag.split('=')[0]}`),
+        status: 2,
+      })),
       {
-        args: ['content:diff', '--output=b'],
+        args: ['content:diff', '--out=b'],
         message:
           /Exactly one of the following must be provided: --source, --source-dump/,
         status: 2,
@@ -1251,94 +1275,26 @@ describe('content command integration', () => {
         status: 2,
       },
       {
-        args: [
-          'content:diff',
-          '--source-dump=b.zip',
-          '--source-profile=one',
-          '--destination-profile=two',
-        ],
+        args: ['content:diff', '--source-dump=b.zip', '--source-profile=one'],
         message:
           /--source-profile=one cannot also be provided when using --source-dump/,
         status: 2,
       },
       {
-        args: [
-          'content:diff',
-          '--source=a',
-          '--output=b',
-          '--source-profile=one',
-        ],
-        message:
-          /All of the following must be provided when using --source-profile: --destination-profile/,
-        status: 2,
-      },
-      {
-        args: [
-          'content:diff',
-          '--source=a',
-          '--output=b',
-          '--source-profile=',
-          '--destination-profile=two',
-        ],
-        message: /Both source and destination profiles must be nonempty\./,
-        status: 2,
-      },
-      {
-        args: [
-          'content:diff',
-          '--source=a',
-          '--output=b',
-          '--source-profile=one',
-          '--destination-profile=two',
-          '--profile=three',
-        ],
-        message: /--profile and --api-token select a single project\./,
-        status: 2,
-      },
-      {
-        args: [
-          'content:diff',
-          '--source=a',
-          '--output=b',
-          '--source-profile=one',
-          '--destination-profile=two',
-          '--api-token=placeholder-flag-token',
-        ],
-        message: /--profile and --api-token select a single project\./,
-        status: 2,
-      },
-      {
-        args: ['content:diff', '--source=a', '--output=b', '--concurrency=0'],
+        args: ['content:diff', '--source=a', '--out=b', '--concurrency=0'],
         message: /Expected an integer greater than or equal to 1/,
         status: 2,
       },
       {
-        args: ['content:diff', '--source=a', '--output=b', '--concurrency=17'],
+        args: ['content:diff', '--source=a', '--out=b', '--concurrency=17'],
         message: /Expected an integer less than or equal to 16/,
         status: 2,
       },
       {
-        args: ['content:diff', '--source=a', '--chunk-bytes=1024'],
-        message: /Nonexistent flag: --chunk-bytes/,
-        status: 2,
-      },
-      {
-        args: ['content:diff', '!!!', '--source=a', '--output=b'],
-        message: /name must contain letters or numbers/,
-        code: 'INVALID_NAME',
-        status: 1,
-      },
-      ...['script.js', 'sync.tsx', 'migration.ts'].map((output) => ({
-        args: ['content:diff', '--source=a', `--output=${output}`],
-        message: /output must be a \.zip file or a directory/,
-        code: 'INVALID_OUTPUT_PATH',
-        status: 1,
-      })),
-      {
         args: [
           'content:diff',
           '--source=a',
-          '--output=b',
+          '--out=b',
           '--api-token=placeholder-flag-token',
           '--autogenerate=schema',
         ],
@@ -1372,16 +1328,29 @@ describe('content command integration', () => {
         status: 2,
       },
       {
-        args: ['content:apply', './diff.zip', '--verification=full'],
-        message: /Nonexistent flag: --verification/,
+        args: ['content:apply', './diff.zip', '--force'],
+        message:
+          /All of the following must be provided when using --force: --fast-fork/,
         status: 2,
       },
+      ...['--verification=full', '--no-fast-fork'].map((flag) => ({
+        args: ['content:apply', './diff.zip', flag],
+        message: new RegExp(`Nonexistent flag: ${flag.split('=')[0]}`),
+        status: 2,
+      })),
       ...['./migration.ts', './migration.content'].map((file) => ({
         args: ['content:apply', file],
         message: /Pass the \.zip diff written by content:diff/,
         code: 'INVALID_DIFF_PATH',
         status: 1,
       })),
+      {
+        args: ['content:apply', './diff.zip', '--fork-name=Review_1'],
+        message:
+          /fork name can only contain lowercase letters, numbers and dashes/,
+        code: 'INVALID_FORK_NAME',
+        status: 1,
+      },
       {
         args: ['content:export', '--concurrency=0'],
         message: /Expected an integer greater than or equal to 1/,
@@ -1397,10 +1366,39 @@ describe('content command integration', () => {
         message: /Nonexistent flag: --source=a/,
         status: 2,
       },
-    ])).timeout(240_000);
+    ])).timeout(300_000);
+
+  // content:diff checks its name and output path in `run`, after the native
+  // init resolved the token, but still before any request.
+  it('rejects content:diff names and output paths before any request', () =>
+    assertRejectedBeforeAnyRequest([
+      {
+        args: [
+          'content:diff',
+          '!!!',
+          '--source=a',
+          '--out=b',
+          '--api-token=placeholder-flag-token',
+        ],
+        message: /name must contain letters or numbers/,
+        code: 'INVALID_NAME',
+        status: 1,
+      },
+      ...['script.js', 'sync.tsx', 'migration.ts'].map((out) => ({
+        args: [
+          'content:diff',
+          '--source=a',
+          `--out=${out}`,
+          '--api-token=placeholder-flag-token',
+        ],
+        message: /output must be a \.zip file or a directory/,
+        code: 'INVALID_OUTPUT_PATH',
+        status: 1,
+      })),
+    ])).timeout(120_000);
 
   it('rejects content:export names and output paths before resolving client authentication', () =>
-    assertRejectedBeforeAuthentication([
+    assertRejectedBeforeAnyRequest([
       {
         args: ['content:export', '!!!'],
         message: /name must contain letters or numbers/,
@@ -1408,7 +1406,7 @@ describe('content command integration', () => {
         status: 1,
       },
       {
-        args: ['content:export', '--output=dump.ts'],
+        args: ['content:export', '--out=dump.ts'],
         message: /output must be a \.zip file or a directory/,
         code: 'INVALID_OUTPUT_PATH',
         status: 1,
@@ -1416,7 +1414,7 @@ describe('content command integration', () => {
     ])).timeout(60_000);
 
   it('rejects a source API token beside a source dump without printing the token', () =>
-    assertRejectedBeforeAuthentication([
+    assertRejectedBeforeAnyRequest([
       {
         args: [
           'content:diff',

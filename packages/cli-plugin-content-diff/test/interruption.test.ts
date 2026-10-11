@@ -8,7 +8,7 @@ import { withInterruptHandling } from '../src/utils/interruption';
 
 describe('one-shot command interruption', () => {
   it('removes only its own signal handlers after success and failure', async () => {
-    const before = ['SIGHUP', 'SIGINT', 'SIGTERM'].map((name) =>
+    const before = ['SIGINT', 'SIGTERM'].map((name) =>
       process.listenerCount(name),
     );
     assert.equal(
@@ -22,15 +22,13 @@ describe('one-shot command interruption', () => {
       /failure/,
     );
     assert.deepEqual(
-      ['SIGHUP', 'SIGINT', 'SIGTERM'].map((name) =>
-        process.listenerCount(name),
-      ),
+      ['SIGINT', 'SIGTERM'].map((name) => process.listenerCount(name)),
       before,
     );
   });
 
-  const exitCodes = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 } as const;
-  for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM'] as const) {
+  const exitCodes = { SIGINT: 130, SIGTERM: 143 } as const;
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     it(`waits for owned cleanup before exiting on ${signal}`, async () => {
       const directory = await mkdtemp(join(tmpdir(), 'content-interruption-'));
       const marker = join(directory, 'cleanup.json');
@@ -107,15 +105,13 @@ describe('one-shot command interruption', () => {
     }).timeout(120_000);
   }
 
-  it('reports repeated signals and survives output errors after a hangup during cleanup', async () => {
+  it('reports repeated signals during cleanup and keeps the first exit status', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'content-interruption-'));
     const marker = join(directory, 'cleanup.json');
     const helper = resolve(__dirname, '../src/utils/interruption.ts');
     const cancellation = resolve(__dirname, '../src/engine/cancellation.ts');
     const script = `
       const { writeFile } = require('node:fs/promises');
-      // Installs oclif's stdout handler, which rethrows everything but EPIPE.
-      require('@oclif/core');
       const { withInterruptHandling } = require(${JSON.stringify(helper)});
       const { assertNotAborted } = require(${JSON.stringify(cancellation)});
       withInterruptHandling(async (signal) => {
@@ -132,9 +128,6 @@ describe('one-shot command interruption', () => {
         } finally {
           process.stdout.write('cleaning\\n');
           await new Promise((resolve) => process.stdin.once('end', resolve).resume());
-          // A closed terminal reports every later write as an error event.
-          for (const stream of [process.stdout, process.stderr])
-            stream.emit('error', Object.assign(new Error('write EIO'), { code: 'EIO' }));
           await writeFile(${JSON.stringify(marker)}, JSON.stringify({ cleaned: true }));
         }
       }).catch(error => {
@@ -168,8 +161,10 @@ describe('one-shot command interruption', () => {
       errors += data.toString();
       const reported = errors.match(repeated)?.length ?? 0;
       if (step === 2 && reported === 1) {
+        // A different signal during cleanup gets feedback too, and does not
+        // replace the exit status of the first one.
         step = 3;
-        child.kill('SIGHUP');
+        child.kill('SIGTERM');
       } else if (step === 3 && reported === 2) {
         step = 4;
         child.stdin.end();

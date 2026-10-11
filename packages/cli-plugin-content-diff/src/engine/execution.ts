@@ -26,8 +26,6 @@ function requestPath(url: string): string {
   }
 }
 
-const REFERENCE_CODE = /LINK|REFERENC|UNPUBLISHED|^VALIDATION_ITEMS?_/;
-
 /** Turns a CMA rejection into a reportable error. */
 export function cmaFailure(error: unknown): unknown {
   if (error instanceof CmaClient.TimeoutError) {
@@ -45,6 +43,7 @@ export function cmaFailure(error: unknown): unknown {
   const errors = error.errors.map((entry) => ({
     code: entry.attributes.code,
     details: entry.attributes.details ?? {},
+    ...(entry.attributes.doc_url && { docUrl: entry.attributes.doc_url }),
   }));
   const details = {
     method,
@@ -60,9 +59,6 @@ export function cmaFailure(error: unknown): unknown {
       details,
     );
   }
-  const codes = errors.flatMap(({ code, details }) =>
-    typeof details.code === 'string' ? [code, details.code] : [code],
-  );
   const summary =
     errors
       .map(({ code, details }) =>
@@ -71,24 +67,18 @@ export function cmaFailure(error: unknown): unknown {
           : code,
       )
       .join('; ') || `HTTP ${error.response.status}`;
+  // The CMA's own documentation of the first error says what it means.
+  const docUrl = errors.find((entry) => entry.docUrl)?.docUrl;
+  const reference = docUrl ? ` See ${docUrl}.` : '';
   if (error.response.status !== 422)
     return new ContentError(
       'CMA_REQUEST_FAILED',
-      `The CMA request ${method} ${path} failed: ${summary}.`,
+      `The CMA request ${method} ${path} failed: ${summary}.${reference}`,
       details,
-    );
-  const hints: string[] = [];
-  if (codes.includes('VALIDATION_UNIQUE'))
-    hints.push(
-      'A unique value may still be held by another record; reorder or edit the diff so that record releases it first.',
-    );
-  if (codes.some((code) => REFERENCE_CODE.test(code)))
-    hints.push(
-      'A referenced record or asset may be missing or unpublished; make sure the diff creates or publishes it first.',
     );
   return new ContentError(
     'CMA_VALIDATION_FAILED',
-    [`The CMA rejected ${method} ${path}: ${summary}.`, ...hints].join(' '),
+    `The CMA rejected ${method} ${path}: ${summary}.${reference}`,
     details,
   );
 }
@@ -236,9 +226,6 @@ async function runOperation(
       return;
     case 'folder.delete':
       await client.uploadCollections.destroy(id);
-      return;
-    case 'folders.reorder':
-      await client.uploadCollections.reorder(body(operation));
       return;
     case 'upload.create':
     case 'upload.replace': {

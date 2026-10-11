@@ -7,11 +7,11 @@ import { pipeline } from 'node:stream/promises';
 import yauzl from 'yauzl';
 import yazl from 'yazl';
 import { object } from './codec';
-import { ContentError } from './errors';
+import { ContentError, type ContentErrorCode } from './errors';
 import { textLines } from './spill';
 
 /** Entries of JSON lines are split at this size, so any one opens in an editor. */
-export const ENTRY_BYTES = 64 * 1024 * 1024;
+const ENTRY_BYTES = 64 * 1024 * 1024;
 
 /**
  * A zip written as a stream (ZIP64 where needed) to a temporary file that is
@@ -194,7 +194,12 @@ export class ZipReader {
    */
   static async openWithManifest(
     path: string,
-    expected: { code: string; format: string; version: number; name: string },
+    expected: {
+      code: ContentErrorCode;
+      format: string;
+      version: number;
+      name: string;
+    },
   ): Promise<{ zip: ZipReader; manifest: Record<string, unknown> }> {
     const zip = await ZipReader.open(path).catch((error: unknown) => {
       throw new ContentError(

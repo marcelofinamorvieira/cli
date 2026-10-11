@@ -17,28 +17,6 @@ export function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** Native integer fields retain arbitrary integers; SDK JSON numbers do not. */
-function assertIntegerFieldPrecision(
-  field: Pick<FieldSchema, 'type' | 'localized' | 'apiKey'>,
-  value: unknown,
-  modelId: string,
-): void {
-  if (field.type !== 'integer') return;
-  const check = (entry: unknown, locale?: string): void => {
-    if (typeof entry === 'number' && !Number.isSafeInteger(entry))
-      throw new ContentError(
-        'UNSUPPORTED_INTEGER_PRECISION',
-        `Integer field ${modelId}.${field.apiKey}${
-          locale ? `.${locale}` : ''
-        } cannot be represented as an exact safe integer.`,
-        { modelId, field: field.apiKey, ...(locale ? { locale } : {}) },
-      );
-  };
-  if (field.localized && object(value))
-    for (const [locale, entry] of Object.entries(value)) check(entry, locale);
-  else check(value);
-}
-
 /** Sets an own property, including `__proto__`, which plain assignment would treat as the prototype. */
 function assign(target: JsonObject, key: string, value: JsonValue): void {
   if (key === '__proto__')
@@ -204,10 +182,6 @@ function mapFields(
   const result: JsonObject = {};
   for (const field of model(schema, modelId).fields) {
     const value = fields[field.apiKey] ?? null;
-    // A rounded native integer remains outside the safe range. Refuse it
-    // before fingerprinting or writing; JSON strings and float fields retain
-    // their distinct native semantics, including inside nested blocks.
-    assertIntegerFieldPrecision(field, value, modelId);
     if (field.localized && object(value)) {
       const locales: JsonObject = {};
       for (const locale of Object.keys(value).sort())
@@ -268,35 +242,23 @@ export function recordPayloadFields(
   fields: JsonObject,
   modelId: string,
   schema: SchemaState,
-  nativeBlocks?: WeakSet<object>,
 ): JsonObject {
   return mapFields(fields, modelId, schema, (value) =>
-    nativeBlock(value, schema, nativeBlocks),
+    nativeBlock(value, schema),
   );
 }
 
 /** A canonical block as a complete native block. */
-function nativeBlock(
-  value: unknown,
-  schema: SchemaState,
-  nativeBlocks?: WeakSet<object>,
-): JsonObject {
+function nativeBlock(value: unknown, schema: SchemaState): JsonObject {
   const block = canonicalBlock(value);
-  const result: JsonObject = {
+  return {
     type: 'item',
     id: block.id,
-    attributes: recordPayloadFields(
-      block.attributes,
-      block.modelId,
-      schema,
-      nativeBlocks,
-    ),
+    attributes: recordPayloadFields(block.attributes, block.modelId, schema),
     relationships: {
       item_type: { data: { type: 'item_type', id: block.modelId } },
     },
   };
-  nativeBlocks?.add(result);
-  return result;
 }
 
 /**
@@ -320,7 +282,6 @@ export function recordUpdatePayloadFields(
     const known = before !== null && Object.hasOwn(before, key);
     const previous = known ? before[key] : null;
     if (known && hashJson(previous) === hashJson(value)) continue;
-    assertIntegerFieldPrecision(field, value, modelId);
     const convert = (next: unknown, old: unknown) =>
       fieldValue(next, field.type, updatedBlock(old, field.type, schema));
     if (field.localized && object(value)) {
@@ -376,37 +337,6 @@ function updatedBlock(
   };
 }
 
-/** Report content the SDK's recursive item request/response adapters mishandle. */
-export function unsupportedRecordPayloadKey(
-  fields: JsonObject,
-  modelId: string,
-  schema: SchemaState,
-): string | undefined {
-  // Adapt blocks first: their canonical __itemTypeId annotations are expected
-  // to disappear. An identically named key in native custom_data is content,
-  // but the SDK also removes it (and loses own __proto__ properties). JSON
-  // fields are strings in the CMA contract and remain opaque here. Track only
-  // schema-identified block wrappers: an opaque object with type='item' is
-  // mistaken for a record by the SDK response adapter after a successful write.
-  const nativeBlocks = new WeakSet<object>();
-  const pending: JsonValue[] = [
-    recordPayloadFields(fields, modelId, schema, nativeBlocks),
-  ];
-  while (pending.length) {
-    const value = pending.pop();
-    if (Array.isArray(value)) {
-      for (const item of value) pending.push(item);
-    } else if (object(value)) {
-      if (value.type === 'item' && !nativeBlocks.has(value)) return 'type';
-      for (const [key, item] of Object.entries(value)) {
-        if (key === '__itemTypeId' || key === '__proto__') return key;
-        pending.push(item as JsonValue);
-      }
-    }
-  }
-  return undefined;
-}
-
 export function recordHash(
   record: Omit<RecordState, 'hash'> | RecordState,
 ): string {
@@ -429,66 +359,27 @@ type NativeRecord = Record<string, unknown> & {
   meta: Record<string, unknown>;
 };
 
-/** A record's scheduled publication or unpublishing as the CMA returns it. */
-export interface ScheduleResource {
-  id: string;
-  type: string;
-  attributes: JsonObject;
-}
-
 /**
- * One record as the CMA returns it: its current version, its published
- * version, and its schedules. This is a line of a dump's `records` entries.
+ * One record as the CMA returns it: its current version and its published
+ * version. This is a line of a dump's `records` entries.
  */
 export interface RecordLine {
   id: string;
   current: unknown;
   published: unknown | null;
-  scheduledPublication: ScheduleResource | null;
-  scheduledUnpublishing: ScheduleResource | null;
 }
 
 function optionalTimestamp(value: unknown): string | null {
   return typeof value === 'string' ? timestamp(value) : null;
 }
 
-const sortedLocales = (value: unknown) => [...(value as string[])].sort();
-
-/** A record's schedules from the resources the CMA returns for them. */
-export function canonicalSchedules(
-  publication: ScheduleResource | null,
-  unpublishing: ScheduleResource | null,
-): Schedules {
-  const selective = publication?.attributes.selective_publication as {
-    content_in_locales: string[];
-    non_localized_content: boolean;
-  } | null;
-  const locales = unpublishing?.attributes.content_in_locales;
+/** A record's schedules from the markers of its listed current version. */
+export function canonicalSchedules(meta: Record<string, unknown>): Schedules {
+  const at = (value: unknown) =>
+    typeof value === 'string' ? { at: timestamp(value) } : null;
   return {
-    publication: publication
-      ? {
-          at: timestamp(
-            publication.attributes.publication_scheduled_at as string,
-          ),
-          selective: selective
-            ? {
-                locales: sortedLocales(selective.content_in_locales),
-                nonLocalized: selective.non_localized_content,
-              }
-            : null,
-        }
-      : null,
-    unpublishing: unpublishing
-      ? {
-          at: timestamp(
-            unpublishing.attributes.unpublishing_scheduled_at as string,
-          ),
-          locales:
-            locales === null || locales === undefined
-              ? null
-              : sortedLocales(locales),
-        }
-      : null,
+    publication: at(meta.publication_scheduled_at),
+    unpublishing: at(meta.unpublishing_scheduled_at),
   };
 }
 
@@ -497,7 +388,6 @@ export function canonicalRecord(
   current: unknown,
   published: unknown | null,
   schema: SchemaState,
-  schedules: Schedules = { publication: null, unpublishing: null },
 ): RecordState {
   const { id, meta, attributes } = current as NativeRecord;
   const pub = published as NativeRecord | null;
@@ -515,7 +405,7 @@ export function canonicalRecord(
     position:
       typeof attributes.position === 'number' ? attributes.position : null,
     stage: nullableString(meta.stage),
-    schedules,
+    schedules: canonicalSchedules(meta),
     hash: '',
   };
   const invalid = {
@@ -532,12 +422,7 @@ export function canonicalRecordLine(
   line: RecordLine,
   schema: SchemaState,
 ): RecordState {
-  return canonicalRecord(
-    line.current,
-    line.published,
-    schema,
-    canonicalSchedules(line.scheduledPublication, line.scheduledUnpublishing),
-  );
+  return canonicalRecord(line.current, line.published, schema);
 }
 
 /**

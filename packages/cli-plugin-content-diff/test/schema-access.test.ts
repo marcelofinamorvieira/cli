@@ -74,7 +74,13 @@ function fixture() {
     users: {
       findMe: async () => ({
         type: 'user',
-        role: { id: 'role', meta: { final_permissions: permissions } },
+        role: { id: 'role', type: 'role' },
+      }),
+    },
+    roles: {
+      find: async () => ({
+        id: 'role',
+        meta: { final_permissions: permissions },
       }),
     },
   } as unknown as Client;

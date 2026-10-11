@@ -20,7 +20,7 @@ import {
   type ContentGenerationArguments,
   generateContentDiff,
 } from '../src/engine/generation';
-import { prepareMigrationSchema } from '../src/engine/migration-schema';
+import { withoutTrackingModel } from '../src/engine/migration-schema';
 import type { Operation } from '../src/engine/operations';
 import { type RawSchema, schemaFromRaw } from '../src/engine/schema';
 import type {
@@ -236,37 +236,6 @@ function nativeRecord(
   };
 }
 
-/** A record's schedules as `items.rawCurrentVsPublishedState` returns them. */
-function nativeSchedules({ id: recordId, schedules }: RecordState) {
-  const { publication, unpublishing } = schedules;
-  const included = [
-    publication && {
-      id: `${recordId}-publication`,
-      type: 'scheduled_publication',
-      attributes: {
-        publication_scheduled_at: publication.at,
-        selective_publication: null,
-      },
-    },
-    unpublishing && {
-      id: `${recordId}-unpublishing`,
-      type: 'scheduled_unpublishing',
-      attributes: {
-        unpublishing_scheduled_at: unpublishing.at,
-        content_in_locales: unpublishing.locales,
-      },
-    },
-  ].filter((resource) => !!resource);
-  return {
-    data: {
-      relationships: Object.fromEntries(
-        included.map(({ id, type }) => [type, { data: { id, type } }]),
-      ),
-    },
-    included,
-  };
-}
-
 const nativeUpload = (upload: UploadState) => ({
   id: upload.id,
   type: 'upload',
@@ -318,7 +287,7 @@ function project(
           })),
       },
     } as unknown as Client,
-    buildEnvironmentClient(environmentId) {
+    async buildEnvironmentClient(environmentId) {
       const environment = environments[environmentId];
       const respond = async <T>(call: string, value: () => T): Promise<T> => {
         calls.push(`${environment.raw.site.data.id}/${environmentId} ${call}`);
@@ -369,14 +338,6 @@ function project(
                 .map((state) => nativeRecord(state, schema(), 'published')),
             ),
           );
-        },
-        items: {
-          rawCurrentVsPublishedState: (recordId: string) =>
-            respond('schedules', () =>
-              nativeSchedules(
-                side().records.find((state) => state.id === recordId)!,
-              ),
-            ),
         },
         uploads: {
           rawList: () =>
@@ -432,7 +393,6 @@ const options = {
   itemTypes: 'article',
   uploads: 'referenced' as const,
   includeDeletions: true,
-  allowPartial: false,
   concurrency: 2,
 };
 
@@ -518,10 +478,7 @@ describe('content diff generation', () => {
                 { related: [id('kept')], image: { upload_id: logo.id } },
                 {
                   schedules: {
-                    publication: {
-                      at: '2030-01-01T00:00:00.000Z',
-                      selective: null,
-                    },
+                    publication: { at: '2030-01-01T00:00:00.000Z' },
                     unpublishing: null,
                   },
                 },
@@ -554,13 +511,13 @@ describe('content diff generation', () => {
       basename(result.diffPath),
       /^\d+_syncContent\.diff-records\.zip$/,
     );
-    assert.deepEqual(result.skipped, []);
-    // One project shares one rate limit: the source is read in full, every
-    // model included, before the destination.
+    // One project shares one rate limit: the source is read in full before
+    // the destination, and only the selected model is read on either side.
     assert.deepEqual(readOrder(calls), ['site/sandbox', 'site/main']);
-    for (const environment of ['sandbox', 'main'])
-      for (const model of [ARTICLE, PAGE])
-        assert.ok(calls.includes(`site/${environment} records ${model}`));
+    for (const environment of ['sandbox', 'main']) {
+      assert.ok(calls.includes(`site/${environment} records ${ARTICLE}`));
+      assert.ok(!calls.includes(`site/${environment} records ${PAGE}`));
+    }
     assert.deepEqual(
       progress.filter((message) => !message.includes(': ')),
       [
@@ -576,33 +533,29 @@ describe('content diff generation', () => {
     assert.equal(format, 'datocms-content-diff');
     assert.equal(version, 1);
     assert.ok(!Number.isNaN(Date.parse(createdAt)));
-    const untracked = { apiKey: 'schema_migration', model: null };
     assert.deepEqual(rest, {
       pluginVersion: PLUGIN_VERSION,
       includesAssets: false,
       source: { kind: 'environment', siteId: 'site', environmentId: 'sandbox' },
       destination: { siteId: 'site', environmentId: 'main' },
       schemaHash: schemaFromRaw(rawSchema('site'), 'main').hash,
-      sourceTracking: untracked,
-      destinationTracking: untracked,
+      trackingModelApiKey: 'schema_migration',
       options: {
         modelIds: [ARTICLE],
         uploads: 'referenced',
         includeDeletions: true,
-        allowPartial: false,
       },
       counts: result.counts,
       operations: operations.length,
     });
     assert.equal(result.operations, operations.length);
-    // Only the selected model changes: the page differs, but is kept as the
-    // destination has it.
+    // Only the selected model is compared: the page differs, but is neither
+    // read nor counted, and stays as the destination has it.
     assert.deepEqual(result.counts.record, {
       create: 1,
       update: 1,
       delete: 1,
-      noop: 1,
-      skip: 0,
+      noop: 0,
     });
     assert.deepEqual(steps(operations), [
       ['folder.create', id('media')],
@@ -611,7 +564,6 @@ describe('content diff generation', () => {
       ['record.update', id('kept')],
       ['record.publish', id('kept')],
       ['record.delete', id('gone')],
-      ['folders.reorder', undefined],
       ['schedule.publication.create', id('fresh')],
     ]);
     const byOp = (op: string) =>
@@ -625,7 +577,6 @@ describe('content diff generation', () => {
     });
     assert.deepEqual(byOp('schedule.publication.create').data, {
       publication_scheduled_at: '2030-01-01T00:00:00.000Z',
-      selective_publication: null,
     });
   });
 
@@ -751,7 +702,7 @@ describe('content diff generation', () => {
     const endpoint = project(environments, calls);
     const dumpPath = join(work, 'backup.dump-records.zip');
     await writeDump({
-      client: endpoint.buildEnvironmentClient('main'),
+      client: await endpoint.buildEnvironmentClient('main'),
       environmentId: 'main',
       primary: true,
       path: dumpPath,
@@ -786,7 +737,6 @@ describe('content diff generation', () => {
     assert.ok(!calls.some((call) => call.endsWith(`records ${TRACKING}`)));
 
     const { manifest, operations } = await read(result.diffPath);
-    const tracking = { apiKey: 'schema_migration', model: { id: TRACKING } };
     assert.deepEqual(manifest.source, {
       kind: 'dump',
       siteId: 'site',
@@ -798,12 +748,13 @@ describe('content diff generation', () => {
       environmentId: 'main',
     });
     assert.equal(manifest.includesAssets, false);
-    assert.deepEqual(manifest.sourceTracking, tracking);
-    assert.deepEqual(manifest.destinationTracking, tracking);
+    // The tracking model is left out of the schema the diff expects.
+    assert.equal(manifest.trackingModelApiKey, 'schema_migration');
     assert.equal(
       manifest.schemaHash,
-      prepareMigrationSchema(schemaFromRaw(raw, 'main')).schema.hash,
+      withoutTrackingModel(schemaFromRaw(raw, 'main'), 'schema_migration').hash,
     );
+    assert.notEqual(manifest.schemaHash, schemaFromRaw(raw, 'main').hash);
     assert.deepEqual(manifest.options.modelIds, [ARTICLE, PAGE].sort());
     assert.deepEqual(steps(operations), [
       ['upload.create', logo.id],
@@ -828,7 +779,6 @@ describe('content diff generation', () => {
         modelIds: [ARTICLE, PAGE],
         uploads: 'all',
         includeDeletions: true,
-        allowPartial: false,
       },
     });
     assert.deepEqual(steps(again.operations), []);
@@ -862,7 +812,7 @@ describe('content diff generation', () => {
     }) as typeof fetch;
     try {
       await writeDump({
-        client: endpoint.buildEnvironmentClient('main'),
+        client: await endpoint.buildEnvironmentClient('main'),
         environmentId: 'main',
         primary: true,
         path: dumpPath,
@@ -993,66 +943,5 @@ describe('content diff generation', () => {
       );
       return true;
     });
-  });
-
-  it('lists what --allow-partial leaves out of the diff, and refuses it otherwise', async () => {
-    const logo = upload('logo', 'logo bytes');
-    const unsupported = article(
-      'unsupported',
-      { image: { upload_id: logo.id, custom_data: { __itemTypeId: 'x' } } },
-      { publish: true },
-    );
-    const environments: Record<string, Environment> = {
-      main: {
-        primary: true,
-        raw: rawSchema('site'),
-        content: content({ uploads: [logo] }),
-      },
-      sandbox: {
-        raw: rawSchema('site'),
-        content: content({
-          records: [unsupported, article('fine', {}, { publish: true })],
-          uploads: [logo],
-        }),
-      },
-    };
-    const endpoint = project(environments, []);
-    const sides = {
-      source: { endpoint, environment: 'sandbox' },
-      destination: { endpoint, environment: 'main' },
-    };
-    const message = `Record ${unsupported.id} contains native field metadata at __itemTypeId that the CMA client cannot safely preserve through writes and responses.`;
-    await assert.rejects(generate(sides), (error: unknown) => {
-      assert.ok(error instanceof ContentError, String(error));
-      assert.equal(error.code, 'UNSAFE_REQUESTED_CHANGE');
-      assert.equal(error.message, message);
-      assert.deepEqual(error.details, {
-        kind: 'record',
-        id: unsupported.id,
-        reason: 'UNSUPPORTED_PAYLOAD_KEY',
-        dependencyId: null,
-      });
-      return true;
-    });
-    const result = await generate({
-      ...sides,
-      options: { allowPartial: true },
-    });
-    assert.deepEqual(result.skipped, [
-      {
-        kind: 'record',
-        id: unsupported.id,
-        code: 'UNSUPPORTED_PAYLOAD_KEY',
-        message,
-      },
-    ]);
-    assert.equal(result.counts.record.skip, 1);
-    const { manifest, operations } = await read(result.diffPath);
-    assert.equal(manifest.options.allowPartial, true);
-    assert.deepEqual(manifest.counts, result.counts);
-    assert.deepEqual(steps(operations), [
-      ['record.create', id('fine')],
-      ['record.publish', id('fine')],
-    ]);
   });
 });

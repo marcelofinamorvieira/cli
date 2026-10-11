@@ -3,9 +3,9 @@
   "compilerOptions": {
     "declaration": false,
     "noEmit": true,
-    "rootDir": "..",
+    "rootDir": "../../..",
     "types": ["node", "mocha"]
   },
-  "include": ["../src/**/*.ts", "./**/*.ts"],
+  "include": ["../src/**/*.ts", "./**/*.ts", "../../../test-helpers/*.ts"],
   "exclude": ["../lib", "../node_modules"]
 }
