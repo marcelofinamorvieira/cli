@@ -711,7 +711,7 @@ describe('diff operations', () => {
     ]);
   });
 
-  it('does not lock the first update of a sibling renumbered by an earlier move', async () => {
+  it('locks the first update of a sibling after an earlier move out of its group', async () => {
     const roots = ['one', 'two'].map((name, index) =>
       record(name, {}, { position: index + 1 }),
     );
@@ -755,7 +755,12 @@ describe('diff operations', () => {
       title: 'First edited',
       meta: { current_version: 'v-first' },
     });
-    assert.deepEqual(update('after'), { title: 'After edited' });
+    // The CMA leaves a gap where the moved record was and keeps the
+    // siblings' versions, so the lock holds.
+    assert.deepEqual(update('after'), {
+      title: 'After edited',
+      meta: { current_version: 'v-after' },
+    });
   });
 
   it('moves and renames a record of a model without draft mode in one update', async () => {

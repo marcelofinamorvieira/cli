@@ -139,27 +139,17 @@ function omitLinks(
   return result;
 }
 
-/** A record's sibling group and place in it. */
-interface Placement {
-  group: string;
-  position: number | null;
-}
 const groupKey = (model: string, parent: string | null) =>
   JSON.stringify([model, parent]);
 
 /**
  * An operation with its place in the run: its slot (one per entity and
- * phase), its sequence within the slot, and what the final pass needs to
- * decide whether a first update can be locked to the destination version.
+ * phase) and its sequence within the slot.
  */
 interface Emitted {
   slot: number;
   seq: number;
   operation: Operation;
-  /** A first update that may carry `meta.current_version`. */
-  lock?: Placement & { version: string };
-  /** A move out of a sibling group, which renumbers the records after it. */
-  leave?: Placement;
 }
 
 type RecordPhase =
@@ -206,12 +196,6 @@ function recordOperations(
   const out: Emitted[] = [];
   let live = entry.action === 'update' ? structuredClone(baseline) : undefined;
   let written = false;
-  // Only a record that has not been written yet can be locked, so its group
-  // is still its baseline group.
-  const placement: Placement | undefined = baseline && {
-    group: groupKey(baseline.modelId, baseline.parentId),
-    position: baseline.position,
-  };
   const subject = (fields?: JsonObject) =>
     recordLabel(
       schema,
@@ -228,7 +212,6 @@ function recordOperations(
     op: OperationName,
     label: string,
     data?: JsonObject,
-    extras: Pick<Emitted, 'lock' | 'leave'> = {},
   ) => {
     const expect: Expectation | undefined =
       !out.length && baseline
@@ -248,7 +231,6 @@ function recordOperations(
         ...(expect && { expect }),
         ...(data && { data }),
       },
-      ...extras,
     });
   };
   // The first write to an existing record is an update locked to the version
@@ -260,19 +242,19 @@ function recordOperations(
     action: string,
     fields: JsonObject,
     detail = '',
-    leave?: Placement,
   ) => {
     if (!Object.keys(body).length) return;
     const version = !written && baseline?.currentVersion;
+    if (version)
+      body.meta = {
+        ...(object(body.meta) ? body.meta : {}),
+        current_version: version,
+      };
     write(
       phase,
       'record.update',
       `${action} ${subject(fields)}${detail}`,
       body,
-      {
-        ...(version && placement && { lock: { ...placement, version } }),
-        ...(leave && { leave }),
-      },
     );
   };
   const parentLabel = (parentId: string | null) =>
@@ -329,8 +311,6 @@ function recordOperations(
         { ...draft.body, parent_id: parentId },
         'Update',
         desired!.current,
-        '',
-        placement,
       );
       live = {
         ...live!,
@@ -348,7 +328,6 @@ function recordOperations(
       'Move',
       live!.current,
       parentLabel(parentId),
-      placement,
     );
     live = { ...live!, parentId };
   };
@@ -366,9 +345,7 @@ function recordOperations(
       entry.modelId,
       schema,
     );
-    let leave: Placement | undefined;
     if (moves()) {
-      leave = placement;
       body.parent_id = desired!.parentId;
       live!.parentId = desired!.parentId;
     }
@@ -377,7 +354,7 @@ function recordOperations(
       body.meta = { first_published_at: firstPublishedAt };
       live!.firstPublishedAt = firstPublishedAt;
     }
-    update(phase, body, action, fields, '', leave);
+    update(phase, body, action, fields);
     live!.current = fields;
     if (!model.draftMode) live!.published = fields;
   };
@@ -906,37 +883,12 @@ export async function* planOperations(args: {
   }
   await ranges.flush();
 
-  // A record leaving its sibling group closes the gap it leaves, and the CMA
-  // may give each sibling it renumbers a new version, so a later first update
-  // of such a sibling cannot be locked to the destination version.
-  const left = new Map<string, number>();
   for (let range = 0; range < starts.length; range++) {
     assertNotAborted(signal);
     const emitted: Emitted[] = [];
     for await (const line of ranges.lines(range))
       emitted.push(JSON.parse(line) as Emitted);
     emitted.sort((a, b) => a.slot - b.slot || a.seq - b.seq);
-    for (const { operation, lock, leave } of emitted) {
-      if (lock) {
-        const first = left.get(lock.group);
-        const renumbered =
-          first !== undefined &&
-          lock.position !== null &&
-          first < lock.position;
-        if (!renumbered) {
-          const data = operation.data as JsonObject;
-          data.meta = {
-            ...(object(data.meta) ? data.meta : {}),
-            current_version: lock.version,
-          };
-        }
-      }
-      if (leave && leave.position !== null)
-        left.set(
-          leave.group,
-          Math.min(left.get(leave.group) ?? leave.position, leave.position),
-        );
-      yield operation;
-    }
+    for (const { operation } of emitted) yield operation;
   }
 }

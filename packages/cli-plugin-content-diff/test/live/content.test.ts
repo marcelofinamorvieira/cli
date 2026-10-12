@@ -16,11 +16,11 @@ import { generateContentDiff } from '../../src/engine/generation';
 
 /**
  * The one check that the CMA accepts what the in-memory CMA of the default
- * suite accepts: export, diff and apply against a throwaway project, with the
- * content the planner reasons about (nested blocks, links, trees, sortable
- * groups, folders, assets, schedules, deletions). It runs with the account
- * credentials described in the repository's `.env.sample` and is excluded
- * from `npm test`.
+ * suite accepts: export, diff and apply, in place and in a fork, against a
+ * throwaway project, with the content the planner reasons about (nested
+ * blocks, links, trees, sortable groups, folders, assets, schedules,
+ * deletions). It runs with the account credentials described in the
+ * repository's `.env.sample` and is excluded from `npm test`.
  */
 
 type Client = CmaClient.Client;
@@ -74,6 +74,8 @@ describe('content diffs against a live DatoCMS project', () => {
   it('exports, diffs, applies and converges', async () => {
     const site = await createTestSite(dashboardClient, 'Content diff test');
     siteId = site.id;
+    // To destroy the project by hand if the run dies before `after`.
+    console.log(`Site ID: ${site.id}`);
     const apiToken = site.access_token!;
     const clientFor = (environment?: string) =>
       CmaClient.buildClient({ apiToken, environment });
@@ -134,7 +136,13 @@ describe('content diffs against a live DatoCMS project', () => {
       label: 'Related',
       api_key: 'related',
       field_type: 'link',
-      validators: { item_item_type: { item_types: [article.id] } },
+      // Fields created through the API default to removing the link instead.
+      validators: {
+        item_item_type: {
+          item_types: [article.id],
+          on_reference_unpublish_strategy: 'fail',
+        },
+      },
     });
     await main.fields.create(article.id, {
       label: 'Cover',
@@ -165,6 +173,7 @@ describe('content diffs against a live DatoCMS project', () => {
       name: 'Page',
       api_key: 'page',
       tree: true,
+      draft_mode_active: true,
     });
     await main.fields.create(page.id, {
       label: 'Title',
@@ -174,6 +183,8 @@ describe('content diffs against a live DatoCMS project', () => {
 
     // Content.
     const folder = await main.uploadCollections.create({ label: 'Covers' });
+    const archive = await main.uploadCollections.create({ label: 'Archive' });
+    const drafts = await main.uploadCollections.create({ label: 'Drafts' });
     const png1 = join(directory, 'cover-1.png');
     const png2 = join(directory, 'cover-2.png');
     await writeFile(png1, PNG_1X1);
@@ -189,6 +200,14 @@ describe('content diffs against a live DatoCMS project', () => {
         block(text.id, {
           text: 'Hello',
           inner: block(inner.id, { label: 'inner' }),
+        }),
+        block(text.id, {
+          text: 'Goodbye',
+          inner: block(inner.id, { label: 'farewell' }),
+        }),
+        block(text.id, {
+          text: 'Unchanged',
+          inner: block(inner.id, { label: 'unchanged' }),
         }),
       ],
       sidebar: [],
@@ -236,7 +255,21 @@ describe('content diffs against a live DatoCMS project', () => {
       title: 'Child page',
       parent_id: p1.id,
     });
-    for (const record of [...items, p1, p2])
+    const p6 = await main.items.create({
+      item_type: itemType(page.id),
+      title: 'Second child page',
+      parent_id: p1.id,
+    });
+    const p4 = await main.items.create({
+      item_type: itemType(page.id),
+      title: 'Other root page',
+    });
+    const p5 = await main.items.create({
+      item_type: itemType(page.id),
+      title: 'Other child page',
+      parent_id: p4.id,
+    });
+    for (const record of [...items, p1, p2, p6, p4, p5])
       await main.items.publish(record.id);
 
     // A backup of main before any change, with asset files.
@@ -255,24 +288,32 @@ describe('content diffs against a live DatoCMS project', () => {
     await waitForEnvironment(root, 'source');
     const source = clientFor('source');
     const current = await source.items.find(a1.id, { nested: true });
-    const [textBlock] = current.body as Array<Record<string, unknown>>;
-    const innerBlock = textBlock.inner as Record<string, unknown>;
-    // A nested block attribute changes; the block moves to the other field.
+    // Nested blocks come back as JSON:API resources.
+    const [textBlock, , unchangedBlock] = current.body as Array<{
+      id: string;
+      attributes: Record<string, unknown>;
+    }>;
+    const innerBlock = textBlock.attributes.inner as { id: string };
+    // A nested block attribute changes, the second block is removed, the
+    // third stays as it is and a new block appears in the other field. (The
+    // CMA refuses to move a block to another field with its ID.)
     await source.items.update(a1.id, {
-      body: [],
-      sidebar: [
+      body: [
         block(
           text.id,
           {
             text: 'Hello again',
-            inner: block(
-              inner.id,
-              { label: 'edited' },
-              innerBlock.id as string,
-            ),
+            inner: block(inner.id, { label: 'edited' }, innerBlock.id),
           },
-          textBlock.id as string,
+          textBlock.id,
         ),
+        unchangedBlock.id,
+      ],
+      sidebar: [
+        block(text.id, {
+          text: 'Aside',
+          inner: block(inner.id, { label: 'aside' }),
+        }),
       ],
     });
     await source.items.publish(a1.id);
@@ -291,14 +332,33 @@ describe('content diffs against a live DatoCMS project', () => {
     await source.items.update(items[2].id, {
       position: positions.get(items[0].id),
     });
-    // A tree record leaves its parent and a new child appears.
+    // A tree record leaves its parent, the sibling after it gets a draft
+    // change (written after the move, and locked) and a new child appears.
     await source.items.update(p2.id, { parent_id: null });
+    await source.items.update(p6.id, { title: 'Second child page, edited' });
     const p3 = await source.items.create({
       item_type: itemType(page.id),
       title: 'New child',
       parent_id: p1.id,
     });
     await source.items.publish(p3.id);
+    // A published child is deleted and its parent unpublished.
+    await source.items.destroy(p5.id);
+    await source.items.unpublish(p4.id);
+    // A folder moves into another and one moves to the front.
+    const folderPositions = new Map(
+      (await source.uploadCollections.list()).map((entry) => [
+        entry.id,
+        entry.position,
+      ]),
+    );
+    await source.uploadCollections.update(drafts.id, {
+      parent: { type: 'upload_collection', id: folder.id },
+      position: 1,
+    });
+    await source.uploadCollections.update(archive.id, {
+      position: folderPositions.get(folder.id),
+    });
     // The asset file is replaced and the schedule moves.
     await source.uploads.updateFromLocalFile(cover.id, { localPath: png2 });
     await source.scheduledPublication.destroy(a3.id);
@@ -311,29 +371,31 @@ describe('content diffs against a live DatoCMS project', () => {
     const diffFrom = (
       from: { environment: string } | { dump: string },
       name: string,
+      destination = 'main',
     ) =>
       generateContentDiff({
         source:
           'dump' in from ? from : { endpoint, environment: from.environment },
-        destination: { endpoint, environment: 'main' },
+        destination: { endpoint, environment: destination },
         outputPath: (includesAssets) =>
           join(directory, `${name}${includesAssets ? '-assets' : ''}.zip`),
         options: {
           itemTypes: 'all',
-          uploads: 'referenced',
+          // Every folder takes part, not only those holding referenced assets.
+          uploads: 'all',
           includeDeletions: true,
           concurrency: 4,
         },
         signal,
       });
-    const apply = (diffPath: string) =>
+    const apply = (diffPath: string, inPlace = true) =>
       applyContentDiff({
         rootClient: root,
         buildEnvironmentClient: endpoint.buildEnvironmentClient,
         diffPath,
         options: {
           signal,
-          inPlace: true,
+          inPlace,
           allowPrimary: true,
           keepFailedFork: false,
           concurrency: 4,
@@ -341,26 +403,40 @@ describe('content diffs against a live DatoCMS project', () => {
           force: false,
         },
       });
-    const converged = (
-      counts: Awaited<ReturnType<typeof diffFrom>>['counts'],
-    ) => {
+    // Nothing left to create, update or delete, and no reorder either.
+    const converged = ({
+      counts,
+      operations,
+    }: Awaited<ReturnType<typeof diffFrom>>) => {
       for (const kind of ['record', 'upload', 'collection'] as const)
         for (const action of ['create', 'update', 'delete'] as const)
           assert.equal(counts[kind][action], 0, `${kind} ${action}`);
+      assert.equal(operations, 0, 'operations');
     };
 
     // Source to main, then nothing left to do.
     const forward = await diffFrom({ environment: 'source' }, 'forward');
     assert.ok(forward.operations > 0);
     await apply(forward.diffPath);
-    converged(
-      (await diffFrom({ environment: 'source' }, 'forward-again')).counts,
-    );
+    converged(await diffFrom({ environment: 'source' }, 'forward-again'));
 
     // The backup restores main, asset files included, then nothing left to do.
     const restore = await diffFrom({ dump: dumpPath }, 'restore');
     assert.ok(restore.diffPath.endsWith('-assets.zip'));
     await apply(restore.diffPath);
-    converged((await diffFrom({ dump: dumpPath }, 'restore-again')).counts);
+    converged(await diffFrom({ dump: dumpPath }, 'restore-again'));
+
+    // The same change applied in a new fork, as content:apply does by default;
+    // main is left as it is.
+    const forked = await diffFrom({ environment: 'source' }, 'forked');
+    const result = await apply(forked.diffPath, false);
+    assert.notEqual(result.environmentId, 'main');
+    converged(
+      await diffFrom(
+        { environment: 'source' },
+        'forked-again',
+        result.environmentId,
+      ),
+    );
   });
 });

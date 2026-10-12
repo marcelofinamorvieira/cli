@@ -145,7 +145,7 @@ Operations run in this order:
 7. one `records.reorder` per sortable or tree sibling group that gains records or whose order changes;
 8. schedule changes, only for records whose schedules differ.
 
-**Optimistic locking.** The first update of a record that already exists in the destination carries `meta: { current_version }`, unless another write to that record comes first or an earlier tree move out of its sibling group renumbers it. If someone edits the record while the diff runs, the CMA rejects the update and apply reports `RECORD_CHANGED_DURING_APPLY` instead of overwriting the edit.
+**Optimistic locking.** The first update of a record that already exists in the destination carries `meta: { current_version }`, unless another write to that record comes first. If someone edits the record while the diff runs, the CMA rejects the update and apply reports `RECORD_CHANGED_DURING_APPLY` instead of overwriting the edit.
 
 **Blocks.** Updates send only the fields that change. Inside a changed Modular Content, single block or Structured Text field, a block that keeps its ID in the same field and locale is sent as its bare ID when unchanged, or as `{ id, type: 'item', attributes }` with only its changed attributes; new blocks are sent in full with their block model.
 
@@ -213,6 +213,7 @@ Keep diffs under `migrations/content/` and run them with `content:apply`; run sc
 
 - Current and published content, nested blocks, structured text, typed references, workflow stages, sortable and tree ordering, uploads, upload folders and schedule instants are planned together.
 - Publication cycles between records are broken by publishing first without the top-level links to records published later, then publishing again with them. Running in place can briefly expose a record without those links and adds an extra published version. Cycles made only of links inside blocks or structured text cannot be broken this way.
+- A block cannot move to another field or locale and keep its ID: the CMA refuses it. Blocks moved in the editor get new IDs, so this only affects a source where a script re-added a removed block, with its ID, to another field or locale; the diff then fails at that record's update.
 - IDs or upload URLs embedded in arbitrary JSON or text fields are not typed references; referenced-upload selection and deletion ordering cannot see them.
 - New records and uploads belong to the account or token running the diff. Version history, original creators and read-only timestamps are not copied; writable `created_at` and `first_published_at` are.
 - Content writes trigger configured webhooks. Forks carry schedules that may run before promotion.

@@ -205,28 +205,21 @@ export function cmaFixture(
     records.set(record.id, record);
     return response(record);
   };
-  // Native ordering: a record leaving a sibling group closes its gap; one
-  // entering a group at a position shifts the siblings at or after it, and
-  // one entering without a position is appended. Every renumbered sibling
-  // gets a new version.
+  // Native ordering, as the CMA does it: a record moved within its sibling
+  // group is taken out and inserted at its new position; one entering a group
+  // at a position shifts the siblings at or after it, and one entering
+  // without a position is appended. The group a record leaves keeps the gap,
+  // as after a deletion. Shifted siblings keep their version.
   const place = (record: RecordState, old?: RecordState, position?: number) => {
     const definition = model(record.modelId);
     if (!definition.sortable && !definition.tree) return;
     const peers = [...records.values()].filter(
       (peer) => peer.id !== record.id && peer.modelId === record.modelId,
     );
-    const shift = (peer: RecordState, by: number) => {
-      peer.position! += by;
-      peer.currentVersion = String(++revision);
-    };
-    for (const peer of peers) {
-      if (
-        old &&
-        peer.parentId === old.parentId &&
-        peer.position! > old.position!
-      )
-        shift(peer, -1);
-    }
+    if (old && old.parentId === record.parentId)
+      for (const peer of peers)
+        if (peer.parentId === old.parentId && peer.position! > old.position!)
+          peer.position!--;
     const siblings = peers.filter((peer) => peer.parentId === record.parentId);
     if (position === undefined)
       record.position = siblings.length
@@ -234,10 +227,9 @@ export function cmaFixture(
         : 1;
     else {
       for (const peer of siblings)
-        if (peer.position! >= position) shift(peer, 1);
+        if (peer.position! >= position) peer.position!++;
       record.position = position;
     }
-    for (const peer of peers) peer.hash = recordHash(peer);
   };
   const folderResponse = (folder: CollectionState) => ({
     id: folder.id,
@@ -494,18 +486,6 @@ export function cmaFixture(
             for (const ref of recordReferences(peer, definition))
               assert(ref.targetId !== id, `destroy referenced record ${id}`);
         records.delete(id);
-        const type = model(old.modelId);
-        if (type.sortable || type.tree)
-          for (const peer of records.values())
-            if (
-              peer.modelId === old.modelId &&
-              peer.parentId === old.parentId &&
-              peer.position! > old.position!
-            ) {
-              peer.position!--;
-              peer.currentVersion = String(++revision);
-              peer.hash = recordHash(peer);
-            }
         events.push(`destroy:${id}`);
         return response(old);
       },

@@ -460,9 +460,14 @@ describe('diff replay', () => {
       sourceSchema: schema(true),
       options,
     });
+    // Only the order counts: a deleted sibling leaves a gap in the positions.
     assert.deepEqual(
-      ['a', 'c', 'd'].map((name) => fixture.records.get(id(name))!.position),
-      [3, 1, 2],
+      ['a', 'c', 'd'].sort(
+        (a, b) =>
+          fixture.records.get(id(a))!.position! -
+          fixture.records.get(id(b))!.position!,
+      ),
+      ['c', 'd', 'a'],
     );
   });
 
