@@ -18,9 +18,10 @@ import { generateContentDiff } from '../../src/engine/generation';
  * The one check that the CMA accepts what the in-memory CMA of the default
  * suite accepts: export, diff and apply, in place and in a fork, against a
  * throwaway project, with the content the planner reasons about (nested
- * blocks, links, trees, sortable groups, folders, assets, schedules,
- * deletions). It runs with the account credentials described in the
- * repository's `.env.sample` and is excluded from `npm test`.
+ * blocks, localized Structured Text, links, trees, sortable groups, folders,
+ * assets, schedules, deletions). It runs with the account credentials
+ * described in the repository's `.env.sample` and is excluded from
+ * `npm test`.
  */
 
 type Client = CmaClient.Client;
@@ -46,6 +47,23 @@ const block = (
     item_type: itemType(modelId),
     ...attributes,
   });
+
+// Structured Text documents and nodes.
+type Node = Record<string, unknown>;
+const dast = (...children: Node[]) => ({
+  schema: 'dast',
+  document: { type: 'root', children },
+});
+const paragraph = (...children: Node[]) => ({ type: 'paragraph', children });
+const span = (value: string) => ({ type: 'span', value });
+const blockNode = (item: unknown) => ({ type: 'block', item });
+const inlineBlock = (item: unknown) => ({ type: 'inlineBlock', item });
+const itemLink = (item: string, text: string) => ({
+  type: 'itemLink',
+  item,
+  children: [span(text)],
+});
+const inlineItem = (item: string) => ({ type: 'inlineItem', item });
 
 async function waitForEnvironment(client: Client, id: string): Promise<void> {
   for (;;) {
@@ -86,6 +104,7 @@ describe('content diffs against a live DatoCMS project', () => {
         clientFor(environment),
     };
     const main = clientFor('main');
+    await main.site.update({ locales: ['en', 'it'] });
 
     // Schema: a block with a nested block, a draft-mode model with blocks, a
     // link and a file, a model without draft mode, a sortable and a tree model.
@@ -180,6 +199,44 @@ describe('content diffs against a live DatoCMS project', () => {
       api_key: 'title',
       field_type: 'string',
     });
+    // A localized Structured Text field with links, inline blocks, blocks
+    // with a nested block, and a block holding Structured Text with a block.
+    const callout = await main.itemTypes.create({
+      name: 'Callout',
+      api_key: 'callout',
+      modular_block: true,
+    });
+    await main.fields.create(callout.id, {
+      label: 'Body',
+      api_key: 'body',
+      field_type: 'structured_text',
+      validators: {
+        structured_text_blocks: { item_types: [inner.id] },
+        structured_text_links: { item_types: [note.id] },
+      },
+    });
+    const guide = await main.itemTypes.create({
+      name: 'Guide',
+      api_key: 'guide',
+      draft_mode_active: true,
+    });
+    await main.fields.create(guide.id, {
+      label: 'Title',
+      api_key: 'title',
+      field_type: 'string',
+      localized: true,
+    });
+    await main.fields.create(guide.id, {
+      label: 'Content',
+      api_key: 'content',
+      field_type: 'structured_text',
+      localized: true,
+      validators: {
+        structured_text_blocks: { item_types: [text.id, callout.id] },
+        structured_text_inline_blocks: { item_types: [inner.id] },
+        structured_text_links: { item_types: [note.id] },
+      },
+    });
 
     // Content.
     const folder = await main.uploadCollections.create({ label: 'Covers' });
@@ -269,7 +326,53 @@ describe('content diffs against a live DatoCMS project', () => {
       title: 'Other child page',
       parent_id: p4.id,
     });
-    for (const record of [...items, p1, p2, p6, p4, p5])
+    const g1 = await main.items.create({
+      item_type: itemType(guide.id),
+      title: { en: 'Guide', it: 'Guida' },
+      content: {
+        en: dast(
+          paragraph(
+            span('See '),
+            itemLink(n1.id, 'the note'),
+            span(', '),
+            inlineItem(n1.id),
+            span(' and '),
+            inlineBlock(block(inner.id, { label: 'inline' })),
+          ),
+          blockNode(
+            block(text.id, {
+              text: 'First',
+              inner: block(inner.id, { label: 'first inner' }),
+            }),
+          ),
+          blockNode(
+            block(text.id, {
+              text: 'Second',
+              inner: block(inner.id, { label: 'second inner' }),
+            }),
+          ),
+          blockNode(
+            block(callout.id, {
+              body: dast(
+                paragraph(span('Callout')),
+                blockNode(block(inner.id, { label: 'deep' })),
+              ),
+            }),
+          ),
+          blockNode(block(text.id, { text: 'Removed', inner: null })),
+        ),
+        it: dast(
+          paragraph(span('Introduzione')),
+          blockNode(
+            block(text.id, {
+              text: 'Primo',
+              inner: block(inner.id, { label: 'interno' }),
+            }),
+          ),
+        ),
+      },
+    });
+    for (const record of [...items, p1, p2, p6, p4, p5, g1])
       await main.items.publish(record.id);
 
     // A backup of main before any change, with asset files.
@@ -322,6 +425,83 @@ describe('content diffs against a live DatoCMS project', () => {
     await source.items.unpublish(a1.id);
     // A model without draft mode changes.
     await source.items.update(n1.id, { title: 'Note, edited' });
+    // Structured Text: in English the text, an inline block, a nested block
+    // attribute and a block inside a callout's Structured Text change, a block
+    // stays, one is removed and one is added; in Italian only the text changes.
+    const guideNow = await source.items.find(g1.id, { nested: true });
+    type Resource = { id: string; attributes: Record<string, unknown> };
+    const nodes = (value: unknown) =>
+      (value as { document: { children: Node[] } }).document.children;
+    const content = guideNow.content as Record<string, unknown>;
+    const [intro, first, second, box] = nodes(content.en);
+    const inlineId = (
+      (intro.children as Node[]).find((node) => node.type === 'inlineBlock')!
+        .item as Resource
+    ).id;
+    const firstBlock = first.item as Resource;
+    const firstInner = firstBlock.attributes.inner as Resource;
+    const boxBlock = box.item as Resource;
+    const [, deep] = nodes(boxBlock.attributes.body);
+    const [, italian] = nodes(content.it);
+    await source.items.update(g1.id, {
+      title: { en: 'Guide, edited', it: 'Guida' },
+      content: {
+        en: dast(
+          paragraph(
+            span('See, again, '),
+            itemLink(n1.id, 'the note'),
+            span(', '),
+            inlineItem(n1.id),
+            span(' and '),
+            inlineBlock(block(inner.id, { label: 'inline, edited' }, inlineId)),
+          ),
+          blockNode(
+            block(
+              text.id,
+              {
+                text: 'First',
+                inner: block(
+                  inner.id,
+                  { label: 'first inner, edited' },
+                  firstInner.id,
+                ),
+              },
+              firstBlock.id,
+            ),
+          ),
+          blockNode((second.item as Resource).id),
+          blockNode(
+            block(
+              callout.id,
+              {
+                body: dast(
+                  paragraph(span('Callout')),
+                  blockNode(
+                    block(
+                      inner.id,
+                      { label: 'deep, edited' },
+                      (deep.item as Resource).id,
+                    ),
+                  ),
+                ),
+              },
+              boxBlock.id,
+            ),
+          ),
+          blockNode(
+            block(text.id, {
+              text: 'Added',
+              inner: block(inner.id, { label: 'added inner' }),
+            }),
+          ),
+        ),
+        it: dast(
+          paragraph(span('Introduzione, modificata')),
+          blockNode((italian.item as Resource).id),
+        ),
+      },
+    });
+    await source.items.publish(g1.id);
     // The sortable group is reordered.
     const positions = new Map(
       (await source.items.list({ filter: { type: item.id } })).map((record) => [
