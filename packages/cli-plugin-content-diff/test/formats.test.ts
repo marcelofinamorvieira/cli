@@ -1199,6 +1199,28 @@ describe('content formats', () => {
       assert.deepEqual(await readdir(directory), []);
     }).timeout(5000);
 
+    it('names the setting to turn off when the asset CDN refuses a video file', async () => {
+      const fixture = project();
+      const [logo] = fixture.uploads;
+      serve(assetFiles(fixture));
+      const files = globalThis.fetch;
+      globalThis.fetch = (async (input: string | URL | Request) =>
+        String(input) === originalFileUrl(logo!.url)
+          ? new Response('Serving raw videos is disabled by admin', {
+              status: 422,
+            })
+          : files(input)) as typeof fetch;
+      await assert.rejects(dump(fixture, join(directory, 'dump.zip'), true), {
+        code: 'ASSET_DOWNLOAD_FAILED',
+        message: new RegExp(
+          `^Asset ${
+            logo!.id
+          } is a video, .*"Block serving URLs for raw video assets" in Project settings > Asset CDN settings`,
+        ),
+      });
+      assert.deepEqual(await readdir(directory), []);
+    });
+
     it('refuses a file that is not a version 1 project dump, or holds other counts than it lists', async () => {
       const path = join(directory, 'project.dump-records.zip');
       const manifest = await dump(project(), path, false);

@@ -57,6 +57,12 @@ function verified(body: Readable, asset: Asset): Readable {
 
 async function download(asset: Asset): Promise<Readable> {
   const response = await fetch(originalFileUrl(asset.url));
+  // The asset CDN answers 422 only for a video file it is set not to serve.
+  if (response.status === 422)
+    throw new ContentError(
+      'ASSET_DOWNLOAD_FAILED',
+      `Asset ${asset.id} is a video, and the project blocks downloading video files, which is the default. To export assets with videos, turn off "Block serving URLs for raw video assets" in Project settings > Asset CDN settings (the change can take about a minute to apply), and turn it back on afterwards.`,
+    );
   if (!response.ok || !response.body)
     throw new ContentError(
       'ASSET_DOWNLOAD_FAILED',

@@ -233,7 +233,7 @@ Request logs and API errors never contain the API token: the SDK masks the `Auth
 | --- | --- |
 | `APPLY_FAILED_CLEANUP_INCOMPLETE` | An operation failed and the fork could not be removed afterwards; the original failure is under `details.cause`. |
 | `ASSET_CHANGED` | An uploaded file's MD5 differs from the source's: the source asset changed after generation. |
-| `ASSET_DOWNLOAD_FAILED` | `content:export --include-assets` could not download an asset file. |
+| `ASSET_DOWNLOAD_FAILED` | `content:export --include-assets` could not download an asset file. For a video file this is usually the project's "Block serving URLs for raw video assets" setting (Project settings > Asset CDN settings), on by default: turn it off for the export and back on afterwards. |
 | `CAPTURE_DRIFT` | Two reads of the same environment disagreed while it was being read: content changed during export or generation. |
 | `CMA_REQUEST_FAILED` | A CMA request failed with something other than a validation error, or timed out. |
 | `CMA_VALIDATION_FAILED` | The CMA rejected a write (HTTP 422). |
