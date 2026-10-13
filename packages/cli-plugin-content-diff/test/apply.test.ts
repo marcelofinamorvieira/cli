@@ -541,6 +541,61 @@ describe('content diff apply', () => {
     }
   });
 
+  it('waits for a fork that reads miss at first, and fails once a seen fork disappears', async () => {
+    const test = fixture();
+    const find = test.root.environments.find;
+    let reads = 0;
+    // The first read misses the new fork.
+    replace(test.root.environments, 'find', async (id: string) =>
+      find(id === 'review' && ++reads === 1 ? 'missing' : id),
+    );
+    assert.equal((await test.apply()).executed, true);
+    assert.deepEqual(
+      test.logs.filter((log) => log.startsWith('Waiting')),
+      ['Waiting for fork "review" (0%).'],
+    );
+    const failed = fixture();
+    const findFailed = failed.root.environments.find;
+    // The fork is seen while being created, then DatoCMS removes it.
+    replace(failed.root.environments, 'find', async (id: string) => {
+      const found = await findFailed(id);
+      failed.environments.delete(id);
+      return { ...found, meta: { ...found.meta, status: 'creating' } };
+    });
+    await assert.rejects(failed.apply(), (error: ContentError) => {
+      assert.equal(error.code, 'FORK_FAILED');
+      assert.equal(error.message, 'DatoCMS removed failed fork "review".');
+      assert.equal(error.keptForkEnvironmentId, undefined);
+      return true;
+    });
+    assert.deepEqual(failed.events, ['fork:review']);
+  });
+
+  it('keeps a fork interrupted while it is still being created, and says so', async () => {
+    const test = fixture();
+    const controller = new AbortController();
+    const find = test.root.environments.find;
+    replace(test.root.environments, 'find', async (id: string) => {
+      const found = await find(id);
+      controller.abort();
+      return { ...found, meta: { ...found.meta, status: 'creating' } };
+    });
+    await assert.rejects(
+      test.apply({ signal: controller.signal }),
+      (error: ContentError & ContentFailureContext) => {
+        assert.equal(error.code, 'INTERRUPTED');
+        assert.equal(error.keptForkEnvironmentId, 'review');
+        assert.equal(
+          error.outcome,
+          'The fork "review" is still being created, so it was kept: delete it once it is ready.',
+        );
+        return true;
+      },
+    );
+    // DatoCMS deletes an environment only once it is ready.
+    assert.deepEqual(test.events, ['fork:review']);
+  });
+
   it('reports a rejected fork request as it is and cleans nothing up', async () => {
     const test = fixture();
     const find = test.root.environments.find;

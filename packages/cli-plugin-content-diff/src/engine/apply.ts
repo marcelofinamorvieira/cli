@@ -37,23 +37,28 @@ async function waitForFork(
   signal?: AbortSignal,
   log?: (message: string) => void,
 ) {
+  // Reads can miss a new fork for a few seconds after its request. One that
+  // was seen, or is still missing once the polling interval reaches its cap,
+  // was removed by DatoCMS after failing.
+  let seen = false;
   for (let wait = 1000; ; wait = Math.min(wait * 2, 10_000)) {
     assertNotAborted(signal);
     const environment = await findMaybe(() => client.environments.find(id));
-    if (!environment)
+    if (!environment && (seen || wait === 10_000))
       throw new ContentError(
         'FORK_FAILED',
         `DatoCMS removed failed fork "${id}".`,
       );
-    if (environment.meta.status === 'ready') return environment;
-    if (environment.meta.status !== 'creating')
+    if (environment?.meta.status === 'ready') return environment;
+    if (environment && environment.meta.status !== 'creating')
       throw new ContentError(
         'FORK_FAILED',
         `Fork "${id}" ended in status ${environment.meta.status}.`,
       );
+    seen ||= !!environment;
     log?.(
       `Waiting for fork "${id}" (${
-        environment.meta.fork_completion_percentage ?? 0
+        environment?.meta.fork_completion_percentage ?? 0
       }%).`,
     );
     try {
@@ -268,6 +273,7 @@ async function applyDiff(
   } catch (error) {
     let failure = error;
     let kept = false;
+    let creating = false;
     if (forkCreated && forkId) {
       const id = forkId;
       const exists = () =>
@@ -280,8 +286,13 @@ async function applyDiff(
         );
       else {
         try {
-          options.log?.(`Removing failed fork "${id}".`);
-          if (await exists()) await args.rootClient.environments.destroy(id);
+          const fork = await exists();
+          // DatoCMS deletes an environment only once it is ready.
+          if (fork?.meta.status === 'creating') kept = creating = true;
+          else if (fork) {
+            options.log?.(`Removing failed fork "${id}".`);
+            await args.rootClient.environments.destroy(id);
+          }
         } catch (cleanup) {
           kept = true;
           failure = cleanupIncomplete(error, id, cleanup);
@@ -292,6 +303,8 @@ async function applyDiff(
     // its own message.
     const outcome = (): string | undefined => {
       if (failure !== error) return undefined;
+      if (creating)
+        return `The fork "${forkId}" is still being created, so it was kept: delete it once it is ready.`;
       if (kept)
         return runStarted
           ? `The fork "${forkId}" was kept; "${destinationId}" was not changed.`

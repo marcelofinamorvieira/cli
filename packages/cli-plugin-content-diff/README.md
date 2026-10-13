@@ -204,7 +204,7 @@ In fork mode the fork is deleted after a failure, unless `--keep-failed-fork` is
 
 ## Interruptions
 
-Every command is one-shot, with no pause, resume or saved progress. On `SIGINT` or `SIGTERM` it stops starting new work; apply finishes the operation in progress, then cleanup deletes a fork created by the run unless `--keep-failed-fork` is set. A second signal does not skip cleanup. Temporary files and partial zips are removed on completion and on failure. `SIGKILL` and machine shutdown cannot run cleanup.
+Every command is one-shot, with no pause, resume or saved progress. On `SIGINT` or `SIGTERM` it stops starting new work; apply finishes the operation in progress, then cleanup deletes a fork created by the run unless `--keep-failed-fork` is set. DatoCMS deletes an environment only once it is ready, so a fork interrupted while it is still being created is kept, and the message says to delete it once it is ready. A second signal does not skip cleanup. Temporary files and partial zips are removed on completion and on failure. `SIGKILL` and machine shutdown cannot run cleanup.
 
 ## Native schema migrations
 
@@ -242,7 +242,7 @@ Request logs and API errors never contain the API token: the SDK masks the `Auth
 | `DESTINATION_UNAVAILABLE` | An in-place destination is not ready or is read-only. |
 | `ENVIRONMENT_NOT_FOUND` | The requested environment does not exist in the project. |
 | `FAST_FORK_BLOCKED` | DatoCMS refused a fast fork because users are editing records. |
-| `FORK_FAILED` | The fork ended in a status other than ready, or disappeared. |
+| `FORK_FAILED` | The fork ended in a status other than ready, or disappeared after it was seen (or was not seen within about 15 seconds of its request). |
 | `FORK_ID_COLLISION` | The requested fork name already exists. |
 | `INTERRUPTED` | The command was stopped by `SIGINT` (exit 130) or `SIGTERM` (exit 143). |
 | `INVALID_BLOCK` | A block in the content lacks its model or attributes. |
