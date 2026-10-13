@@ -35,6 +35,7 @@ export const OPERATIONS = {
   'upload.delete': { id: true },
   'record.create': { id: true, data: 'object' },
   'record.update': { id: true, data: 'object' },
+  'record.restore': { id: true },
   'record.publish': { id: true },
   'record.unpublish': { id: true },
   'record.delete': { id: true },

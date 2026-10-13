@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { basename, extname } from 'node:path';
 import {
+  blockIds,
   canonicalFields,
   canonicalUpload,
   collectionHash,
@@ -388,6 +389,22 @@ export function cmaFixture(
           record.modelId,
           definition,
         );
+        // A block sent under an ID that exists outside the record's current
+        // version, such as one only its published version keeps, is refused.
+        const kept = blockIds(old.current, record.modelId, definition);
+        const held = new Set<string>();
+        for (const peer of records.values())
+          for (const fields of [peer.current, peer.published])
+            if (fields) blockIds(fields, peer.modelId, definition, held);
+        for (const block of blockIds(
+          record.current,
+          record.modelId,
+          definition,
+        ))
+          assert(
+            kept.has(block) || !held.has(block),
+            `block ${block} belongs to another record`,
+          );
         if ('parent_id' in body)
           record.parentId = body.parent_id as string | null;
         if ('created_at' in meta) record.createdAt = String(meta.created_at);
@@ -488,6 +505,25 @@ export function cmaFixture(
         records.delete(id);
         events.push(`destroy:${id}`);
         return response(old);
+      },
+    },
+    itemVersions: {
+      /** A record's versions, newest first. */
+      async *listPagedIterator(id: string) {
+        const record = get(id);
+        yield { id: `current:${id}`, meta: { is_published: false } };
+        if (record.published)
+          yield { id: `published:${id}`, meta: { is_published: true } };
+      },
+      /** Makes a copy of the published version the current one. */
+      async restore(versionId: string) {
+        const [version, id] = versionId.split(':');
+        assert.equal(version, 'published');
+        const record = get(id!);
+        record.current = structuredClone(record.published!);
+        record.currentVersion = String(++revision);
+        events.push(`restore:${id}`);
+        return [save(record), { id: versionId }];
       },
     },
     scheduledPublication: {

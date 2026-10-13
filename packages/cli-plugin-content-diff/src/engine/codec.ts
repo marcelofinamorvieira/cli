@@ -237,6 +237,22 @@ function canonicalBlock(value: unknown): {
   };
 }
 
+/** The IDs of the blocks in canonical fields, nested blocks included. */
+export function blockIds(
+  fields: JsonObject,
+  modelId: string,
+  schema: SchemaState,
+  ids = new Set<string>(),
+): Set<string> {
+  mapFields(fields, modelId, schema, (value) => {
+    const block = canonicalBlock(value);
+    ids.add(block.id);
+    blockIds(block.attributes, block.modelId, schema, ids);
+    return null;
+  });
+  return ids;
+}
+
 /** Native CMA write payload fields from canonical fields. */
 export function recordPayloadFields(
   fields: JsonObject,

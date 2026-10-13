@@ -127,6 +127,7 @@ Each line is one CMA call:
 | `upload.create`, `upload.replace` | `uploads.createFromLocalFile` or `updateFromLocalFile` when `file` names an entry of the diff, otherwise `createFromUrl` or `updateFromUrl`; then an MD5 check |
 | `upload.update`, `upload.delete` | `uploads.update`, `destroy` |
 | `record.create`, `record.update`, `record.delete` | `items.create`, `update`, `destroy` |
+| `record.restore` | `itemVersions.restore` of the record's published version, found with `itemVersions.list` |
 | `record.publish`, `record.unpublish` | `items.publish`, `unpublish`, with `recursive` off: tree parents and children are never published or unpublished along |
 | `records.reorder` | the plugin's reorder routine (see below) |
 | `schedule.publication.create`, `.delete` | `scheduledPublication.create`, `destroy` |
@@ -147,7 +148,7 @@ Operations run in this order:
 
 **Optimistic locking.** The first update of a record that already exists in the destination carries `meta: { current_version }`, unless another write to that record comes first. If someone edits the record while the diff runs, the CMA rejects the update and apply reports `RECORD_CHANGED_DURING_APPLY` instead of overwriting the edit.
 
-**Blocks.** Updates send only the fields that change. Inside a changed Modular Content, single block or Structured Text field, a block that keeps its ID in the same field and locale is sent as its bare ID when unchanged, or as `{ id, type: 'item', attributes }` with only its changed attributes; new blocks are sent in full with their block model.
+**Blocks.** Updates send only the fields that change. Inside a changed Modular Content, single block or Structured Text field, a block that keeps its ID in the same field and locale is sent as its bare ID when unchanged, or as `{ id, type: 'item', attributes }` with only its changed attributes; new blocks are sent in full with their block model. A draft that removes blocks from a published record leaves them in its published version, and the CMA refuses an update that brings one of them back under its ID, so such an update is preceded by a `record.restore` that makes the published version the draft again, blocks and IDs included.
 
 **Uploads.** A diff from an environment, or from a dump without asset files, uploads new and replaced files from the source URL (with the original-file parameters, so default image optimizations and SVG sanitizing do not alter the bytes); the source uploads must still exist and be reachable when the diff runs, and the machine running apply downloads them before uploading them. Every upload is checked against the source MD5 and fails with `ASSET_CHANGED` when it differs.
 

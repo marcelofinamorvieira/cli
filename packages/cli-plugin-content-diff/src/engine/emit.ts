@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { assertNotAborted } from './cancellation';
 import {
+  blockIds,
   hashJson,
   object,
   recordPayloadFields,
@@ -257,6 +258,27 @@ function recordOperations(
       body,
     );
   };
+  // The CMA takes a block ID in an update only when the block is in the
+  // record's current version or does not exist. A draft that removed blocks
+  // of a published record leaves them in its published version, so a write
+  // that brings one back first restores that version as the draft.
+  let restored = false;
+  const restorePublished = (phase: RecordPhase, fields: JsonObject) => {
+    if (!model.draftMode || !live?.published) return;
+    const current = blockIds(live.current, entry.modelId, schema);
+    const wanted = blockIds(fields, entry.modelId, schema);
+    for (const id of blockIds(live.published, entry.modelId, schema))
+      if (!current.has(id) && wanted.has(id)) {
+        write(
+          phase,
+          'record.restore',
+          `Restore the published version of ${subject()}`,
+        );
+        live.current = live.published;
+        restored = true;
+        return;
+      }
+  };
   const parentLabel = (parentId: string | null) =>
     parentId
       ? ` under ${recordLabel(
@@ -267,9 +289,9 @@ function recordOperations(
         )}`
       : ' to the top level';
   // The update that brings a record's draft fields and metadata to their
-  // desired state. A field update gives a published draft-mode record a new
-  // current version, which leaves it with unpublished changes, so that
-  // version is published again when the source record has none.
+  // desired state. A field update or a restore gives a published draft-mode
+  // record a new current version, which leaves it with unpublished changes,
+  // so that version is published again when the source record has none.
   const draftUpdate = (state: RecordState) => {
     const body = recordUpdatePayloadFields(
       state.current,
@@ -278,7 +300,7 @@ function recordOperations(
       schema,
     );
     const republish =
-      Object.keys(body).length > 0 &&
+      (Object.keys(body).length > 0 || restored) &&
       model.draftMode &&
       !!desired!.published &&
       hashJson(desired!.current) === hashJson(desired!.published);
@@ -298,6 +320,7 @@ function recordOperations(
   const moves = () => model.tree && live!.parentId !== desired!.parentId;
   const move = (phase: RecordPhase) => {
     const { parentId } = desired!;
+    restorePublished(phase, desired!.current);
     // A record whose publication is settled takes its draft changes along,
     // unless the update phase would publish them again afterwards.
     const draft = draftUpdate(live!);
@@ -339,6 +362,7 @@ function recordOperations(
     fields: JsonObject,
     action: string,
   ) => {
+    restorePublished(phase, fields);
     const body = recordUpdatePayloadFields(
       live!.current,
       fields,
@@ -426,7 +450,9 @@ function recordOperations(
     if (!model.draftMode) continue;
     write(phase, 'record.publish', `Publish ${subject()}`);
     live!.published = fields;
+    restored = false;
   }
+  restorePublished('draft', desired!.current);
   const draft = draftUpdate(live!);
   update('draft', draft.body, 'Update', desired!.current);
   live = { ...desired! };

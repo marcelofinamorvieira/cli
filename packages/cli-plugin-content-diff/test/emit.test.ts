@@ -203,6 +203,60 @@ async function replayed(
 const ops = (operations: Operation[]) =>
   operations.map((operation) => operation.op);
 
+const SECTION = id('emit-section');
+
+/** The test schema with a Modular Content `body` of sections. */
+function blockSchema(): SchemaState {
+  const definition = schema();
+  definition.models[0].fields.push({
+    id: id('emit-body'),
+    apiKey: 'body',
+    type: 'rich_text',
+    localized: false,
+    validators: {},
+    defaultValue: null,
+  });
+  definition.models.push({
+    ...definition.models[0],
+    id: SECTION,
+    apiKey: 'section',
+    name: 'Section',
+    block: true,
+    draftMode: false,
+    fields: [
+      {
+        id: id('emit-section-text'),
+        apiKey: 'text',
+        type: 'string',
+        localized: false,
+        validators: {},
+        defaultValue: null,
+      },
+      {
+        id: id('emit-section-inner'),
+        apiKey: 'inner',
+        type: 'single_block',
+        localized: false,
+        validators: {},
+        defaultValue: null,
+      },
+    ],
+  });
+  definition.hash = schemaHash(definition);
+  return definition;
+}
+
+/** A section block, optionally holding another one. */
+const section = (
+  name: string,
+  text: string,
+  inner: JsonObject | null = null,
+): JsonObject => ({
+  id: id(name),
+  __itemTypeId: SECTION,
+  attributes: { text, inner },
+});
+
 describe('diff operations', () => {
   it('locks only the first update of an existing record and never reads it first', async () => {
     const before = published('article', { title: 'Old' });
@@ -323,65 +377,20 @@ describe('diff operations', () => {
   });
 
   it('sends unchanged blocks by ID and changed blocks with only their changed attributes', async () => {
-    const SECTION = id('emit-section');
-    const definition = schema();
-    definition.models[0].fields.push({
-      id: id('emit-body'),
-      apiKey: 'body',
-      type: 'rich_text',
-      localized: false,
-      validators: {},
-      defaultValue: null,
-    });
-    definition.models.push({
-      ...definition.models[0],
-      id: SECTION,
-      apiKey: 'section',
-      name: 'Section',
-      block: true,
-      draftMode: false,
-      fields: [
-        {
-          id: id('emit-section-text'),
-          apiKey: 'text',
-          type: 'string',
-          localized: false,
-          validators: {},
-          defaultValue: null,
-        },
-        {
-          id: id('emit-section-inner'),
-          apiKey: 'inner',
-          type: 'single_block',
-          localized: false,
-          validators: {},
-          defaultValue: null,
-        },
-      ],
-    });
-    definition.hash = schemaHash(definition);
-    const block = (
-      name: string,
-      text: string,
-      inner: JsonObject | null = null,
-    ): JsonObject => ({
-      id: id(name),
-      __itemTypeId: SECTION,
-      attributes: { text, inner },
-    });
+    const definition = blockSchema();
     const before = record('blocks', {
       body: [
-        block('first', 'first'),
-        block('second', 'second', block('deep', 'deep')),
-        block('third', 'third'),
+        section('first', 'first'),
+        section('second', 'second', section('deep', 'deep')),
+        section('third', 'third'),
       ],
     });
     const after = record('blocks', {
       body: [
-        block('first', 'first'),
-        block('second', 'second', block('deep', 'deeper')),
-        block('added', 'added'),
-        block('third', 'third'),
+        section('first', 'first'),
+        section('second', 'second', section('deep', 'deeper')),
+        section('added', 'added'),
+        section('third', 'third'),
       ],
     });
     const { operations } = await replayed(
@@ -453,6 +462,66 @@ describe('diff operations', () => {
         id: after.id,
         label: `Publish ${article('reverted')}`,
       },
+    ]);
+  });
+
+  it('restores the published version before bringing back blocks that only it holds', async () => {
+    const definition = blockSchema();
+    const body = [
+      section('kept', 'kept'),
+      section('quote', 'quote', section('inner', 'inner')),
+    ];
+    // The destination's draft removed the quote, which its published
+    // version still shows.
+    const before = record(
+      'quoted',
+      { body: [section('kept', 'kept')] },
+      {
+        published: { title: 'quoted', related: [], body },
+        firstPublishedAt: '2025-02-01T00:00:00.000Z',
+        publishedUpdatedAt: '2025-02-01T00:00:00.000Z',
+      },
+    );
+    const restore = {
+      op: 'record.restore',
+      id: before.id,
+      label: `Restore the published version of ${article('quoted')}`,
+      expect: expected(before),
+    };
+    const publish = {
+      op: 'record.publish',
+      id: before.id,
+      label: `Publish ${article('quoted')}`,
+    };
+    const reverted = await replayed(
+      { records: [before] },
+      { records: [published('quoted', { body })] },
+      definition,
+    );
+    assert.deepEqual(reverted.operations, [restore, publish]);
+    const edited = await replayed(
+      { records: [before] },
+      {
+        records: [
+          published('quoted', { body: [section('kept', 'edited'), body[1]] }),
+        ],
+      },
+      definition,
+    );
+    assert.deepEqual(edited.operations, [
+      restore,
+      {
+        op: 'record.update',
+        id: before.id,
+        label: `Prepare publication of ${article('quoted')}`,
+        data: {
+          body: [
+            { type: 'item', id: id('kept'), attributes: { text: 'edited' } },
+            id('quote'),
+          ],
+        },
+      },
+      publish,
     ]);
   });
 

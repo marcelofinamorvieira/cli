@@ -278,6 +278,14 @@ async function runOperation(
     case 'record.update':
       await client.items.update(id, body(operation));
       return;
+    case 'record.restore':
+      // Only the record's version list names its published version.
+      for await (const version of client.itemVersions.listPagedIterator(id))
+        if (version.meta.is_published) {
+          await client.itemVersions.restore(version.id);
+          break;
+        }
+      return;
     case 'record.publish':
       await client.items.publish(id, undefined, { recursive: false });
       return;
