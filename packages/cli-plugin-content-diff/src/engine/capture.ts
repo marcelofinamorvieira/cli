@@ -202,13 +202,16 @@ export async function captureEnvironment(args: {
     const nested = readsBlocks(model);
     const limit = nested ? 30 : 500;
     options.progress?.(`Reading ${model.apiKey}`);
+    // Creation order, which edits do not change, so an edit made meanwhile
+    // cannot move a record to a page already read. The CMA can time out on
+    // the ID order of a large model.
     await pages(
       (offset) =>
         readNativeRecordPage(client, {
           filter: { type: model.id },
           nested,
           version: 'current',
-          order_by: 'id_ASC',
+          order_by: '_created_at_ASC',
           page: { offset, limit },
         }),
       limit,
