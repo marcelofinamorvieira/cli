@@ -120,6 +120,21 @@ export function contentErrorReport(error: Error): ContentErrorReport {
   };
 }
 
+/**
+ * A video file the asset CDN refused: it answers 422 only for raw video
+ * files, while the project's asset settings block serving them (the
+ * default). `purpose` says what the download was for.
+ */
+export function rawVideoBlocked(
+  assetId: string,
+  purpose: string,
+): ContentError {
+  return new ContentError(
+    'ASSET_DOWNLOAD_FAILED',
+    `Asset ${assetId} is a video, and its project blocks downloading video files, which is the default. ${purpose}, turn off "Block serving URLs for raw video assets" in that project's Project settings > Asset CDN settings (the change can take about a minute to apply), and turn it back on afterwards.`,
+  );
+}
+
 /** The first observed difference between the destination and its baseline. */
 type DestinationDifference =
   | {

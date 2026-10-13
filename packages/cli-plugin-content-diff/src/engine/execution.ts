@@ -8,7 +8,7 @@ import { boundedWork } from './bounded-work';
 import { assertNotAborted } from './cancellation';
 import { canonicalCollection, canonicalUpload } from './codec';
 import type { DiffFile } from './diff-file';
-import { ContentError, destinationChanged } from './errors';
+import { ContentError, destinationChanged, rawVideoBlocked } from './errors';
 import {
   CREATES,
   type Expectation,
@@ -261,6 +261,16 @@ async function runOperation(
             'ASSET_CHANGED',
             `Asset ${id} was uploaded with a different file than the diff expects: it changed in the source since the diff generation. Please re-generate a diff to apply.`,
           );
+      } catch (error) {
+        // The SDK downloads a URL itself and keeps the status only in its
+        // message.
+        if (
+          !localPath &&
+          error instanceof Error &&
+          /^Failed to download .*: 422\b/.test(error.message)
+        )
+          throw rawVideoBlocked(id, 'To copy it');
+        throw error;
       } finally {
         if (localPath) await rm(localPath, { force: true });
       }

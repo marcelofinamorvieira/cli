@@ -773,6 +773,37 @@ describe('content diff execution', () => {
       await assert.rejects(access(extracted));
     });
 
+    it('names the setting to turn off when the asset CDN refuses a video file', async () => {
+      const line = {
+        op: 'upload.create',
+        id: 'v',
+        label: 'Create v',
+        url: 'https://assets.example.test/v.mp4',
+        md5: 'expected',
+        data: {},
+      };
+      for (const status of ['422 Unprocessable Content', '404 Not Found']) {
+        const failure = new Error(`Failed to download ${line.url}: ${status}`);
+        const { client } = recorder({
+          'uploads.createFromUrl': () => {
+            throw failure;
+          },
+        });
+        await assert.rejects(
+          execute(client, await linesDiff([line])),
+          (error: Error & { code?: string }) => {
+            if (status.startsWith('404')) return error === failure;
+            assert.equal(error.code, 'ASSET_DOWNLOAD_FAILED');
+            assert.match(
+              error.message,
+              /^operations\/000001\.jsonl line 1, Create v: Asset v is a video, .* To copy it, turn off "Block serving URLs for raw video assets"/,
+            );
+            return true;
+          },
+        );
+      }
+    });
+
     it('names the line and label of a failed operation and runs nothing after it', async () => {
       const lines = [
         { op: 'record.publish', id: 'a', label: 'Publish a' },

@@ -1215,7 +1215,7 @@ describe('content formats', () => {
         message: new RegExp(
           `^Asset ${
             logo!.id
-          } is a video, .*"Block serving URLs for raw video assets" in Project settings > Asset CDN settings`,
+          } is a video, .* To export assets with videos, turn off "Block serving URLs for raw video assets" in that project's Project settings > Asset CDN settings`,
         ),
       });
       assert.deepEqual(await readdir(directory), []);
