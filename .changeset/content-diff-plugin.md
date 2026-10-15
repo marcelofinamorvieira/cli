@@ -1,5 +1,0 @@
----
-'@datocms/cli-plugin-content-diff': minor
----
-
-Add the `content:export`, `content:diff` and `content:apply` commands for moving content between DatoCMS environments, projects and backups. `content:export` writes an environment to a project dump, a zip of JSON lines holding every record (current and published versions), upload and folder, and optionally every asset file. `content:diff` compares a live environment or a dump with a destination environment, checks that the schemas are structurally compatible, refuses source records the CMA reports invalid (except invalid drafts the destination model accepts), and writes a zip diff of ordinary CMA calls in dependency order. `content:apply` checks that every record, upload and folder the diff touches is unchanged in the destination, then runs the diff one operation at a time in a new fork by default (a fast fork with `--fast-fork`, or in place with `--in-place`), deletes the fork if an operation fails, and reports CMA errors with the line that caused them. Every step streams, so large projects are never held in memory.
